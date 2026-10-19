@@ -60,6 +60,7 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> miette::Result<()> {
             target,
             window,
             client,
+            facts: crate::vault_access::slot_facts(),
         },
         &render::reporter::CliReporter,
         &cancel,

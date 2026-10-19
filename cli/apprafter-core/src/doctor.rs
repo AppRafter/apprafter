@@ -15,7 +15,9 @@ use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
 use crate::kube::{Kube, KubeErrorKind, KubectlKube};
 use crate::lock::limits::{LimitClient, SshFacts};
-use crate::lock::{self, text, LockReport, MachineLimit, SlotRefusalView, SlotView, UnlockWindow};
+use crate::lock::{
+    self, text, LockReport, MachineLimit, SlotFacts, SlotRefusalView, SlotView, UnlockWindow,
+};
 use crate::net;
 use crate::provider::{self, SUPPORTED_PROVIDERS};
 use crate::report::{Event, Reporter};
@@ -44,6 +46,9 @@ pub struct DoctorArgs {
     pub target: DoctorTarget,
     pub window: UnlockWindow,
     pub client: LimitClient,
+    /// What only the client can find out about this computer, for the slot rows (D.4b
+    /// B30): the OS its slot backend plays, its machine id; unknown where it cannot ask.
+    pub facts: Arc<dyn SlotFacts>,
 }
 
 /// The groups, in report and print order.
@@ -387,6 +392,7 @@ fn run_reading_only(
         target,
         window,
         client,
+        facts,
     } = args;
     let store = ctx.store();
     let name = match target {
@@ -448,6 +454,7 @@ fn run_reading_only(
             ctx,
             &window,
             &client,
+            &*facts,
             match &lookup {
                 Lookup::Found(t) => Some(t.name()),
                 _ => None,
@@ -1668,6 +1675,7 @@ fn this_computer_group(
     ctx: &Context,
     window: &UnlockWindow,
     client: &LimitClient,
+    facts: &dyn SlotFacts,
     checked: Option<&str>,
     cancel: &CancellationToken,
 ) -> CoreResult<Vec<Check>> {
@@ -1680,7 +1688,7 @@ fn this_computer_group(
     // D.4a §3.13: the lock's rows, after the tools and DNS. The ssh-agent query among them
     // waits up to 2 s and cannot be interrupted: a Ctrl-C is honoured before it.
     cancel.check()?;
-    out.extend(lock_rows(ctx, window, client, checked));
+    out.extend(lock_rows(ctx, window, client, facts, checked));
     out.extend(secret_file_rows(ctx, checked));
     Ok(out)
 }
@@ -1694,6 +1702,7 @@ fn lock_rows(
     ctx: &Context,
     window: &UnlockWindow,
     client: &LimitClient,
+    facts: &dyn SlotFacts,
     checked: Option<&str>,
 ) -> Vec<Check> {
     let mode = match ctx.secrets().mode() {
@@ -1714,7 +1723,7 @@ fn lock_rows(
     } else {
         without_ssh(client)
     };
-    let report = lock::status(ctx, window.clone(), &asked);
+    let report = lock::status(ctx, window.clone(), &asked, facts);
     let mut rows = vec![secrets_row(mode, &report, window)];
     if let (SecretsMode::Locked, Ok(r)) = (mode, &report) {
         rows.extend(locked_facts(ctx, r, checked));
@@ -1838,6 +1847,10 @@ const FOREIGN_OWNER_FIX: &str = "AppRafter running as you did not write a vault 
 const NO_RECOVERY_FIX: &str = "Without a recovery key, a forgotten lock password loses every \
      secret in the vault. While the lock password still opens it, run `apprafter lock off` and \
      then `apprafter lock on`, which makes a new recovery key.";
+const SECOND_OF_KIND_FIX: &str = "Only the first slot of a kind is tried, so that a damaged or \
+     forged vault header cannot make every attempt slower. `apprafter lock slot remove <id>` \
+     removes the extra one (`apprafter lock slot list` shows its id); if you did not add it, a \
+     program that can write the vault did.";
 const HARDENING_FIX: &str = "The operating system refused one of the protections the unlock \
      window's holder puts on its key; the window works without it. `apprafter lock now` ends \
      the window.";
@@ -1935,31 +1948,58 @@ fn locked_facts(ctx: &Context, r: &LockReport, checked: Option<&str>) -> Vec<Che
 /// open the vault, and without a recovery key a forgotten lock password loses the vault. Read
 /// from the report's slot views: nothing is derived.
 fn slot_facts(slots: &[SlotView], store: &Path) -> Vec<Check> {
+    let refusal = |reason| CliError::SlotRefused {
+        store: store.to_path_buf(),
+        reason,
+    };
     let mut rows: Vec<Check> = slots
         .iter()
         .filter_map(|s| {
-            let (reason, what) = match s.refused? {
+            let (title, fix) = match s.refused? {
                 SlotRefusalView::KdfTooWeak => (
-                    SlotRefusal::KdfTooWeak,
-                    "weaker than this AppRafter accepts: a copy of the vault is faster to guess \
-                     than it allows",
+                    format!(
+                        "The `{}` slot uses key-derivation settings weaker than this AppRafter \
+                         accepts: a copy of the vault is faster to guess than it allows",
+                        s.label
+                    ),
+                    help_of(&refusal(SlotRefusal::KdfTooWeak)),
                 ),
                 SlotRefusalView::KdfOutOfRange => (
-                    SlotRefusal::KdfOutOfRange,
-                    "beyond what this AppRafter computes: it cannot open the vault",
+                    format!(
+                        "The `{}` slot uses key-derivation settings beyond what this AppRafter \
+                         computes: it cannot open the vault",
+                        s.label
+                    ),
+                    help_of(&refusal(SlotRefusal::KdfOutOfRange)),
                 ),
-            };
-            let refusal = CliError::SlotRefused {
-                store: store.to_path_buf(),
-                reason,
+                // B41: a slot this build refuses is a warning.
+                SlotRefusalView::NewerKind => (
+                    format!(
+                        "The `{}` slot was made by a newer AppRafter: this one cannot open it",
+                        s.label
+                    ),
+                    help_of(&refusal(SlotRefusal::NoUsableSlot)),
+                ),
+                // B18, B77: a second slot of a typed kind in the header is a warning.
+                SlotRefusalView::SecondOfKind => (
+                    format!(
+                        "The vault holds a second {} slot, `{}`: it is never tried",
+                        if s.kind == LockSlotKind::Password {
+                            "lock-password"
+                        } else {
+                            "account-password"
+                        },
+                        s.label
+                    ),
+                    SECOND_OF_KIND_FIX.to_string(),
+                ),
+                // B70: another computer's slot, or one this OS cannot open, is a fact, not a
+                // fault: d4b-f's `lock_slots` row says it, as Info.
+                SlotRefusalView::GestureNotHere => return None,
             };
             Some(Check {
-                fix: Some(explain(&help_of(&refusal))),
-                ..row(
-                    CheckId::Secrets,
-                    CheckStatus::Warn,
-                    format!("The `{}` slot uses key-derivation settings {what}", s.label),
-                )
+                fix: Some(explain(&fix)),
+                ..row(CheckId::Secrets, CheckStatus::Warn, title)
             })
         })
         .collect();
@@ -2333,6 +2373,7 @@ mod tests {
                 target,
                 window,
                 client,
+                facts: Arc::new(crate::lock::UnknownFacts),
             },
             &NullReporter,
             &CancellationToken::new(),
@@ -3100,6 +3141,7 @@ mod tests {
                     target,
                     window: UnlockWindow::NoTerminal,
                     client: quiet(),
+                    facts: Arc::new(crate::lock::UnknownFacts),
                 },
                 &reporter,
                 &CancellationToken::new(),
@@ -3147,6 +3189,7 @@ mod tests {
                 target: DoctorTarget::CliDefault,
                 window: UnlockWindow::NoTerminal,
                 client: quiet(),
+                facts: Arc::new(crate::lock::UnknownFacts),
             },
             &NullReporter,
             &cancel,
@@ -3172,6 +3215,7 @@ mod tests {
                 target: DoctorTarget::CliDefault,
                 window: UnlockWindow::NoTerminal,
                 client: quiet(),
+                facts: Arc::new(crate::lock::UnknownFacts),
             },
             &NullReporter,
             cancel,
@@ -4309,6 +4353,7 @@ mod tests {
                     target,
                     window: UnlockWindow::NoTerminal,
                     client: quiet(),
+                    facts: Arc::new(crate::lock::UnknownFacts),
                 },
                 &reporter,
                 &CancellationToken::new(),
@@ -5183,9 +5228,11 @@ mod tests {
         use crate::lock::{SlotRefusalView as V, SlotView};
         use crate::secrets::LockSlotKind as K;
         let slot = |kind, label: &str, refused| SlotView {
+            id: None,
             kind,
             label: label.into(),
             refused,
+            notes: Vec::new(),
         };
         let store = Path::new("/s");
         let healthy = [
@@ -5223,6 +5270,96 @@ mod tests {
                 "The vault has no recovery-key slot"
             ]
         );
+    }
+
+    /// D.4b B18, B41 (WI-498 acceptance 3): a second slot of a typed kind and a slot a newer
+    /// AppRafter made are warnings; another computer's slot is none here (d4b-f's `lock_slots`
+    /// row says it, as Info).
+    #[test]
+    fn a_second_slot_of_its_kind_or_a_newer_one_is_a_warning() {
+        use crate::lock::{SlotRefusalView as V, SlotView};
+        use crate::secrets::LockSlotKind as K;
+        let slot = |kind, label: &str, refused| SlotView {
+            id: None,
+            kind,
+            label: label.into(),
+            refused,
+            notes: Vec::new(),
+        };
+        let rows = slot_facts(
+            &[
+                slot(K::Password, "lock password", None),
+                slot(K::Password, "forged", Some(V::SecondOfKind)),
+                slot(K::Unknown, "from the future", Some(V::NewerKind)),
+                slot(
+                    K::OsPassword,
+                    "account password of walker on box-b",
+                    Some(V::GestureNotHere),
+                ),
+                slot(K::RecoveryKey, "recovery key", None),
+            ],
+            Path::new("/s"),
+        );
+        assert_eq!(
+            rows.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            [
+                "The vault holds a second lock-password slot, `forged`: it is never tried",
+                "The `from the future` slot was made by a newer AppRafter: this one cannot open it",
+            ]
+        );
+        assert!(rows
+            .iter()
+            .all(|c| c.status == CheckStatus::Warn && c.id == CheckId::Secrets));
+        assert!(
+            matches!(&rows[0].fix, Some(CheckFix::Explain { text }) if text.contains("`apprafter lock slot remove <id>`"))
+        );
+    }
+
+    /// WI-498 acceptance 3, end to end (critic round, finding 3): doctor reads the slots with
+    /// the client's facts — a second slot with this computer's tag warns only because the
+    /// facts say which computer this is; without them it is not checked here, and no row.
+    #[test]
+    fn doctor_reads_the_slots_with_the_clients_facts() {
+        use crate::lock::facts::FixedFacts;
+        use crate::vault::{KdfPolicy, MachineId, NewSlot, OsRandom, VaultFile, VAULT_FILE};
+        let dir = tempfile::tempdir().unwrap();
+        let made = crate::secrets::testing::locked_store(dir.path(), &[("prod", None)]);
+        let path = dir.path().join(VAULT_FILE);
+        let mut opened = VaultFile::parse(&std::fs::read(&path).unwrap())
+            .unwrap()
+            .open_with_key(made.data_key(), made.vault_id)
+            .unwrap();
+        let account = |text: &str| NewSlot::OsPassword {
+            secret: SecretString::new(text),
+            label: format!("account password {text}"),
+            enrolled_at: 1_760_000_000,
+            machine: MachineId::new(&[0xa; 16]).unwrap(),
+        };
+        let fast = &KdfPolicy::INSECURE_FAST;
+        opened
+            .add_slot(account("on a"), fast, &mut OsRandom)
+            .unwrap();
+        let forged = opened.forge_record(account("again on a"), fast).unwrap();
+        opened.header_mut().slots.push(forged);
+        let sealed = opened.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+        let store = cli_core::target::TargetStorePaths::for_root(dir.path().to_path_buf());
+        let held = cli_core::StoreLock::exclusive(&store).unwrap();
+        crate::vault::file::replace(&path, &sealed, &held).unwrap();
+        drop(held);
+        let ctx = Context::for_desktop(dir.path().to_path_buf(), "http://127.0.0.1:1")
+            .with_kdf_policy(fast);
+        let titles = |facts: &dyn SlotFacts| {
+            lock_rows(&ctx, &UnlockWindow::NoTerminal, &quiet(), facts, None)
+                .into_iter()
+                .map(|c| c.title)
+                .collect::<Vec<_>>()
+        };
+        let second = "The vault holds a second account-password slot, `account password again \
+                      on a`: it is never tried";
+        assert!(titles(&FixedFacts::on(0xa)).iter().any(|t| t == second));
+        assert!(!titles(&crate::lock::UnknownFacts)
+            .iter()
+            .any(|t| t == second));
     }
 
     /// T35, §3.13: an override variable set beside a locked store is a warning that names the

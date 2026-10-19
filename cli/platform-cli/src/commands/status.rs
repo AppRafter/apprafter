@@ -216,7 +216,8 @@ fn read_lock_report() -> std::result::Result<LockReport, String> {
         terminal: None,
         ssh: SshFacts::default(),
     };
-    lock::status(&ctx, window, &quiet).map_err(|e| e.to_string())
+    lock::status(&ctx, window, &quiet, &*crate::vault_access::slot_facts())
+        .map_err(|e| e.to_string())
 }
 
 /// The `secrets:` line under the header (D.4a §3.13): files, locked with its slots and this
@@ -560,14 +561,18 @@ mod tests {
             mode,
             slots: vec![
                 SlotView {
+                    id: None,
                     kind: LockSlotKind::Password,
                     label: "lock password".into(),
                     refused: None,
+                    notes: Vec::new(),
                 },
                 SlotView {
+                    id: None,
                     kind: LockSlotKind::RecoveryKey,
                     label: "recovery key".into(),
                     refused: None,
+                    notes: Vec::new(),
                 },
             ],
             window_minutes: 5,

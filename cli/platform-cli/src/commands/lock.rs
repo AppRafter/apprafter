@@ -14,7 +14,7 @@ use apprafter_core::lock::text;
 use apprafter_core::lock::{
     self, check_password, HolderUnavailableReason, LockOffPayload, LockOffStart, LockOnInput,
     LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit, PasswordAdvice,
-    PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotRefusalView, SlotView, UnlockWindow,
+    PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotView, UnlockWindow,
 };
 use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId, STORE_FILE};
 use apprafter_core::vault::{
@@ -596,7 +596,9 @@ pub(crate) fn status() -> miette::Result<()> {
     let place = holder_window::HolderPlace::of(&ctx);
     let window = holder_window::window_state(&ctx, &place, terminal).map_err(report)?;
     let client = limits_client::cli_limit_client(&ProcessEnv, terminal);
-    let lock_report = apprafter_core::lock::status(&ctx, window, &client).map_err(report)?;
+    let facts = crate::vault_access::slot_facts();
+    let lock_report =
+        apprafter_core::lock::status(&ctx, window, &client, &*facts).map_err(report)?;
     print!("{}", render_status(&lock_report));
     Ok(())
 }
@@ -904,7 +906,7 @@ fn opened_by(slots: &[SlotView]) -> String {
         let kind = match s.kind {
             LockSlotKind::Password => "a password",
             LockSlotKind::RecoveryKey => "the recovery key",
-            LockSlotKind::OsPassword => "your OS password",
+            LockSlotKind::OsPassword => "your account password",
             LockSlotKind::WindowsHello => "Windows Hello",
             LockSlotKind::TouchId => "Touch ID",
             LockSlotKind::Unknown => continue,
@@ -918,12 +920,7 @@ fn opened_by(slots: &[SlotView]) -> String {
 
 fn slot_text(s: &SlotView) -> String {
     match s.refused {
-        Some(SlotRefusalView::KdfTooWeak) => {
-            format!("{} (refused by this build: kdf_too_weak)", s.label)
-        }
-        Some(SlotRefusalView::KdfOutOfRange) => {
-            format!("{} (refused by this build: kdf_out_of_range)", s.label)
-        }
+        Some(refused) => format!("{} (refused by this build: {})", s.label, refused.as_str()),
         None => s.label.clone(),
     }
 }
@@ -1264,9 +1261,11 @@ mod status_render_tests {
 
     fn slot(kind: LockSlotKind, label: &str) -> SlotView {
         SlotView {
+            id: None,
             kind,
             label: label.into(),
             refused: None,
+            notes: Vec::new(),
         }
     }
 

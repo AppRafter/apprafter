@@ -165,7 +165,8 @@ pub fn lock_info(shell: &Shell) -> Result<LockSectionInfo, DesktopError> {
     }
     let window = shell.window(&now);
     let client = shell.limit_client_later()();
-    let (report, limits) = match lock::status(&shell.context, window.clone(), &client) {
+    let facts = crate::vault_access::slot_facts();
+    let (report, limits) = match lock::status(&shell.context, window.clone(), &client, &*facts) {
         Ok(report) => {
             let limits = report.limits.clone();
             (Some(report), limits)

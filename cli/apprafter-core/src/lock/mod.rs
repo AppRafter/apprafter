@@ -143,19 +143,84 @@ pub struct LockReport {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SlotView {
+    /// The slot's id, 32 hex characters (a surface shows its first 8, `text::short_id`);
+    /// `None` on `store.yaml`'s mirror, whose rows offer no action (D.4b B36).
+    pub id: Option<String>,
     pub kind: LockSlotKind,
     pub label: String,
     /// Why this build will not open it, when it will not (told without deriving).
     pub refused: Option<SlotRefusalView>,
+    /// What this slot costs and adds, said wherever it is listed (D.4b B61, B70, B76; rule
+    /// 1).
+    pub notes: Vec<SlotNote>,
 }
 
-/// Why this build refuses a slot, before deriving (T22).
+/// Why this build will not open a slot here, told before deriving anything (T22; D.4b B18,
+/// B36).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SlotRefusalView {
     KdfTooWeak,
     KdfOutOfRange,
+    /// It opens elsewhere only: an account-password slot made on another computer (or
+    /// before this computer's id changed), or on Windows; a Windows Hello slot of another
+    /// computer (d4b-w1).
+    GestureNotHere,
+    /// A kind, or a layout of a known kind, that a newer AppRafter made (B1): kept, never
+    /// opened.
+    NewerKind,
+    /// A second slot of a typed kind — a lock password, or this computer's account password
+    /// — which the prompt never tries: a forged or damaged header (B18, B77).
+    SecondOfKind,
+}
+
+impl SlotRefusalView {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotRefusalView::KdfTooWeak => "kdf_too_weak",
+            SlotRefusalView::KdfOutOfRange => "kdf_out_of_range",
+            SlotRefusalView::GestureNotHere => "gesture_not_here",
+            SlotRefusalView::NewerKind => "newer_kind",
+            SlotRefusalView::SecondOfKind => "second_of_kind",
+        }
+    }
+}
+
+/// A fact about one slot that every surface listing it says (D.4b B41, B61, B70, B76; §7.4).
+/// The CLI's words are `text::note_line`, a plan's `text::plan_note_line`; the desktop words
+/// its own. The Windows Hello notes and `AccountPasswordChanged` are produced from d4b-w1
+/// and d4b-f.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SlotNote {
+    /// An account-password slot (Q1, B54): it opens only on the computer that made it, and
+    /// anyone with a copy of the vault and that computer's id can guess the password offline.
+    AccountPasswordOffline,
+    /// The account password changed after this slot was added (B41; d4b-f, where the system
+    /// tells the change time).
+    AccountPasswordChanged,
+    /// An account-password slot made on another computer, or before this computer's id
+    /// changed: not tried here (B70, B76).
+    OsPasswordOtherComputer,
+    /// Whoever opens the store with it can also change how it opens (O-b8, B61).
+    ManagesStore,
+    /// The Windows Hello dialog does not name the program that asks (O-b5; d4b-w1).
+    HelloPromptUnnamed,
+    /// A Windows Hello slot made on another computer (d4b-w1).
+    HelloOtherComputer,
+    /// A Windows Hello slot made here whose key is gone (d4b-w1).
+    HelloKeyMissing,
+    /// A Windows Hello key kept in software, not in a TPM (B52; d4b-w1).
+    HelloSoftwareKey,
+    /// A fact about this slot this AppRafter could not check here (B30): under the fence,
+    /// without a backend.
+    NotCheckedHere,
+    /// This computer looks like a container or WSL: its machine id may change when it is
+    /// re-created (B76).
+    MachineIdMayChange,
 }
 
 /// One slot by its id, kind and label: what an outcome names — the slot a fresh secret opened
@@ -319,14 +384,21 @@ mod tests {
             mode: SecretsMode::Locked,
             slots: vec![
                 SlotView {
+                    id: Some("0123456789abcdef0123456789abcdef".into()),
                     kind: LockSlotKind::Password,
                     label: "lock password".into(),
                     refused: Some(SlotRefusalView::KdfTooWeak),
+                    notes: Vec::new(),
                 },
                 SlotView {
-                    kind: LockSlotKind::RecoveryKey,
-                    label: "recovery key".into(),
-                    refused: None,
+                    id: None,
+                    kind: LockSlotKind::OsPassword,
+                    label: "account password of rem on laptop".into(),
+                    refused: Some(SlotRefusalView::GestureNotHere),
+                    notes: vec![
+                        SlotNote::AccountPasswordOffline,
+                        SlotNote::OsPasswordOtherComputer,
+                    ],
                 },
             ],
             window_minutes: 5,
@@ -360,8 +432,12 @@ mod tests {
                 "targets": ["prod"],
                 "mode": "locked",
                 "slots": [
-                    {"kind": "password", "label": "lock password", "refused": "kdf_too_weak"},
-                    {"kind": "recovery_key", "label": "recovery key", "refused": null}
+                    {"id": "0123456789abcdef0123456789abcdef", "kind": "password",
+                     "label": "lock password", "refused": "kdf_too_weak", "notes": []},
+                    {"id": null, "kind": "os_password", "label": "account password of rem on laptop",
+                     "refused": "gesture_not_here",
+                     "notes": [{"kind": "account_password_offline"},
+                               {"kind": "os_password_other_computer"}]}
                 ],
                 "windowMinutes": 5,
                 "window": {
@@ -438,6 +514,39 @@ mod tests {
             json!({"kind": "short", "chars": 14, "recommended": 15})
         );
         assert_eq!(RECOMMENDED_PASSWORD_CHARS, 15, "O2, decided 2026-10-13");
+    }
+
+    /// D.4b §7.4 (frozen with the desktop's own types in d4b-c4): every refusal's and every
+    /// note's wire name.
+    #[test]
+    fn every_slot_refusal_and_note_has_its_wire_name() {
+        for (refusal, wire) in [
+            (SlotRefusalView::KdfTooWeak, "kdf_too_weak"),
+            (SlotRefusalView::KdfOutOfRange, "kdf_out_of_range"),
+            (SlotRefusalView::GestureNotHere, "gesture_not_here"),
+            (SlotRefusalView::NewerKind, "newer_kind"),
+            (SlotRefusalView::SecondOfKind, "second_of_kind"),
+        ] {
+            assert_eq!(serde_json::to_value(refusal).unwrap(), json!(wire));
+            assert_eq!(refusal.as_str(), wire);
+        }
+        for (note, wire) in [
+            (SlotNote::AccountPasswordOffline, "account_password_offline"),
+            (SlotNote::AccountPasswordChanged, "account_password_changed"),
+            (
+                SlotNote::OsPasswordOtherComputer,
+                "os_password_other_computer",
+            ),
+            (SlotNote::ManagesStore, "manages_store"),
+            (SlotNote::HelloPromptUnnamed, "hello_prompt_unnamed"),
+            (SlotNote::HelloOtherComputer, "hello_other_computer"),
+            (SlotNote::HelloKeyMissing, "hello_key_missing"),
+            (SlotNote::HelloSoftwareKey, "hello_software_key"),
+            (SlotNote::NotCheckedHere, "not_checked_here"),
+            (SlotNote::MachineIdMayChange, "machine_id_may_change"),
+        ] {
+            assert_eq!(serde_json::to_value(note).unwrap(), json!({"kind": wire}));
+        }
     }
 
     #[cfg(feature = "ts")]

@@ -86,6 +86,42 @@ pub struct UnknownFacts;
 
 impl SlotFacts for UnknownFacts {}
 
+/// Tests: the facts a test sets (d4b-c1), on any OS.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct FixedFacts {
+    pub os: HostOs,
+    pub machine: MachineFact,
+    pub may_change: Option<bool>,
+}
+
+#[cfg(test)]
+impl FixedFacts {
+    /// Linux, whose machine id is 16 bytes all `which`, not in a container.
+    pub(crate) fn on(which: u8) -> FixedFacts {
+        FixedFacts {
+            os: HostOs::Linux,
+            machine: MachineFact::Id(MachineId::new(&[which; 16]).unwrap()),
+            may_change: Some(false),
+        }
+    }
+}
+
+#[cfg(test)]
+impl SlotFacts for FixedFacts {
+    fn os(&self) -> HostOs {
+        self.os
+    }
+
+    fn machine_id(&self) -> MachineFact {
+        self.machine.clone()
+    }
+
+    fn machine_id_may_change(&self) -> Option<bool> {
+        self.may_change
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -103,6 +103,9 @@ export const SLOT_NAMES: Record<LockSlotKind, string> = {
 export const SLOT_REFUSALS: Record<SlotRefusalView, string> = {
   kdf_too_weak: 'refused by this build: its key derivation is weaker than a release accepts',
   kdf_out_of_range: 'refused by this build: its key derivation parameters are out of range',
+  gesture_not_here: 'opens only on the computer that made it, or not on this system',
+  newer_kind: 'made by a newer AppRafter: this one cannot open it',
+  second_of_kind: 'a second one of its kind, never tried: the vault header was damaged or forged',
 };
 export const SLOTS_LATER = 'Changing them comes in a later version.';
 

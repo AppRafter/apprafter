@@ -837,6 +837,24 @@ impl VaultFile {
     }
 }
 
+/// Tests outside the vault (d4b-c1): forge what no write of the core makes — a second slot of
+/// one kind (B18, B77), a vault without its recovery slot (`NoUsableSlotLeft`).
+#[cfg(test)]
+impl UnlockedVault {
+    pub(crate) fn header_mut(&mut self) -> &mut VaultHeader {
+        &mut self.header
+    }
+
+    /// A record for `slot` under a fresh id, wrapping this vault's data key, not added.
+    pub(crate) fn forge_record(
+        &self,
+        slot: NewSlot,
+        policy: &KdfPolicy,
+    ) -> VaultResult<SlotRecord> {
+        self.new_record(slot, policy, &mut super::rng::OsRandom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

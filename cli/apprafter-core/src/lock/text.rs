@@ -4,7 +4,10 @@
 //! doctor's rows and `apprafter status`'s line, so that each limit reads the same wherever it is
 //! shown. The desktop words its own Settings section; its doctor overlay shows doctor's rows.
 
-use crate::lock::{HolderHardening, HolderUnavailableReason, MachineLimit, SlotView, UnlockWindow};
+use crate::lock::{
+    HolderHardening, HolderUnavailableReason, MachineLimit, SlotNote, SlotRefusalView, SlotView,
+    UnlockWindow,
+};
 use crate::secrets::LockSlotKind;
 
 /// One limit as a surface states it: a warning or a fact, and its sentence.
@@ -174,12 +177,17 @@ pub fn slot_kinds(slots: &[SlotView]) -> String {
             let kind = match s.kind {
                 LockSlotKind::Password => "password",
                 LockSlotKind::RecoveryKey => "recovery key",
-                LockSlotKind::OsPassword => "OS password",
+                LockSlotKind::OsPassword => "account password",
                 LockSlotKind::WindowsHello => "Windows Hello",
                 LockSlotKind::TouchId => "Touch ID",
                 LockSlotKind::Unknown => "a slot this AppRafter does not know",
             };
             match s.refused {
+                Some(SlotRefusalView::GestureNotHere) => format!("{kind} (not on this computer)"),
+                Some(SlotRefusalView::NewerKind) => format!("{kind} (made by a newer AppRafter)"),
+                Some(SlotRefusalView::SecondOfKind) => {
+                    format!("{kind} (a second one, never tried)")
+                }
                 Some(_) => format!("{kind} (refused by this build)"),
                 None => kind.to_string(),
             }
@@ -196,6 +204,81 @@ pub fn slot_count(slots: &[SlotView]) -> String {
         if n == 1 { "slot" } else { "slots" },
         slot_kinds(slots)
     )
+}
+
+/// A slot's id as surfaces show it: its first 8 hex characters (D.4b B30, B80).
+pub fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// One slot note as `lock slot list`, `lock status` and doctor say it (D.4b B41, B61, B70,
+/// B76; rule 1): a clause after the slot's label.
+pub fn note_line(note: &SlotNote) -> &'static str {
+    match note {
+        SlotNote::AccountPasswordOffline => {
+            "opens the store only on the computer that made it; anyone with a copy of the vault \
+             and that computer's id can try to guess it offline"
+        }
+        SlotNote::AccountPasswordChanged => {
+            "your account password changed after it was added: it still opens with the \
+             previous one"
+        }
+        SlotNote::OsPasswordOtherComputer => {
+            "made on another computer, or before this computer's id changed: it does not open \
+             here"
+        }
+        SlotNote::ManagesStore => "whoever knows it can also change how the store opens",
+        SlotNote::HelloPromptUnnamed => "its Windows Hello dialog does not say which program asks",
+        SlotNote::HelloOtherComputer => {
+            "made on another computer: its Windows Hello key stays there"
+        }
+        SlotNote::HelloKeyMissing => "its Windows Hello key is gone from this computer",
+        SlotNote::HelloSoftwareKey => {
+            "this computer keeps its Windows Hello key in software: a copy of its disk lets \
+             someone guess the PIN offline"
+        }
+        SlotNote::NotCheckedHere => {
+            "not checked here: this AppRafter could not ask this computer whether it opens here"
+        }
+        SlotNote::MachineIdMayChange => {
+            "this looks like a container or WSL: its machine id may change when it is re-created"
+        }
+    }
+}
+
+/// B61, in full: what an account-password slot lets its holder do.
+const ACCOUNT_PASSWORD_MANAGES: &str = "Anyone who can open this store with your account \
+     password — an agent you gave it to for `sudo`, or one that saw you type it — can also \
+     change how it opens: give it a lock password and a recovery key only they know and remove \
+     yours, which locks you out of it. Run agents under a separate OS user or in a sandbox; on \
+     a computer where an agent gets your account password, use a separate lock password \
+     instead.";
+/// B61's Windows Hello sentence.
+const HELLO_MANAGES: &str = "One approval in a Windows Hello dialog — which does not say which \
+     program asks — lets that program open this store and change how it opens.";
+/// Q1 with the machine binding (O-b1), B70 and B77, in full.
+const ACCOUNT_PASSWORD_OFFLINE: &str = "Anyone with a copy of the vault and this computer's id \
+     — any program running as you — can try to guess your account password offline; each \
+     computer you add it on is one more such copy. On another computer, after you reinstall the \
+     system, or if this computer's id changes, only the recovery key opens this store (and a \
+     lock password, if you add one): keep the recovery key at hand, or add a lock password to a \
+     store you use on more than one computer. After you change your account password, the old \
+     one keeps opening the store until you add the new one.";
+/// B76, in full.
+const MACHINE_ID_MAY_CHANGE: &str = "This looks like a container or WSL: its machine id may \
+     change when it is re-created, and then only the recovery key opens this store.";
+
+/// What adding a slot of `kind` with `note` costs, as its plan says it before any secret is
+/// asked (D.4b B61, Q1, B70, B76, B77; rule 1): the full sentence where the list's clause
+/// would hide a cost.
+pub fn plan_note_line(note: &SlotNote, kind: crate::secrets::LockSlotKind) -> &'static str {
+    match (note, kind) {
+        (SlotNote::ManagesStore, crate::secrets::LockSlotKind::WindowsHello) => HELLO_MANAGES,
+        (SlotNote::ManagesStore, _) => ACCOUNT_PASSWORD_MANAGES,
+        (SlotNote::AccountPasswordOffline, _) => ACCOUNT_PASSWORD_OFFLINE,
+        (SlotNote::MachineIdMayChange, _) => MACHINE_ID_MAY_CHANGE,
+        (other, _) => note_line(other),
+    }
 }
 
 #[cfg(test)]
@@ -297,10 +380,66 @@ mod tests {
 
     fn slot(kind: crate::secrets::LockSlotKind, refused: bool) -> crate::lock::SlotView {
         crate::lock::SlotView {
+            id: None,
             kind,
             label: "x".into(),
             refused: refused.then_some(crate::lock::SlotRefusalView::KdfTooWeak),
+            notes: Vec::new(),
         }
+    }
+
+    /// D.4b B30, B61, B70, B76: the new refusals and every note in words, and a short id.
+    #[test]
+    fn the_new_refusals_and_notes_in_words() {
+        use crate::lock::{SlotNote as N, SlotRefusalView as V};
+        use crate::secrets::LockSlotKind as K;
+        let refused_as = |kind, refused| crate::lock::SlotView {
+            id: None,
+            kind,
+            label: "x".into(),
+            refused: Some(refused),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            slot_kinds(&[
+                refused_as(K::OsPassword, V::GestureNotHere),
+                refused_as(K::Unknown, V::NewerKind),
+                refused_as(K::Password, V::SecondOfKind),
+            ]),
+            "account password (not on this computer), a slot this AppRafter does not know \
+             (made by a newer AppRafter), password (a second one, never tried)"
+        );
+        assert_eq!(
+            slot_count(&[slot(K::OsPassword, false), slot(K::RecoveryKey, false)]),
+            "2 slots: account password, recovery key"
+        );
+        for note in [
+            N::AccountPasswordOffline,
+            N::AccountPasswordChanged,
+            N::OsPasswordOtherComputer,
+            N::ManagesStore,
+            N::HelloPromptUnnamed,
+            N::HelloOtherComputer,
+            N::HelloKeyMissing,
+            N::HelloSoftwareKey,
+            N::NotCheckedHere,
+            N::MachineIdMayChange,
+        ] {
+            assert!(!note_line(&note).is_empty(), "{note:?}");
+            assert!(!plan_note_line(&note, K::OsPassword).is_empty(), "{note:?}");
+        }
+        assert_eq!(
+            note_line(&N::ManagesStore),
+            "whoever knows it can also change how the store opens"
+        );
+        assert!(plan_note_line(&N::ManagesStore, K::OsPassword)
+            .starts_with("Anyone who can open this store with your account password"));
+        assert!(plan_note_line(&N::ManagesStore, K::WindowsHello)
+            .starts_with("One approval in a Windows Hello dialog"));
+        assert!(plan_note_line(&N::AccountPasswordOffline, K::OsPassword)
+            .contains("only the recovery key opens this store"));
+        assert_eq!(short_id("0123456789abcdef0123456789abcdef"), "01234567");
+        assert_eq!(short_id("abc"), "abc");
     }
 
     /// D.4a §3.13: the window and the slots as doctor's `secrets` row and `status`'s line say

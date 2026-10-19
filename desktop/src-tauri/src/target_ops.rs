@@ -282,6 +282,7 @@ pub fn start_doctor(shell: &Shell, name: String) -> Result<OpId, DesktopError> {
                 target,
                 window,
                 client: client(),
+                facts: crate::vault_access::slot_facts(),
             };
             doctor::run(ctx, args, reporter, cancel)
         },

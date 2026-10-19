@@ -24,8 +24,8 @@ function report(more: Partial<LockReport> = {}): LockReport {
     targets: ['prod'],
     mode: 'locked',
     slots: [
-      { kind: 'password', label: 'lock password', refused: null },
-      { kind: 'recovery_key', label: 'recovery key', refused: null },
+      { id: null, kind: 'password', label: 'lock password', refused: null, notes: [] },
+      { id: null, kind: 'recovery_key', label: 'recovery key', refused: null, notes: [] },
     ],
     windowMinutes: 5,
     window: { status: 'app' },
@@ -76,8 +76,14 @@ describe('StoreProtection', () => {
       info: section(
         report({
           slots: [
-            { kind: 'password', label: 'lock password', refused: 'kdf_too_weak' },
-            { kind: 'recovery_key', label: 'recovery key', refused: null },
+            {
+              id: null,
+              kind: 'password',
+              label: 'lock password',
+              refused: 'kdf_too_weak',
+              notes: [],
+            },
+            { id: null, kind: 'recovery_key', label: 'recovery key', refused: null, notes: [] },
           ],
         }),
       ),
