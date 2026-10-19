@@ -993,3 +993,61 @@ fn rotated_vector() {
     );
     assert!(decrypt_with_identity(&cache("cache-old.age"), &new_key).is_err());
 }
+
+/// B63, R4, acceptance 2: `retire_identity` on the rotated vector writes after byte for
+/// byte — the same data key, vault id and slots, the payload without
+/// `age-identity-retiring` — and only the new store key is left, which opens the new cache.
+#[test]
+fn rotated_vector_retired() {
+    let v = inputs("rotated");
+    let mid = read("rotated/mid/vault");
+    let after = read("rotated/after/vault");
+    assert_eq!(
+        hex(&Sha256::digest(&after)),
+        text(&v, &["after", "vault_sha256"])
+    );
+    let fast = &KdfPolicy::INSECURE_FAST;
+    let m = VaultFile::parse(&mid).unwrap();
+    let opened = m
+        .open(&SlotSecret::RecoveryKey(recovery_key()), fast)
+        .unwrap();
+    let mut rng = ScriptedRandom::new(draws(&v["after"]));
+    let retired = opened
+        .retire_identity(text(&v, &["writer"]), &mut rng)
+        .unwrap();
+    assert_eq!(
+        hex(&retired),
+        hex(&after),
+        "retire_identity reproduces rotated/after/vault"
+    );
+    let a = VaultFile::parse(&after).unwrap();
+    assert_eq!(a.header(), m.header());
+    assert_eq!(
+        hex(&a.payload_aad),
+        text(&v, &["after", "payload_aad"]),
+        "payload AAD"
+    );
+    let by_key = a
+        .open_with_key(opened.data_key(), a.header().vault_id)
+        .unwrap();
+    assert_eq!(entries_of(by_key.payload()), entries_listed(&v["after"]));
+    assert!(by_key.payload().retiring_identity().unwrap().is_none());
+    for secret in [
+        SlotSecret::AccountPassword(account(&v), machine_id(&v, "linux")),
+        SlotSecret::RecoveryKey(recovery_key()),
+        SlotSecret::Password(SecretString::new(text(&v, &["new_password"]))),
+    ] {
+        assert!(a.open(&secret, fast).is_ok(), "{secret:?}");
+    }
+    let key = by_key.payload().age_identity().unwrap();
+    assert_eq!(
+        key.to_string().expose_secret(),
+        text(&v, &["identities", "new"])
+    );
+    let cache = |name: &str| String::from_utf8(read(&format!("rotated/{name}"))).unwrap();
+    assert_eq!(
+        decrypt_with_identity(&cache("cache-new.age"), &key).unwrap(),
+        text(&v, &["cache", "plaintext"])
+    );
+    assert!(decrypt_with_identity(&cache("cache-old.age"), &key).is_err());
+}

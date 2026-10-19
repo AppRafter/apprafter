@@ -261,6 +261,7 @@ pub enum InputWhat {
     RotationUnfinished,
     SameVaultId,
     OneRecoverySlot,
+    NothingToRetire,
 }
 
 impl fmt::Display for InputWhat {
@@ -285,6 +286,7 @@ impl fmt::Display for InputWhat {
             }
             Self::SameVaultId => "a rotated vault needs a vault id of its own",
             Self::OneRecoverySlot => "a rotated vault holds exactly one recovery-key slot",
+            Self::NothingToRetire => "the vault retires no store key",
         })
     }
 }

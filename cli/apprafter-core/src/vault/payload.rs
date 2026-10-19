@@ -251,6 +251,17 @@ impl VaultPayload {
         Ok(VaultPayload { entries })
     }
 
+    /// This payload without its retiring store key (R4, B63), every other entry as it is.
+    /// Refused when there is none to remove: a finish that finds none skips R4 (§5.4).
+    pub(crate) fn retired(&self) -> VaultResult<VaultPayload> {
+        if !self.entries.contains_key(AGE_IDENTITY_RETIRING) {
+            return Err(VaultError::InvalidInput(InputWhat::NothingToRetire));
+        }
+        let mut entries = self.entries.clone();
+        entries.remove(AGE_IDENTITY_RETIRING);
+        Ok(VaultPayload { entries })
+    }
+
     /// The encoded length, and the two limits a payload can break.
     pub(crate) fn check_size(&self) -> VaultResult<usize> {
         if self.entries.len() > ENTRY_MAX {

@@ -149,6 +149,20 @@ impl fmt::Debug for Rotated {
 }
 
 impl UnlockedVault {
+    /// This vault without its retiring store key (R4, B63): the same data key, vault id,
+    /// slots and labels — no slot is re-made, so nothing is asked — and every other payload
+    /// entry, sealed by `writer` under a fresh payload nonce, its one draw. Refused before
+    /// drawing when the payload retires no store key (`InvalidInput(NothingToRetire)`): a
+    /// finish that finds none skips R4 (§5.4). This vault itself is unchanged.
+    pub fn retire_identity(&self, writer: &str, rng: &mut dyn VaultRng) -> VaultResult<Vec<u8>> {
+        let retired = UnlockedVault {
+            header: self.header.clone(),
+            dk: Arc::clone(&self.dk),
+            payload: self.payload.retired()?,
+        };
+        retired.seal(writer, rng)
+    }
+
     /// Proves that `secret` is slot `id`'s in this vault, for [`rotate`] (B6, B68): the
     /// slot's own key check under `policy` — never PAM (B13) — and its wrap must open to this
     /// vault's data key. `SlotNotFound` for no such slot; `NoUsableSlot`, deriving nothing,
@@ -381,6 +395,7 @@ mod tests {
     use super::*;
     use age::secrecy::ExposeSecret;
 
+    use crate::secrets::vault_id_on_disk;
     use crate::vault::format::{VaultFile, PAYLOAD_MAX};
     use crate::vault::kdf::DERIVATIONS;
     use crate::vault::keys::SlotSecret;
@@ -388,6 +403,8 @@ mod tests {
     use crate::vault::rng::{OsRandom, ScriptedRandom};
     use crate::vault::seal::{create, create_with, VaultIds};
     use crate::vault::testutil::{hex, seq, seq_array, tlv};
+    use crate::vault::{file, VAULT_FILE};
+    use cli_core::{StoreLock, TargetStorePaths};
 
     const PASSWORD: &str = "correct horse battery staple";
     const NEW_PASSWORD: &str = "a new lock password for the rotated vault";
@@ -1200,6 +1217,112 @@ mod tests {
             RotationIds::draw(1, &mut ScriptedRandom::failing_at(1, vec![seq(0xc0, 16)])),
             Err(VaultError::RandomUnavailable { .. })
         ));
+    }
+
+    /// R4 (B63), acceptance 2: the retired vault is the rotated one — the same data key, vault
+    /// id, slots and labels, no slot re-made, one draw — without `age-identity-retiring`,
+    /// every other entry as it was; a vault that retires nothing is refused before drawing.
+    #[test]
+    fn retiring_removes_only_the_retiring_store_key() {
+        let (_, current) = store();
+        let done = rotated(&current);
+        let before = derivations();
+        let mut rng = ScriptedRandom::new(vec![seq(0xd1, 24)]);
+        let bytes = done.vault.retire_identity(WRITER, &mut rng).unwrap();
+        assert_eq!((rng.drawn(), derivations()), (1, before));
+        let file = VaultFile::parse(&bytes).unwrap();
+        assert_eq!(file.header(), done.vault.header());
+        assert_eq!(file.payload_nonce, seq_array::<24>(0xd1));
+        let retired = file
+            .open_with_key(done.vault.data_key(), done.vault.header().vault_id)
+            .unwrap();
+        let rest = |p: &VaultPayload| -> Vec<(String, Vec<u8>)> {
+            p.keys()
+                .filter(|key| *key != "age-identity-retiring")
+                .map(|key| (key.to_string(), p.raw(key).unwrap().to_vec()))
+                .collect()
+        };
+        assert!(retired.payload().retiring_identity().unwrap().is_none());
+        assert!(retired.payload().raw("age-identity-retiring").is_none());
+        assert_eq!(rest(retired.payload()), rest(done.vault.payload()));
+        // Every slot the rotation kept still opens it.
+        for secret in [password(PASSWORD), account(HERE), recovery_secret(0x11)] {
+            assert!(file.open(&secret, FAST).is_ok(), "{secret:?}");
+        }
+        // The rotated vault in memory still retires its key; retiring nothing is refused.
+        assert!(done.vault.payload().retiring_identity().unwrap().is_some());
+        for vault in [&retired, &current] {
+            assert!(matches!(
+                vault.retire_identity(WRITER, &mut ScriptedRandom::new(Vec::new())),
+                Err(VaultError::InvalidInput(InputWhat::NothingToRetire))
+            ));
+        }
+    }
+
+    /// B78, §4.5, §5.4: both of a rotation's vaults go through `vault::file::replace`, durable
+    /// before it returns, and read back as written. From R2 on the vault id on disk is the new
+    /// one and R4 keeps it: only the opened payload's retiring key tells R2's vault from R4's.
+    #[test]
+    fn a_rotation_is_written_and_retired_through_the_durable_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lock = StoreLock::exclusive(&TargetStorePaths::for_root(root.to_path_buf())).unwrap();
+        let path = root.join(VAULT_FILE);
+        let slots = vec![
+            NewSlot::Password {
+                secret: SecretString::new(PASSWORD),
+                label: "lock password".into(),
+            },
+            NewSlot::RecoveryKey {
+                key: recovery(0x11),
+                label: "recovery key".into(),
+            },
+        ];
+        let (made, current) = create(STORE, WRITER, payload(), slots, FAST, &mut OsRandom).unwrap();
+        file::write_new(&path, &made, &lock).unwrap();
+        assert_eq!(
+            vault_id_on_disk(root).unwrap(),
+            Some(current.header().vault_id)
+        );
+        // R2: the rotated vault replaces the current one.
+        let ids = slot_ids(&current);
+        let keep = vec![
+            current.keep(ids[0], kept_password(PASSWORD), FAST).unwrap(),
+            current.keep(ids[1], kept_recovery(0x11), FAST).unwrap(),
+        ];
+        let rotation = RotationIds::draw(0, &mut OsRandom).unwrap();
+        let done = rotate(
+            &current,
+            &rotation,
+            keep,
+            Vec::new(),
+            WRITER,
+            FAST,
+            &mut OsRandom,
+        )
+        .unwrap();
+        file::replace(&path, &done.bytes, &lock).unwrap();
+        assert_eq!(vault_id_on_disk(root).unwrap(), Some(rotation.vault_id));
+        let r2 = VaultFile::parse(&file::read(&path).unwrap())
+            .unwrap()
+            .open(&password(PASSWORD), FAST)
+            .unwrap();
+        assert_eq!(r2.header(), done.vault.header());
+        assert!(r2.payload().retiring_identity().unwrap().is_some());
+        // R4: the retired vault replaces it, under the same vault id.
+        let retired = r2.retire_identity(WRITER, &mut OsRandom).unwrap();
+        file::replace(&path, &retired, &lock).unwrap();
+        assert_eq!(vault_id_on_disk(root).unwrap(), Some(rotation.vault_id));
+        let r4 = VaultFile::parse(&file::read(&path).unwrap())
+            .unwrap()
+            .open_with_key(r2.data_key(), rotation.vault_id)
+            .unwrap();
+        assert_eq!(r4.header(), r2.header());
+        assert!(r4.payload().retiring_identity().unwrap().is_none());
+        assert_eq!(
+            r4.payload().raw("age-identity"),
+            r2.payload().raw("age-identity")
+        );
     }
 
     #[test]
