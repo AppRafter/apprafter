@@ -75,6 +75,20 @@ impl fmt::Debug for NewSlot {
     }
 }
 
+/// What a slot record is made from: a new slot's secret ([`NewSlot`]) or a kept one's (a
+/// rotation's, D.4b B6) — the id and the label come beside it. A kept account-password slot
+/// goes through `AccountPassword` here, never through a `NewSlot` built in the core: only the
+/// OS crate's glue builds that one, after the system checked the password (G-OS6).
+enum Fresh {
+    Password(SecretString),
+    AccountPassword {
+        secret: SecretString,
+        enrolled_at: u64,
+        machine: MachineId,
+    },
+    RecoveryKey(RecoveryKey),
+}
+
 /// An opened vault: its header, its data key and its authenticated payload.
 pub struct UnlockedVault {
     header: VaultHeader,
@@ -389,8 +403,8 @@ impl UnlockedVault {
         self.new_record_as(id, slot, policy, rng)
     }
 
-    /// A slot record under `id`, given (`create_with`, a rotation's kept slot in d4b-b2) or
-    /// drawn just before: draws its salt and wrap nonce, in that order.
+    /// A slot record under `id`, given (`create_with`) or drawn just before: draws its salt and
+    /// wrap nonce, in that order.
     fn new_record_as(
         &self,
         id: SlotId,
@@ -398,10 +412,41 @@ impl UnlockedVault {
         policy: &KdfPolicy,
         rng: &mut dyn VaultRng,
     ) -> VaultResult<SlotRecord> {
+        let (fresh, label) = match slot {
+            NewSlot::Password { secret, label } => (Fresh::Password(secret), label),
+            NewSlot::OsPassword {
+                secret,
+                label,
+                enrolled_at,
+                machine,
+            } => (
+                Fresh::AccountPassword {
+                    secret,
+                    enrolled_at,
+                    machine,
+                },
+                label,
+            ),
+            NewSlot::RecoveryKey { key, label } => (Fresh::RecoveryKey(key), label),
+        };
+        self.fresh_record(id, fresh, label, policy, rng)
+    }
+
+    /// A slot record under `id` from `fresh` — a new slot's secret, or a kept one's (a
+    /// rotation, D.4b B6) — with `label`, the policy's costs, and a fresh salt and wrap nonce,
+    /// drawn in that order.
+    fn fresh_record(
+        &self,
+        id: SlotId,
+        fresh: Fresh,
+        label: String,
+        policy: &KdfPolicy,
+        rng: &mut dyn VaultRng,
+    ) -> VaultResult<SlotRecord> {
         let salt: [u8; SALT_LEN] = draw(rng)?;
         let wrap_nonce: [u8; NONCE_LEN] = draw(rng)?;
-        let (kind, mut body, material, label) = match slot {
-            NewSlot::Password { secret, label } => {
+        let (kind, mut body, material) = match fresh {
+            Fresh::Password(secret) => {
                 let kdf = policy.create_params();
                 let material = derive_password_material(&secret, &salt, &kdf, policy)?;
                 let body = SlotBody::Password {
@@ -411,12 +456,10 @@ impl UnlockedVault {
                     key_check: [0; 32],
                     wrapped_dk: [0; WRAPPED_DK_LEN],
                 };
-                let material = Zeroizing::new(material.to_vec());
-                (SlotKind::Password, body, material, label)
+                (SlotKind::Password, body, Zeroizing::new(material.to_vec()))
             }
-            NewSlot::OsPassword {
+            Fresh::AccountPassword {
                 secret,
-                label,
                 enrolled_at,
                 machine,
             } => {
@@ -431,10 +474,13 @@ impl UnlockedVault {
                     key_check: [0; 32],
                     wrapped_dk: [0; WRAPPED_DK_LEN],
                 };
-                let material = Zeroizing::new(material.to_vec());
-                (SlotKind::OsPassword, body, material, label)
+                (
+                    SlotKind::OsPassword,
+                    body,
+                    Zeroizing::new(material.to_vec()),
+                )
             }
-            NewSlot::RecoveryKey { key, label } => {
+            Fresh::RecoveryKey(key) => {
                 let body = SlotBody::RecoveryKey {
                     salt,
                     wrap_nonce,
@@ -442,7 +488,7 @@ impl UnlockedVault {
                     wrapped_dk: [0; WRAPPED_DK_LEN],
                 };
                 let material = Zeroizing::new(key.key_bytes().to_vec());
-                (SlotKind::RecoveryKey, body, material, label)
+                (SlotKind::RecoveryKey, body, material)
             }
         };
         let keys = slot_keys(&material[..], &salt, kind.byte());
@@ -560,6 +606,48 @@ fn unwrap_data_key(
             None
         }
     }
+}
+
+/// `Ok(None)`: the key check says the secret is not this slot's. `Ok(Some(key))`: it is, and
+/// the wrapped key decrypted. `SlotCorrupt`: it is, and the wrapped key did not. `vault_id` is
+/// the vault the slot's wrap is bound to (its associated data): a file's, or an opened
+/// vault's (a rotation's kept slot, D.4b B6).
+fn unwrap_slot(
+    vault_id: &VaultId,
+    slot: &SlotRecord,
+    material: &[u8],
+) -> VaultResult<Option<DataKey>> {
+    let (salt, wrap_nonce, stored_check, wrapped) = match &slot.body {
+        SlotBody::Password {
+            salt,
+            wrap_nonce,
+            key_check,
+            wrapped_dk,
+            ..
+        }
+        | SlotBody::OsPassword {
+            salt,
+            wrap_nonce,
+            key_check,
+            wrapped_dk,
+            ..
+        }
+        | SlotBody::RecoveryKey {
+            salt,
+            wrap_nonce,
+            key_check,
+            wrapped_dk,
+        } => (salt, wrap_nonce, key_check, wrapped_dk),
+        SlotBody::Opaque(_) => return Ok(None),
+    };
+    let keys = slot_keys(material, salt, slot.kind.byte());
+    if !bool::from(keys.key_check[..].ct_eq(&stored_check[..])) {
+        return Ok(None);
+    }
+    let aad = slot_aad(vault_id, &slot.id, slot.kind, &slot.body);
+    unwrap_data_key(&keys.kek, &aad, wrap_nonce, wrapped)
+        .map(Some)
+        .ok_or(VaultError::SlotCorrupt { slot: slot.id })
 }
 
 impl VaultFile {
@@ -702,40 +790,9 @@ impl VaultFile {
             .collect()
     }
 
-    /// `Ok(None)`: the key check says the secret is not this slot's. `Ok(Some(key))`: it is,
-    /// and the wrapped key decrypted. `SlotCorrupt`: it is, and the wrapped key did not.
+    /// [`unwrap_slot`] over this file's vault id.
     fn try_slot(&self, slot: &SlotRecord, material: &[u8]) -> VaultResult<Option<DataKey>> {
-        let (salt, wrap_nonce, stored_check, wrapped) = match &slot.body {
-            SlotBody::Password {
-                salt,
-                wrap_nonce,
-                key_check,
-                wrapped_dk,
-                ..
-            }
-            | SlotBody::OsPassword {
-                salt,
-                wrap_nonce,
-                key_check,
-                wrapped_dk,
-                ..
-            }
-            | SlotBody::RecoveryKey {
-                salt,
-                wrap_nonce,
-                key_check,
-                wrapped_dk,
-            } => (salt, wrap_nonce, key_check, wrapped_dk),
-            SlotBody::Opaque(_) => return Ok(None),
-        };
-        let keys = slot_keys(material, salt, slot.kind.byte());
-        if !bool::from(keys.key_check[..].ct_eq(&stored_check[..])) {
-            return Ok(None);
-        }
-        let aad = slot_aad(&self.header().vault_id, &slot.id, slot.kind, &slot.body);
-        unwrap_data_key(&keys.kek, &aad, wrap_nonce, wrapped)
-            .map(Some)
-            .ok_or(VaultError::SlotCorrupt { slot: slot.id })
+        unwrap_slot(&self.header().vault_id, slot, material)
     }
 
     fn open_payload(&self, dk: DataKey) -> VaultResult<UnlockedVault> {
