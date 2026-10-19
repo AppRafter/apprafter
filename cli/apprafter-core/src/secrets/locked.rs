@@ -205,6 +205,11 @@ pub(crate) fn vault_error(root: &Path, e: VaultError) -> CliError {
             now: SecretsModeKind::Locked,
         },
         VaultError::RandomUnavailable { detail } => CliError::RandomUnavailable { detail },
+        // D.4b: a seventeenth slot is no vault of too many bytes.
+        VaultError::TooLarge {
+            what: vault::SizeWhat::Slots,
+            ..
+        } => slot(SlotRefusal::SlotsFull),
         VaultError::TooLarge { limit, .. } => CliError::VaultUnwritable {
             path: path.clone(),
             problem: VaultWriteProblem::TooLarge { limit },
@@ -625,5 +630,41 @@ mod vault_id_on_disk_tests {
             !testing::of_path(&path).unwrap().is_owner_only(),
             "the DACL was rewritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_error_tests {
+    use super::*;
+    use crate::vault::SizeWhat;
+
+    /// D.4b: a vault already holding its 16 slots refuses a seventeenth as `slot_refused`
+    /// (`slots_full`) — never as a vault of more bytes than it may hold.
+    #[test]
+    fn a_seventeenth_slot_is_slots_full_never_too_many_bytes() {
+        let root = Path::new("/s");
+        assert!(matches!(
+            vault_error(
+                root,
+                VaultError::TooLarge {
+                    what: SizeWhat::Slots,
+                    limit: 16
+                }
+            ),
+            CliError::SlotRefused {
+                reason: SlotRefusal::SlotsFull,
+                ..
+            }
+        ));
+        assert!(matches!(
+            vault_error(
+                root,
+                VaultError::TooLarge {
+                    what: SizeWhat::File,
+                    limit: 2_097_152
+                }
+            ),
+            CliError::VaultUnwritable { .. }
+        ));
     }
 }

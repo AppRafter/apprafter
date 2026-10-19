@@ -25,10 +25,10 @@ pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
 pub use error::{
-    age_key_missing_help, store_not_private_help, vault_unreadable_help, CliError, DamageKind,
-    LockPhase, LockedWhy, ProvisionStop, ProvisionedBy, RefusedInput, Result, SecretsModeKind,
-    SkuCheckFor, SlotRefusal, StoreFolderProblem, TransportFailure, UnavailableKind, VaultProblem,
-    VaultWriteProblem,
+    age_key_missing_help, store_not_private_help, vault_unreadable_help, AccountCheckUnavailable,
+    AccountPasswordRefusal, AccountPasswordUnusable, CliError, DamageKind, LockPhase, LockedWhy,
+    ProvisionStop, ProvisionedBy, RefusedInput, Result, SecretsModeKind, SkuCheckFor, SlotRefusal,
+    StoreFolderProblem, TransportFailure, UnavailableKind, VaultProblem, VaultWriteProblem,
 };
 pub use fsutil::atomic_replace;
 pub use target::{

@@ -264,6 +264,10 @@ pub mod codes {
     pub const RANDOM_UNAVAILABLE: &str = "apprafter::secrets::random_unavailable";
     /// A folder of the target store another account owns or can write (WI-475).
     pub const STORE_NOT_PRIVATE: &str = "apprafter::secrets::store_not_private";
+    /// D.4b B29: a slot `lock slot remove` names that the store does not have, and the
+    /// account password not taken for a slot (both cli-core's, passing through).
+    pub const SLOT_NOT_FOUND: &str = "apprafter::secrets::slot_not_found";
+    pub const ACCOUNT_PASSWORD_REFUSED: &str = "apprafter::secrets::account_password_refused";
     /// The lock's three refusals the core raises itself (`CoreError`).
     pub const PASSWORD_REFUSED: &str = "apprafter::secrets::password_refused";
     pub const RECOVERY_KEY_INVALID: &str = "apprafter::secrets::recovery_key_invalid";
@@ -319,6 +323,8 @@ pub mod codes {
         VAULT_NEEDS_WRITE_LOCK,
         RANDOM_UNAVAILABLE,
         STORE_NOT_PRIVATE,
+        SLOT_NOT_FOUND,
+        ACCOUNT_PASSWORD_REFUSED,
         PASSWORD_REFUSED,
         RECOVERY_KEY_INVALID,
         INSECURE_KDF_REFUSED,
@@ -730,18 +736,53 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
         C::SlotRefused { reason, .. } => match reason {
             cli_core::SlotRefusal::KdfTooWeak | cli_core::SlotRefusal::KdfOutOfRange => {
                 "This build will not use that lock password's key settings. Unlock with the \
-                 recovery key, then stop protecting the secrets and protect them again on the \
-                 Security page, which sets a new lock password."
+                 recovery key, then replace the keys on the Security page (Replace keys…), \
+                 which sets a new lock password."
                     .into()
             }
-            cli_core::SlotRefusal::NoUsableSlot => "Its slots were made by a newer AppRafter: \
-                 upgrade it, or unlock with the recovery key."
+            cli_core::SlotRefusal::NoUsableSlot => "This app cannot open this store's other \
+                 slots here: a Windows Hello slot opens only on the computer that made it, an \
+                 account-password slot only on Linux and macOS and on the computer that made \
+                 it, a slot of a newer AppRafter only after an upgrade. Unlock with the lock \
+                 password or the recovery key."
                 .into(),
-            cli_core::SlotRefusal::LastRecoverySlot => "A locked target store always keeps a \
-                 recovery key: add the new one before removing the old one."
+            cli_core::SlotRefusal::LastRecoverySlot => "A locked target store always keeps its \
+                 recovery key: New recovery key… on the Security page replaces it."
                 .into(),
             cli_core::SlotRefusal::NoUsableSlotLeft => "A locked target store always keeps a \
                  way this app can open it: add one before removing this one."
+                .into(),
+            cli_core::SlotRefusal::AlreadyHasPassword => "A target store has at most one lock \
+                 password: Replace keys… on the Security page changes it."
+                .into(),
+            cli_core::SlotRefusal::NotOnThisOs => {
+                "On Windows, add a separate lock password instead.".into()
+            }
+            cli_core::SlotRefusal::SlotsFull => {
+                "Remove a way to open it that it no longer needs first.".into()
+            }
+        },
+        C::SlotNotFound { .. } => "That slot is not in this target store's vault as it is \
+             now: the list on the Security page shows its slots."
+            .into(),
+        C::AccountPasswordRefused { reason, .. } => match reason {
+            cli_core::AccountPasswordRefusal::Wrong => "Nothing was written. A failed check \
+                 may count as a failed login on systems that lock accounts after failures, so \
+                 AppRafter waits before it checks again. Try again later, or choose a separate \
+                 lock password instead."
+                .into(),
+            cli_core::AccountPasswordRefusal::NotChecked => "Nothing was written, and no \
+                 failed check was counted. Type the password when the system asks for it, not \
+                 a fingerprint, or choose a separate lock password instead."
+                .into(),
+            cli_core::AccountPasswordRefusal::Backoff { .. } => "AppRafter spaces out \
+                 account-password checks after a failed one, so that typos cannot lock your \
+                 account. Try again then, or choose a separate lock password instead."
+                .into(),
+            cli_core::AccountPasswordRefusal::NoPassword
+            | cli_core::AccountPasswordRefusal::Unavailable { .. }
+            | cli_core::AccountPasswordRefusal::Unusable { .. } => "Choose a separate lock \
+                 password instead: only AppRafter ever sees it."
                 .into(),
         },
         C::CacheNotSealed { .. } => "An older AppRafter or another program wrote it \
@@ -918,6 +959,33 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
         C::SlotRefused { store, reason } => {
             put("store", json!(store.display().to_string()));
             put("reason", json!(reason.as_str()));
+        }
+        C::SlotNotFound { given, matches, .. } => {
+            put("given", json!(given));
+            put("matches", json!(matches));
+        }
+        C::AccountPasswordRefused { reason, .. } => {
+            put("reason", json!(reason.as_str()));
+            match reason {
+                cli_core::AccountPasswordRefusal::Unavailable { what } => {
+                    put("unavailable", json!(what.as_str()));
+                    if let cli_core::AccountCheckUnavailable::SystemError { name } = what {
+                        put("systemError", json!(name));
+                    }
+                }
+                cli_core::AccountPasswordRefusal::Backoff {
+                    wait_secs: Some(secs),
+                } => {
+                    put("waitSecs", json!(secs));
+                }
+                cli_core::AccountPasswordRefusal::Unusable { why } => {
+                    put("why", json!(why.as_str()));
+                    if let cli_core::AccountPasswordUnusable::TooLong { max } = why {
+                        put("max", json!(max));
+                    }
+                }
+                _ => {}
+            }
         }
         C::CacheNotSealed { secret, target } => {
             put("secret", json!(secret.as_str()));
@@ -1336,6 +1404,7 @@ pub mod samples {
     /// One of each lock refusal of cli-core (D.4a §3.12), every shape whose help differs.
     pub fn lock_errors() -> Vec<cli_core::CliError> {
         use cli_core::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        use cli_core::{AccountCheckUnavailable, AccountPasswordRefusal, AccountPasswordUnusable};
         use cli_core::{
             CliError as C, DamageKind, LockPhase, LockedWhy, ProvisionedBy, RefusedInput,
             SecretsModeKind, SlotRefusal, VaultProblem, VaultWriteProblem,
@@ -1475,10 +1544,60 @@ pub mod samples {
             SlotRefusal::NoUsableSlot,
             SlotRefusal::LastRecoverySlot,
             SlotRefusal::NoUsableSlotLeft,
+            SlotRefusal::AlreadyHasPassword,
+            SlotRefusal::NotOnThisOs,
+            SlotRefusal::SlotsFull,
         ] {
             out.push(C::SlotRefused {
                 store: store(),
                 reason,
+            });
+        }
+        // D.4b B29: a slot the store does not have, and the account password not taken.
+        out.push(C::SlotNotFound {
+            store: store(),
+            given: s("ffff"),
+            matches: Vec::new(),
+        });
+        out.push(C::SlotNotFound {
+            store: store(),
+            given: s("os-password"),
+            matches: vec![
+                s("3a4b5c6d00000000000000000000000a"),
+                s("9c0d1e2f00000000000000000000000b"),
+            ],
+        });
+        let unavailable = |what| AccountPasswordRefusal::Unavailable { what };
+        for reason in [
+            AccountPasswordRefusal::Wrong,
+            AccountPasswordRefusal::NotChecked,
+            AccountPasswordRefusal::NoPassword,
+            unavailable(AccountCheckUnavailable::NoLibpam),
+            unavailable(AccountCheckUnavailable::NoService),
+            unavailable(AccountCheckUnavailable::NoCheckRoute),
+            unavailable(AccountCheckUnavailable::NoAccount),
+            unavailable(AccountCheckUnavailable::NoMachineId),
+            unavailable(AccountCheckUnavailable::NoBackoffRecord),
+            unavailable(AccountCheckUnavailable::SystemError {
+                name: s("PAM_SYSTEM_ERR"),
+            }),
+            AccountPasswordRefusal::Backoff {
+                wait_secs: Some(540),
+            },
+            AccountPasswordRefusal::Backoff { wait_secs: None },
+            AccountPasswordRefusal::Unusable {
+                why: AccountPasswordUnusable::TooLong { max: 1024 },
+            },
+            AccountPasswordRefusal::Unusable {
+                why: AccountPasswordUnusable::RecoveryKeyShape,
+            },
+            AccountPasswordRefusal::Unusable {
+                why: AccountPasswordUnusable::ContainsNul,
+            },
+        ] {
+            out.push(C::AccountPasswordRefused {
+                reason,
+                messages: Vec::new(),
             });
         }
         for what in [
@@ -1947,6 +2066,8 @@ mod tests {
             codes::VAULT_NEEDS_WRITE_LOCK,
             codes::RANDOM_UNAVAILABLE,
             codes::STORE_NOT_PRIVATE,
+            codes::SLOT_NOT_FOUND,
+            codes::ACCOUNT_PASSWORD_REFUSED,
         ] {
             assert!(
                 seen.contains(code),
@@ -1965,8 +2086,8 @@ mod tests {
         let unlocking = "Unprotecting this target store's secrets was interrupted. Finish \
                          it on the Security page.";
         let weak = "This build will not use that lock password's key settings. Unlock with \
-                    the recovery key, then stop protecting the secrets and protect them again \
-                    on the Security page, which sets a new lock password.";
+                    the recovery key, then replace the keys on the Security page (Replace \
+                    keys…), which sets a new lock password.";
         for (e, want) in [
             (
                 cli_core::CliError::LockIncomplete {
@@ -2105,6 +2226,61 @@ mod tests {
                 reason: SlotRefusal::KdfTooWeak
             }),
             json!({"store": "/s", "reason": "kdf_too_weak"})
+        );
+        assert_eq!(
+            cli(C::SlotRefused {
+                store: s(),
+                reason: SlotRefusal::SlotsFull
+            }),
+            json!({"store": "/s", "reason": "slots_full"})
+        );
+        assert_eq!(
+            cli(C::SlotNotFound {
+                store: s(),
+                given: "os-password".into(),
+                matches: vec!["3a4b5c6d00000000000000000000000a".into()]
+            }),
+            json!({"given": "os-password", "matches": ["3a4b5c6d00000000000000000000000a"]})
+        );
+        let refused = |reason| {
+            cli(C::AccountPasswordRefused {
+                reason,
+                messages: vec!["not shown as a field".into()],
+            })
+        };
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Wrong),
+            json!({"reason": "wrong"})
+        );
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Unavailable {
+                what: cli_core::AccountCheckUnavailable::SystemError {
+                    name: "PAM_SYSTEM_ERR".into()
+                }
+            }),
+            json!({"reason": "unavailable", "unavailable": "system_error", "systemError": "PAM_SYSTEM_ERR"})
+        );
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Unavailable {
+                what: cli_core::AccountCheckUnavailable::NoMachineId
+            }),
+            json!({"reason": "unavailable", "unavailable": "no_machine_id"})
+        );
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Backoff {
+                wait_secs: Some(540)
+            }),
+            json!({"reason": "backoff", "waitSecs": 540})
+        );
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Backoff { wait_secs: None }),
+            json!({"reason": "backoff"})
+        );
+        assert_eq!(
+            refused(cli_core::AccountPasswordRefusal::Unusable {
+                why: cli_core::AccountPasswordUnusable::TooLong { max: 1024 }
+            }),
+            json!({"reason": "unusable", "why": "too_long", "max": 1024})
         );
         assert_eq!(
             cli(C::CacheNotSealed {
@@ -2444,6 +2620,8 @@ mod tests {
             codes::VAULT_NEEDS_WRITE_LOCK,
             codes::RANDOM_UNAVAILABLE,
             codes::STORE_NOT_PRIVATE,
+            codes::SLOT_NOT_FOUND,
+            codes::ACCOUNT_PASSWORD_REFUSED,
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
         }

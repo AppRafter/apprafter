@@ -5208,7 +5208,7 @@ mod tests {
             )]
         );
         assert!(
-            matches!(&weak[0].fix, Some(CheckFix::Explain { text }) if text.contains("`apprafter lock off`")),
+            matches!(&weak[0].fix, Some(CheckFix::Explain { text }) if text.contains("`apprafter lock rekey`")),
             "{:?}",
             weak[0].fix
         );
