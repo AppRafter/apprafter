@@ -129,7 +129,7 @@ pub(super) fn opened(ctx: &Context, secret: &str) -> Context {
     let key = open_at(
         ctx.config_root(),
         file.id.as_ref().unwrap(),
-        SlotInput::from_input(SecretString::new(secret)),
+        SlotInput::from_input(SecretString::new(secret), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();
@@ -152,7 +152,7 @@ pub(super) fn token_of(ctx: &Context, shown: &str, target: &str) -> String {
             let o = open_at(
                 ctx.config_root(),
                 &id,
-                SlotInput::from_input(SecretString::new(shown)),
+                SlotInput::from_input(SecretString::new(shown), None),
                 &KdfPolicy::INSECURE_FAST,
             )
             .unwrap();
@@ -1024,7 +1024,7 @@ fn the_window_lives_in_the_vault_and_changes_there() {
     let o = open_at(
         f.ctx.config_root(),
         &id,
-        SlotInput::from_input(SecretString::new(shown.as_str())),
+        SlotInput::from_input(SecretString::new(shown.as_str()), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();
@@ -1033,7 +1033,7 @@ fn the_window_lives_in_the_vault_and_changes_there() {
     let o = open_at(
         f.ctx.config_root(),
         &id,
-        SlotInput::from_input(SecretString::new(shown.as_str())),
+        SlotInput::from_input(SecretString::new(shown.as_str()), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();

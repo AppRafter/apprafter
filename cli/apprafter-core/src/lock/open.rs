@@ -389,7 +389,7 @@ mod open_at_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let made = locked_store(&root, &[("prod", Some(TOKEN))]);
-        let input = SlotInput::from_input(made.recovery_key().clone());
+        let input = SlotInput::from_input(made.recovery_key().clone(), None);
         let opened = open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap();
         assert_eq!(opened.vault_id, made.vault_id);
         assert_eq!(opened.key.expose(), made.data_key().expose());
@@ -403,7 +403,7 @@ mod open_at_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let made = locked_store(&root, &[("prod", Some(TOKEN))]);
-        let input = SlotInput::from_input(SecretString::new("not the password"));
+        let input = SlotInput::from_input(SecretString::new("not the password"), None);
         match open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap_err() {
             CoreError::Cli(CliError::UnlockFailed {
                 attempts, store, ..
@@ -423,7 +423,7 @@ mod open_at_tests {
         match open_at(
             &root,
             &made.store_id,
-            SlotInput::from_input(typed),
+            SlotInput::from_input(typed, None),
             KdfPolicy::active(),
         )
         .unwrap_err()
@@ -443,7 +443,7 @@ mod open_at_tests {
         let made_a = locked_store(&a, &[("prod", Some(TOKEN))]);
         let made_b = locked_store(&b, &[("prod", Some(TOKEN))]);
         std::fs::copy(b.join("vault"), a.join("vault")).unwrap();
-        let input = SlotInput::from_input(made_b.recovery_key().clone());
+        let input = SlotInput::from_input(made_b.recovery_key().clone(), None);
         assert!(matches!(
             open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
             CoreError::Cli(CliError::VaultUnreadable {
@@ -452,7 +452,7 @@ mod open_at_tests {
             })
         ));
         std::fs::remove_file(a.join("vault")).unwrap();
-        let input = SlotInput::from_input(made_a.recovery_key().clone());
+        let input = SlotInput::from_input(made_a.recovery_key().clone(), None);
         assert!(matches!(
             open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
             CoreError::Cli(CliError::VaultUnreadable {
@@ -547,6 +547,24 @@ mod open_at_tests {
         assert_eq!(opened.vault_id, made.vault_id);
         let elsewhere = MachineId::new(&[0x0b; 16]).unwrap();
         let input = SlotInput::AccountPassword(typed(), elsewhere);
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// B27 (d4b-c1): the prompt's input — whatever a client's prompt or field gets — opens
+    /// this computer's account-password slot when the client knows the machine id, and is
+    /// one failed attempt without it, as before.
+    #[test]
+    fn the_prompts_input_reaches_this_computers_account_password_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        let input = SlotInput::from_input(typed(), Some(here()));
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.vault_id, made.vault_id);
+        let input = SlotInput::from_input(typed(), None);
         one_failed_attempt(open_at(&root, &made.store_id, input, fast));
     }
 }

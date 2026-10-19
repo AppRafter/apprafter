@@ -29,7 +29,7 @@ fn open_with(ctx: &Context, secret: &str) -> OpenedVault {
     open_at(
         ctx.config_root(),
         file.id.as_ref().unwrap(),
-        SlotInput::from_input(SecretString::new(secret)),
+        SlotInput::from_input(SecretString::new(secret), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap()

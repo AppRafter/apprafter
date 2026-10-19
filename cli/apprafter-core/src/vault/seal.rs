@@ -2093,8 +2093,14 @@ mod tests {
             format!("{:?}", password(PASSWORD)),
             format!("{:?}", recovery_secret(0x11)),
             format!("{:?}", slots(PASSWORD, 0x11)),
-            format!("{:?}", SlotInput::from_input(SecretString::new(PASSWORD))),
-            format!("{:?}", SlotInput::from_input(SecretString::new(mistyped))),
+            format!(
+                "{:?}",
+                SlotInput::from_input(SecretString::new(PASSWORD), None)
+            ),
+            format!(
+                "{:?}",
+                SlotInput::from_input(SecretString::new(mistyped), None)
+            ),
             format!("{:?}", key.confirm(shown.expose()).unwrap()),
             format!("{:?}", account(ACCOUNT, 0xa)),
             format!("{:?}", account_slot(ACCOUNT, 0xa)),

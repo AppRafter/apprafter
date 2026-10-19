@@ -138,8 +138,7 @@ pub enum SlotInput {
     AccountPassword(SecretString, MachineId),
     /// Text typed at a prompt that is not recovery-key shaped (B27): the lock-password slot,
     /// then, with this computer's machine id, the account-password slot made on this
-    /// computer. The prompt's input from d4b-c1 on; until then [`SlotInput::from_input`]
-    /// answers `Password`, as it did.
+    /// computer — what [`SlotInput::from_input`] makes of it, for every prompt and field.
     Typed(SecretString, Option<MachineId>),
     /// Recovery-key shaped but failing its checksum: it is tried against the password slots
     /// too, and only when they refuse it is `error` reported, as one attempt.
@@ -150,9 +149,15 @@ pub enum SlotInput {
 }
 
 impl SlotInput {
-    pub fn from_input(input: SecretString) -> Self {
+    /// One prompt's input (T62, B27): a recovery key when it has a recovery key's shape and
+    /// its checksum holds; otherwise typed text, tried as the lock password and — given this
+    /// computer's machine id (`lock::SlotFacts::machine_id`) — as this computer's account
+    /// password. A mistyped recovery key is tried as a lock password only, as in D.4a: no
+    /// slot holds recovery-key-shaped text (O2's rule at enrolment), so no derivation is
+    /// spent on a slot that cannot match.
+    pub fn from_input(input: SecretString, machine: Option<MachineId>) -> Self {
         if !looks_like_recovery_key(input.expose()) {
-            return SlotInput::Password(input);
+            return SlotInput::Typed(input, machine);
         }
         match RecoveryKey::parse(input.expose()) {
             Ok(key) => SlotInput::RecoveryKey(key),
@@ -200,16 +205,16 @@ mod tests {
 
     #[test]
     fn one_input_is_tried_as_what_it_looks_like() {
-        match SlotInput::from_input(SecretString::new(SHOWN)) {
+        match SlotInput::from_input(SecretString::new(SHOWN), None) {
             SlotInput::RecoveryKey(key) => assert_eq!(key.key_bytes()[31], 0x1f),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            SlotInput::from_input(SecretString::new("correct horse battery staple")),
-            SlotInput::Password(_)
+            SlotInput::from_input(SecretString::new("correct horse battery staple"), None),
+            SlotInput::Typed(_, None)
         ));
         let typo = "QQQSY-QCYQ5-RQWZQ-FPH9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK";
-        match SlotInput::from_input(SecretString::new(typo)) {
+        match SlotInput::from_input(SecretString::new(typo), None) {
             SlotInput::MistypedRecoveryKey { as_password, error } => {
                 assert_eq!(as_password.expose(), typo);
                 assert_eq!(error, RecoveryKeyError::Checksum { group: Some(4) });
@@ -217,7 +222,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let one = "QQ1SY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK";
-        match SlotInput::from_input(SecretString::new(one)) {
+        match SlotInput::from_input(SecretString::new(one), None) {
             SlotInput::MistypedRecoveryKey { error, .. } => assert_eq!(
                 error,
                 RecoveryKeyError::InvalidChar {
@@ -268,10 +273,36 @@ mod tests {
         assert_eq!(format!("{typed:?}"), "SlotInput::Typed(..)");
         let account = SlotInput::AccountPassword(SecretString::new("hunter2"), here);
         assert_eq!(format!("{account:?}"), "SlotInput::AccountPassword(..)");
-        // Until d4b-c1 moves the prompt to `Typed`, typed text stays the lock password's input.
+        // B27 (d4b-c1): typed text is the prompt's input over both password kinds, with this
+        // computer's machine id when the client knows it.
+        let here = MachineId::new(&[7; 16]).unwrap();
         assert!(matches!(
-            SlotInput::from_input(SecretString::new("hunter2")),
-            SlotInput::Password(_)
+            SlotInput::from_input(SecretString::new("hunter2"), Some(here)),
+            SlotInput::Typed(_, Some(_))
+        ));
+    }
+
+    /// B27: typed text carries this computer's machine id when the client knows it; a
+    /// recovery key, whole or mistyped, carries none — no slot holds recovery-key-shaped text.
+    #[test]
+    fn only_typed_text_carries_the_machine_id() {
+        let here = || Some(MachineId::new(&[7; 16]).unwrap());
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new("hunter2"), here()),
+            SlotInput::Typed(_, Some(_))
+        ));
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new("hunter2"), None),
+            SlotInput::Typed(_, None)
+        ));
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new(SHOWN), here()),
+            SlotInput::RecoveryKey(_)
+        ));
+        let typo = "QQQSY-QCYQ5-RQWZQ-FPH9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK";
+        assert!(matches!(
+            SlotInput::from_input(SecretString::new(typo), here()),
+            SlotInput::MistypedRecoveryKey { .. }
         ));
     }
 
@@ -282,8 +313,11 @@ mod tests {
             "SlotSecret::Password(..)"
         );
         assert_eq!(
-            format!("{:?}", SlotInput::from_input(SecretString::new("hunter2"))),
-            "SlotInput::Password(..)"
+            format!(
+                "{:?}",
+                SlotInput::from_input(SecretString::new("hunter2"), None)
+            ),
+            "SlotInput::Typed(..)"
         );
     }
 }

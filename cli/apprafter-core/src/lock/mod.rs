@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::secrets::{LockSlotKind, SecretsMode};
 
+pub mod facts;
 pub mod faults;
 pub mod limits;
 pub mod off;
@@ -24,6 +25,7 @@ mod status;
 pub mod text;
 pub use status::status;
 
+pub use facts::{HostOs, MachineFact, SlotFacts, UnknownFacts};
 pub use faults::FaultPoint;
 pub use off::{execute_off, plan_off, LockOffPayload, LockOffStart, LockedOff};
 pub use on::{
