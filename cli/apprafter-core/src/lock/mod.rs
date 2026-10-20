@@ -21,6 +21,7 @@ pub mod on;
 #[cfg(test)]
 mod on_tests;
 pub mod open;
+mod reseal;
 pub mod slots;
 #[cfg(test)]
 mod slots_tests;
