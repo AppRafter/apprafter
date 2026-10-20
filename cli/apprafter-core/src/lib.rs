@@ -44,6 +44,9 @@ pub mod context;
 pub mod doctor;
 pub mod env;
 pub mod error;
+/// What a cluster answers, for tests (D.5 B76): never in a shipped build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
 pub mod kube;
 pub mod lock;
 pub mod machine;
