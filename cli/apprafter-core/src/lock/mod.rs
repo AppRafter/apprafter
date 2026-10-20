@@ -51,6 +51,10 @@ pub use open::{
     check_password, open_at, open_slot_at, set_unlock_timeout, OpenedVault, SlotOpened,
 };
 pub use rotate::{
+    begin_rotate, drop_takes_the_word, execute_rotate, Again, Answered, DroppedSlot, KeysRotated,
+    RotateAnswer, RotateMaterial, RotateQuestion, DROP,
+};
+pub use rotate::{
     plan_rotate, DropWhy, RotateKind, RotatePayload, RotateRow, SlotFate, StoreKeyLine,
 };
 pub use slots::{

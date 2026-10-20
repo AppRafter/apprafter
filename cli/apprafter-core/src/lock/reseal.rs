@@ -20,13 +20,6 @@
 //!
 //! Each cache sealed to the key — a skipped one too — records it (F13, B86: the store's id and
 //! the vault's); a dropped one loses its record; a left one keeps whatever it had.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the key change's half: d4b-c2a's R3 (WI-501) is its first caller"
-    )
-)]
 
 use std::path::{Path, PathBuf};
 
