@@ -1009,11 +1009,16 @@ pub fn vault_unreadable_help(path: &Path, problem: &VaultProblem) -> String {
 
 fn lock_incomplete_help(phase: LockPhase) -> String {
     match phase {
-        LockPhase::Locking => "Run `apprafter lock on` again: it asks for the lock password \
-             and the recovery key and finishes. Without one of them, `apprafter lock off` backs \
-             out of it with the other, and a new `apprafter lock on` makes a new recovery key. \
-             Until then commands that need the store's secrets refuse, because some may be only \
-             in the vault."
+        // D.4b-e1a: the everyday secret is the lock password or, by default, the account
+        // password; and a run this AppRafter cannot finish (d4b-c3's Deviation 10) has one way
+        // out, `lock off` with the recovery key.
+        LockPhase::Locking => "Run `apprafter lock on` again: it asks for the store's everyday \
+             secret — its lock password or your account password — and the recovery key, and \
+             finishes. Without one of them, `apprafter lock off` backs out of it with the other; \
+             where `apprafter lock on` says this AppRafter cannot finish the run, `apprafter lock \
+             off` backs it out with the recovery key. A new `apprafter lock on` then makes a new \
+             recovery key. Until then commands that need the store's secrets refuse, because some \
+             may be only in the vault."
             .to_string(),
         LockPhase::Unlocking => "Run `apprafter lock off` again: it asks for the lock password \
              or the recovery key and finishes. Until then commands that need the store's \
@@ -3532,6 +3537,28 @@ mod tests {
         assert!(help.contains("not a fingerprint"), "{help}");
         assert!(
             help.contains("`apprafter lock on --lock-password`"),
+            "{help}"
+        );
+    }
+
+    /// D.4b-e1a (d4b-c3's Deviation 10): an interrupted `lock on` is finished with the store's
+    /// everyday secret — its lock password or, by default, the account password — and the
+    /// recovery key; where `lock on` cannot finish it, `lock off` backs it out with the key.
+    #[test]
+    fn an_interrupted_lock_on_names_both_everyday_secrets_and_lock_off_where_it_cannot_finish() {
+        let help = help_of(&CliError::LockIncomplete {
+            store: PathBuf::from("/s"),
+            phase: LockPhase::Locking,
+        });
+        assert!(
+            help.contains("its lock password or your account password"),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "where `apprafter lock on` says this AppRafter cannot finish the run, \
+                 `apprafter lock off` backs it out with the recovery key"
+            ),
             "{help}"
         );
     }

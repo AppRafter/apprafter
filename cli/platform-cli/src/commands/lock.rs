@@ -38,7 +38,7 @@ use crate::holder::protocol::HolderUnavailable;
 use crate::holder::spawn::HolderStarted;
 use crate::os_slots::OsSlots;
 use crate::prompt::{Asker, PromptError, Terminal};
-use crate::render::core_error::report;
+use crate::render::core_error::{report, report_with_help};
 use crate::render::reporter::CliReporter;
 use crate::vault_access::{ask_and_open, prompt_refusal, sentence, ATTEMPTS};
 use crate::{holder_window, limits_client};
@@ -97,6 +97,14 @@ const OPENS_WITHOUT_ACCOUNT_PASSWORD: &str = "It opens this store where your acc
                                               reinstall the system, or once this computer's \
                                               id changes. AppRafter cannot open a locked \
                                               store without one of its secrets.";
+/// D.4b (d4b-c3's Deviation 10, d4b-e1a): an interrupted run this AppRafter cannot finish, and
+/// its one way out.
+const CANNOT_FINISH: &str = "This AppRafter cannot finish that run: besides the recovery key, its \
+                             vault has no slot this AppRafter opens (a Windows Hello slot that a \
+                             newer AppRafter made, say). `apprafter lock off` backs it out with \
+                             the recovery key, and a new `apprafter lock on` then makes a new \
+                             vault and a new recovery key. Until then commands that need the \
+                             store's secrets refuse, because some may be only in the vault.";
 /// C8.
 const AGENT_NOTE: &str = "This stops an AI agent that runs AppRafter as you from reading \
                           these secrets or using them without you. It does not stop a program \
@@ -144,6 +152,23 @@ impl Reporter for Progress {
     }
 }
 
+/// `lock on`'s plan refused (D.4b, d4b-c3's Deviation 10): an interrupted run whose vault this
+/// AppRafter cannot finish is `lock_incomplete` when it is planned, with help that names `lock
+/// off` alone — `lock_incomplete`'s own help also names `lock on` again, which refuses it the
+/// same way. An interrupted `lock off` keeps its own help.
+fn plan_refused(e: CoreError) -> miette::Report {
+    if matches!(
+        e,
+        CoreError::Cli(CliError::LockIncomplete {
+            phase: LockPhase::Locking,
+            ..
+        })
+    ) {
+        return report_with_help(e, CANNOT_FINISH);
+    }
+    report(e)
+}
+
 fn on(asker: &dyn Asker, timeout: Option<u32>, lock_password: bool) -> miette::Result<()> {
     crate::vault_access::insecure_kdf_note();
     let ctx = crate::context::cli_context()?;
@@ -163,7 +188,7 @@ fn on(asker: &dyn Asker, timeout: Option<u32>, lock_password: bool) -> miette::R
     } else {
         lock::WayAsked::Everyday(&*slots)
     };
-    let mut plan = lock::plan_on(&ctx, timeout, asked).map_err(report)?;
+    let mut plan = lock::plan_on(&ctx, timeout, asked).map_err(plan_refused)?;
     if let LockOnStart::AlreadyLocked = plan.payload.start() {
         match timeout {
             None => println!("The target store at {shown} is already locked."),

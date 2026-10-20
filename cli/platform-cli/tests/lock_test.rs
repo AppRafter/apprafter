@@ -134,6 +134,67 @@ fn a_plain_lock_on_without_a_terminal_says_why_it_takes_a_lock_password() {
     assert_eq!(store_yaml(&sp), None);
 }
 
+/// `sp`'s locked store as an interrupted `lock on` (`locking`) or `lock off` (`unlocking`)
+/// leaves it, its vault on disk.
+fn interrupted_as(sp: &Spawn, mode: apprafter_core::secrets::SecretsMode) {
+    let root = sp.store();
+    let held = cli_core::StoreLock::exclusive(&cli_core::TargetStorePaths::for_root(root.clone()))
+        .unwrap();
+    let mut file = apprafter_core::secrets::read_store_file(&root)
+        .unwrap()
+        .unwrap();
+    file.secrets = mode;
+    apprafter_core::secrets::write_store_file(&root, &file, &held).unwrap();
+}
+
+/// D.4b (d4b-c3's Deviation 10, d4b-e1a): an interrupted `lock on` whose vault this AppRafter
+/// cannot finish — here the recovery key is its only slot — is refused when it is planned,
+/// and its help names `lock off` alone, never `lock on` again, which would refuse it the same
+/// way; nothing is asked or written.
+#[test]
+fn an_interrupted_lock_on_this_build_cannot_finish_names_lock_off() {
+    let sp = Spawn::new();
+    locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
+    interrupted_as(&sp, apprafter_core::secrets::SecretsMode::Locking);
+    let before = store_yaml(&sp);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let flat = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("apprafter::secrets::lock_incomplete"),
+        "{stderr}"
+    );
+    assert!(
+        flat.contains("This AppRafter cannot finish that run")
+            && flat.contains("`apprafter lock off` backs it out with the recovery key"),
+        "{stderr}"
+    );
+    assert!(!flat.contains("Run `apprafter lock on` again"), "{stderr}");
+    assert_eq!(store_yaml(&sp), before, "nothing was written");
+    assert!(sp.store().join("vault").exists());
+}
+
+/// The same refusal for an interrupted `lock off` keeps its own help: `lock off` again
+/// finishes it (D.4a T37).
+#[test]
+fn lock_on_over_an_interrupted_lock_off_names_lock_off_again() {
+    let sp = Spawn::new();
+    locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
+    interrupted_as(&sp, apprafter_core::secrets::SecretsMode::Unlocking);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let flat = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("apprafter::secrets::lock_incomplete"),
+        "{stderr}"
+    );
+    assert!(flat.contains("Run `apprafter lock off` again"), "{stderr}");
+    assert!(
+        !flat.contains("This AppRafter cannot finish that run"),
+        "{stderr}"
+    );
+}
+
 /// C26: on a store in files `lock off` has nothing to do.
 #[test]
 fn lock_off_on_a_store_in_files_says_so() {
