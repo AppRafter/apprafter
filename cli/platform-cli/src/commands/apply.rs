@@ -1104,6 +1104,97 @@ mod tests {
         assert_eq!(s.cached_kubeconfig(&s.ctx).as_deref(), Some(YAML));
     }
 
+    use crate::commands::state_paths::testing::{opened_by_new_password, rekey};
+
+    /// The cache on disk opens with the store key of the vault on disk — opened with the lock
+    /// password [`rekey`] set, one derivation at a time (critic round, finding 13) — and
+    /// records that vault (B86).
+    fn opens_with_the_store_key_on_disk(s: &Scratch, vault_id: &str) {
+        use apprafter_core::secrets::FixedVaultAccess;
+        let opened = opened_by_new_password(&s.ctx);
+        assert_eq!(opened.vault_id.to_string(), vault_id);
+        let reader = s
+            .ctx
+            .clone()
+            .with_vault_access(std::sync::Arc::new(FixedVaultAccess::new(
+                opened.key.clone(),
+                opened.vault_id,
+            )));
+        assert_eq!(s.cached_kubeconfig(&reader).as_deref(), Some(YAML));
+        assert!(
+            matches!(
+                &s.hetzner().kubeconfig_sealed_to,
+                Some(cli_state::SealedTo::StoreVault { vault_id: Some(v), .. }) if v == vault_id
+            ),
+            "{:?}",
+            s.hetzner().kubeconfig_sealed_to
+        );
+    }
+
+    /// D.4b B73, G-ROT (acceptance 2): a whole key change runs between this apply's first
+    /// read and its save — while it provisions — and apply's save keeps the cache the change
+    /// re-sealed: it opens with the store key of the vault on disk, never the key the change
+    /// retired, and apply's own fields land beside it. Nothing sleeps: the change runs at
+    /// apply's `WritePoint::BeforeLock`.
+    #[test]
+    fn apply_keeps_the_cache_a_key_change_resealed_while_it_provisioned() {
+        let s = Scratch::new();
+        cache_kubeconfig(&s.ctx, &WaitSignal::none()).unwrap();
+        lock_on(&s.ctx, &WaitSignal::none());
+        let api = live_project();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::BeforeLock, move |signal| rekey(&ctx, signal));
+        persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        let done = other.result();
+        assert_eq!(done.caches_resealed, 1, "{done:?}");
+        opens_with_the_store_key_on_disk(&s, &done.vault_id);
+        assert_eq!(applied(&s.hetzner()), from_live_project());
+    }
+
+    /// D.4b B73, G-ROT: a key change started while apply holds the store lock — its save
+    /// under way — waits for it (its own "waiting" event, never a clock), then re-seals the
+    /// cache in the state apply saved.
+    #[test]
+    fn a_key_change_waits_for_apply_s_save() {
+        let s = Scratch::new();
+        cache_kubeconfig(&s.ctx, &WaitSignal::none()).unwrap();
+        lock_on(&s.ctx, &WaitSignal::none());
+        let api = live_project();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::Reread, move |signal| rekey(&ctx, signal));
+        persist_state(&provider_at(&api), &early, &s.store, &s.paths, "platform-1").unwrap();
+        let done = other.result();
+        assert_eq!(done.caches_resealed, 1, "{done:?}");
+        opens_with_the_store_key_on_disk(&s, &done.vault_id);
+        assert_eq!(applied(&s.hetzner()), from_live_project());
+    }
+
+    /// D.4b B73, G-ROT (critic round, finding 6): an apply started while a key change holds
+    /// the store lock — the key change at R3's re-read of this target's state — waits for it
+    /// (its own `LockWait`, never a clock), then merges into the state R3 saved: the cache it
+    /// saves opens with the store key of the vault on disk, and its own fields land beside
+    /// it. The key change runs on this thread; apply on the one `interleave` starts.
+    #[test]
+    fn apply_started_during_a_key_change_waits_and_keeps_its_cache() {
+        let s = Scratch::new();
+        cache_kubeconfig(&s.ctx, &WaitSignal::none()).unwrap();
+        lock_on(&s.ctx, &WaitSignal::none());
+        let api = live_project();
+        let provider = provider_at(&api);
+        let early = s.state();
+        let (store, paths) = (s.store.clone(), s.paths.clone());
+        let apply = interleave(WritePoint::Reread, move |_| {
+            persist_state(&provider, &early, &store, &paths, "platform-1")
+        });
+        let done = rekey(&s.ctx, &WaitSignal::none());
+        apply.result().unwrap();
+        assert_eq!(done.caches_resealed, 1, "{done:?}");
+        opens_with_the_store_key_on_disk(&s, &done.vault_id);
+        assert_eq!(applied(&s.hetzner()), from_live_project());
+    }
+
     /// WI-487: a `lock on` started while apply holds the store lock waits for it, then
     /// re-seals the cache in the state apply saved: apply cannot write back the copy under the
     /// shared key it read before.

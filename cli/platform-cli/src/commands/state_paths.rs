@@ -218,8 +218,14 @@ pub(crate) mod testing {
     use std::sync::{Mutex, PoisonError};
     use std::thread::JoinHandle;
 
+    use apprafter_core::lock::{
+        begin_rotate, execute_rotate, open_at, plan_rotate, Answered, KeysRotated, OpenedVault,
+        RotateAnswer, RotateKind, RotateQuestion, UnknownFacts,
+    };
     use apprafter_core::lock::{execute_on, plan_on, LockOnInput, LockedOn, WayAsked};
     use apprafter_core::lock::{first_slot, FirstSecret, FirstStep};
+    use apprafter_core::secrets::read_store_file;
+    use apprafter_core::vault::{KdfPolicy, SlotInput};
     use apprafter_core::{CancellationToken, Context, Event, Outcome, Reporter, SecretString};
     use cli_core::secrets::CachedSecret;
     use cli_core::target::{
@@ -379,6 +385,68 @@ pub(crate) mod testing {
             Outcome::Completed { result } => result,
             other => panic!("lock on did not complete: {other:?}"),
         }
+    }
+
+    /// The lock password [`rekey`] sets.
+    pub(crate) const NEW_PASSWORD: &str = "a new lock password, long enough";
+
+    /// `lock rekey`, run to its end as the CLI runs it (D.4b B73, G-ROT): opened with
+    /// [`lock_on`]'s lock password, a new one set ([`NEW_PASSWORD`]), Enter at the recovery
+    /// key's question — a new key, typed back as shown; `signal` hears it wait for the store
+    /// lock. One at a time with `lock on` (release keys in a plain build).
+    pub(crate) fn rekey(ctx: &Context, signal: &WaitSignal) -> KeysRotated {
+        let _one = ONE_LOCK_ON.lock().unwrap_or_else(PoisonError::into_inner);
+        let plan =
+            plan_rotate(ctx, RotateKind::Rekey, &UnknownFacts).expect("the key change's plan");
+        let mut material = begin_rotate(ctx, &plan, SecretString::new(PASSWORD))
+            .expect("opened with the lock password");
+        while let Some(question) = material.question() {
+            let answer = match question {
+                RotateQuestion::NewLockPassword => SecretString::new(NEW_PASSWORD),
+                RotateQuestion::KeepRecoveryKey { .. } => SecretString::new(""),
+                RotateQuestion::NewRecoveryKey { shown, .. } => shown,
+                RotateQuestion::Keep { slot, .. } => {
+                    panic!("a store `lock_on` made has no {slot:?} to keep")
+                }
+            };
+            let taken = material
+                .answer(RotateAnswer::Typed(answer))
+                .expect("an answer");
+            assert!(
+                matches!(taken, Answered::Taken | Answered::TakenShort(_)),
+                "{taken:?}"
+            );
+        }
+        match execute_rotate(
+            ctx,
+            plan,
+            material,
+            &HearsWaits(signal),
+            &CancellationToken::new(),
+        )
+        .expect("the key change")
+        {
+            Outcome::Completed { result } => result,
+            other => panic!("the key change did not complete: {other:?}"),
+        }
+    }
+
+    /// The vault on disk opened with [`NEW_PASSWORD`], one key derivation at a time with
+    /// `lock on` and [`rekey`] (release keys in a plain build; critic round, finding 13).
+    pub(crate) fn opened_by_new_password(ctx: &Context) -> OpenedVault {
+        let _one = ONE_LOCK_ON.lock().unwrap_or_else(PoisonError::into_inner);
+        let root = ctx.config_root();
+        let id = read_store_file(root)
+            .expect("store.yaml")
+            .and_then(|file| file.id)
+            .expect("a locked store's id");
+        open_at(
+            root,
+            &id,
+            SlotInput::from_input(SecretString::new(NEW_PASSWORD), None),
+            KdfPolicy::active(),
+        )
+        .expect("the new lock password opens the vault on disk")
     }
 
     /// A reporter that tells `signal` when the run waits for the store lock.
