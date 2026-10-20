@@ -270,6 +270,19 @@ fn a_fallback_said_first_no_account() {
     );
 }
 
+/// WI-545: under no_new_privs the plan falls back at B88 (3) — after the account, before the
+/// machine id — though a back-off is in force and the account has no password: the system was
+/// asked only whether it can check, never the back-off's record or the password's status.
+#[test]
+fn a_fallback_said_first_no_new_privs() {
+    a_fallback_is_said_first(
+        "lock/lock_on_fallback_no_new_privs",
+        "backend no-new-privs\nbackoff wait 540 recent-failure\nstatus empty\n",
+        "it runs with no_new_privs",
+        &["Backend"],
+    );
+}
+
 #[test]
 fn a_fallback_said_first_no_machine_id() {
     a_fallback_is_said_first(
