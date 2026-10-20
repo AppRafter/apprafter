@@ -130,7 +130,8 @@ pub enum PasswordState {
     Locked,
     /// No password, or an empty one.
     Empty,
-    /// Not readable here (macOS tells an empty password from a set one only at a check).
+    /// Not readable here (macOS tells an empty password from a set one only at a check; Linux's
+    /// `passwd` says nothing clear without its privileges, WI-545).
     Unknown,
 }
 

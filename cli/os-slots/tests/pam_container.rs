@@ -214,6 +214,18 @@ fn a_locked_password_reads_locked_and_is_wrong() {
     assert_eq!(backend.check(&password, now()).outcome, CheckOutcome::Wrong);
 }
 
+/// WI-545: `passwd` without its set-uid bit cannot read `/etc/shadow` and prints `walker P`,
+/// whatever walker's password is — here none (`--empty-password`). The status reads unknown,
+/// never usable: `lock on` then offers the empty entry instead of calling Enter a slip.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-os-slots-linux.sh"]
+fn a_passwd_without_its_set_uid_bit_says_nothing_clear() {
+    walker();
+    let status = backend().password_status();
+    assert_eq!(status.state, PasswordState::Unknown, "{status:?}");
+    assert_eq!(status.changed, PasswordChanged::Unknown, "{status:?}");
+}
+
 /// libpam moved out of the library path: nothing to load, every path tried named, nothing
 /// counted.
 #[test]

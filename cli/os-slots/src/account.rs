@@ -2,11 +2,15 @@
 //! This account (`getpwuid_r(getuid())`, never a name from input and never `$HOME`) and what a
 //! process that is not root can read about its password (D.4b B16, B41, B75; GOTCHA-328).
 //!
-//! Linux: `passwd -S <account>` works for one's own account without privileges on Debian,
-//! Fedora and NixOS (d4b-a's probe): `<name> P|L|NP <date> …` — the password set, locked or none
-//! (`PS`, `LK` on older Fedora and RHEL too) and its last change as a day, `YYYY-MM-DD` or
+//! Linux: `passwd -S <account>` works for one's own account on Debian, Fedora and NixOS (d4b-a's
+//! probe) through `passwd`'s set-uid bit: `<name> P|L|NP <date> …` — the password set, locked or
+//! none (`PS`, `LK` on older Fedora and RHEL too) and its last change as a day, `YYYY-MM-DD` or
 //! `MM/DD/YYYY`. A day of 1970-01-02 or earlier is unknown: NixOS writes day 1 for a password
-//! set in its configuration, and day 0 means "change at next login".
+//! set in its configuration, and day 0 means "change at next login". Without its privileges —
+//! no_new_privs, the set-uid bit dropped, a nosuid mount, NixOS's profile `passwd` — shadow's
+//! `passwd` cannot read `/etc/shadow` and prints `<name> P` from `/etc/passwd`'s `x`
+//! placeholder, whatever the password is: a line without the change-day field is unknown
+//! (WI-545).
 //!
 //! macOS: `dscl . -read /Users/<account> AuthenticationAuthority` — "No such key" means the
 //! account has no password record, so no password; anything else is unknown, since an empty
@@ -150,6 +154,12 @@ pub(crate) fn parse_passwd_status(account: &str, out: &str) -> PasswordStatus {
     else {
         return PasswordStatus::UNKNOWN;
     };
+    // WI-545: shadow's `passwd` prints the change day and the ages only when it read
+    // /etc/shadow; without its privileges it prints `<name> P` from /etc/passwd's `x`
+    // placeholder, whatever the password is. A line without the change-day field says nothing.
+    if fields.len() < 3 {
+        return PasswordStatus::UNKNOWN;
+    }
     let state = match fields.get(1).copied() {
         Some("P" | "PS") => PasswordState::Usable,
         Some("L" | "LK") => PasswordState::Locked,
@@ -354,6 +364,61 @@ mod tests {
             parse_passwd_status("walker", refused),
             PasswordStatus::UNKNOWN
         );
+    }
+
+    /// WI-545: shadow's `passwd` that cannot read /etc/shadow — no_new_privs, its set-uid bit
+    /// dropped, a nosuid mount, NixOS's profile `passwd` — prints `<name> P` (the `x`
+    /// placeholder), whatever the password is: unknown, never usable, so `lock on` offers the
+    /// empty entry. The full lines of Debian, Fedora and NixOS read as before; the change-day
+    /// field alone is enough.
+    #[test]
+    fn a_line_without_the_change_day_field_is_unknown() {
+        for out in [
+            "walker P\n",
+            "walker P",
+            "walker NP\n",
+            "walker L\n",
+            "walker PS\n",
+        ] {
+            let status = parse_passwd_status("walker", out);
+            assert_eq!(status, PasswordStatus::UNKNOWN, "{out:?}");
+        }
+        let day = |days_since_epoch| PasswordChanged::Day { days_since_epoch };
+        for (out, state, changed) in [
+            // Debian 13 and Fedora 42 through their set-uid passwd (the e1a walk's W3xdiag).
+            (
+                "walker P 2026-10-16 0 99999 7 -1\n",
+                Usable,
+                day(PROBE_DAY + 1),
+            ),
+            (
+                "walker NP 2026-10-16 0 99999 7 -1\n",
+                Empty,
+                day(PROBE_DAY + 1),
+            ),
+            (
+                "walker L 2026-10-16 0 99999 7 -1\n",
+                Locked,
+                day(PROBE_DAY + 1),
+            ),
+            // NixOS's set-uid wrapper, /run/wrappers/bin/passwd (the walk's VM).
+            (
+                "walker P 2026-10-20 -1 -1 -1 -1\n",
+                Usable,
+                day(PROBE_DAY + 5),
+            ),
+            // NixOS, a password set in its configuration: day 1 (GOTCHA-328).
+            (
+                "walker P 1970-01-02 -1 -1 -1 -1\n",
+                Usable,
+                PasswordChanged::Unknown,
+            ),
+            // The rule asks for the change-day field, not for all seven.
+            ("walker P 2026-10-15\n", Usable, day(PROBE_DAY)),
+        ] {
+            let status = parse_passwd_status("walker", out);
+            assert_eq!(status, PasswordStatus { state, changed }, "{out:?}");
+        }
     }
 
     #[test]

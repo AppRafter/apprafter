@@ -36,6 +36,7 @@
 #   --no-run-user        no /run/user/<uid> (a container, or su without logind)
 #   --no-marker | --root-marker    no marker, or one root owns
 #   --machine-id absent|empty|<32 hex>
+#   --passwd-no-setuid   drop passwd's set-uid bit: shadow's passwd then cannot read /etc/shadow
 #
 # A case passes only when its one test reported `ok`, the harness ran exactly one test, and the
 # driver's own checks held; the cases here must be exactly the tests in the binary, so a renamed
@@ -58,6 +59,7 @@ CASES=(
     "an_empty_entry_never_reaches_pam --stack permit"
     "an_account_without_a_password_reads_empty_and_is_never_verified --empty-password"
     "a_locked_password_reads_locked_and_is_wrong --locked-password"
+    "a_passwd_without_its_set_uid_bit_says_nothing_clear --passwd-no-setuid --empty-password"
     "without_libpam_there_is_no_check --no-libpam"
     "without_a_pam_service_there_is_no_check --no-pam-service"
     "without_a_runtime_directory_there_is_no_back_off_record --no-run-user --stack permit"
@@ -169,7 +171,7 @@ cat >"$work/os-slots-case" <<'DRIVER_EOF'
 #   os-slots-case [flags] <test name>
 set -euo pipefail
 stack=distro tally=no expect_tally="" password=set libpam=yes service=yes run_user=yes
-marker=walker machine_id=keep
+marker=walker machine_id=keep passwd_setuid=keep
 while [[ $# -gt 1 ]]; do
     case "$1" in
     --stack) stack="$2"; shift ;;
@@ -183,6 +185,7 @@ while [[ $# -gt 1 ]]; do
     --no-marker) marker=none ;;
     --root-marker) marker=root ;;
     --machine-id) machine_id="$2"; shift ;;
+    --passwd-no-setuid) passwd_setuid=drop ;;
     *) echo "os-slots-case: unknown flag $1" >&2; exit 2 ;;
     esac
     shift
@@ -228,6 +231,10 @@ case "$password" in
 empty) passwd -d walker >/dev/null ;;
 locked) passwd -l walker >/dev/null ;;
 esac
+if [[ $passwd_setuid == drop ]]; then
+    # Without its set-uid bit shadow's passwd cannot read /etc/shadow (WI-545).
+    chmod u-s /usr/bin/passwd
+fi
 if [[ $libpam == no ]]; then
     mkdir -p /opt/hidden
     mv "$LIBDIR"/libpam.so.0* /opt/hidden/
