@@ -540,12 +540,117 @@ mod tests {
         ));
     }
 
+    /// An executable at `path` holding `contents`, written by a child process (GOTCHA-342):
+    /// this test process never holds a descriptor open for writing on it, so no sibling test
+    /// thread's fork can carry one into a child that has not exec'd yet — while such a copy is
+    /// open the kernel refuses to exec the file (ETXTBSY). The writer is `/bin/sh` running
+    /// builtins alone, which forks nothing, and its descriptors are closed once it is waited
+    /// for. `while_writing` runs while the writer runs.
+    #[cfg(unix)]
+    fn executable_with(path: &Path, contents: &str, while_writing: impl FnOnce()) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s' "$1" > "$2""#, "sh", contents])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        while_writing();
+        let status = writer.wait().unwrap();
+        assert!(status.success(), "writing {}: {status}", path.display());
+        // By path: no descriptor.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) {
+        executable_with(&dir.join(name), &format!("#!/bin/sh\n{body}\n"), || {});
+    }
+
+    /// A sibling test's child that has not exec'd yet, kept: it holds every descriptor of this
+    /// process into a directory past its own exec, until the guard drops (its stdin closes, it
+    /// exits, it is waited for).
+    #[cfg(target_os = "linux")]
+    struct Sibling(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Sibling {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Fork now, as a sibling test thread may at any moment, and keep in the child every
+    /// descriptor this process has open into `dir`: their close-on-exec flags are cleared in the
+    /// child alone, so its copies outlive its exec (`/bin/sh` waiting on its stdin) as a
+    /// not-yet-exec'd child's would. `spawn` returns once the child has exec'd.
+    #[cfg(target_os = "linux")]
+    fn fork_now_keeping(dir: &Path) -> Sibling {
+        use std::os::unix::process::CommandExt;
+        let dir = dir.canonicalize().unwrap();
+        let fds: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|to| to.starts_with(&dir)))
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .collect();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: fcntl(2) is async-signal-safe, and the closure only reads `fds`.
+        unsafe {
+            cmd.pre_exec(move || {
+                for &fd in &fds {
+                    libc::fcntl(fd, libc::F_SETFD, 0);
+                }
+                Ok(())
+            });
+        }
+        Sibling(cmd.spawn().unwrap())
+    }
+
+    /// GOTCHA-342: a stand-in is never exec'd while a copy of a descriptor that wrote it is
+    /// open — the copy a sibling test's fork keeps from its fork until its own exec, for which
+    /// the kernel refuses the stand-in's exec (ETXTBSY). Forced: a child forked while the
+    /// stand-in is written keeps every descriptor of this process into its directory. The
+    /// control: such a copy of a write descriptor this process held fails the probe, so the race
+    /// is real on this kernel and the check below cannot pass without meeting it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stand_in_is_never_busy_for_a_fork_that_kept_its_writer() {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let f = dir.join(name);
-        std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().as_os_str().to_owned();
+        let r = ToolResolver::new(&p, None, false);
+        let cancel = CancellationToken::new();
+        let helm = dir.path().join("helm");
+        let mut f = std::fs::File::create(&helm).unwrap();
+        let control = fork_now_keeping(dir.path());
+        f.write_all(b"#!/bin/sh\necho v3.99\n").unwrap();
+        drop(f);
+        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let busy = r.probe(ToolId::Helm, Duration::from_secs(5), &cancel);
+        drop(control);
+        assert!(
+            matches!(&busy.problem, Some(ToolProblem::SpawnFailed { error }) if error.contains("Text file busy")),
+            "the control: a kept copy of a write descriptor makes the exec busy: {busy:?}"
+        );
+        let mut sibling = None;
+        executable_with(
+            &dir.path().join("git"),
+            "#!/bin/sh\necho git version 2.99\n",
+            || sibling = Some(fork_now_keeping(dir.path())),
+        );
+        let git = r.probe(ToolId::Git, Duration::from_secs(5), &cancel);
+        drop(sibling);
+        assert_eq!(
+            (git.version.as_deref(), git.problem.clone()),
+            (Some("git version 2.99"), None)
+        );
     }
 
     /// `sleep` by its absolute path, from the test process's own `PATH`: a probed child's
@@ -677,11 +782,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_found_tool_whose_interpreter_is_missing_is_not_reported_missing() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let helm = dir.path().join("helm");
-        std::fs::write(&helm, "#!/nonexistent/interpreter\n").unwrap();
-        std::fs::set_permissions(&helm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        executable_with(&helm, "#!/nonexistent/interpreter\n", || {});
         let p = dir.path().as_os_str().to_owned();
         let status = ToolResolver::new(&p, None, false).probe(
             ToolId::Helm,
