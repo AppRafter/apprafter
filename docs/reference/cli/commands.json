@@ -2444,9 +2444,22 @@
       "hidden": false,
       "examples": [
         "apprafter lock on",
+        "apprafter lock on --lock-password",
         "apprafter lock on --timeout 15"
       ],
       "args": [
+        {
+          "id": "lock_password",
+          "long": "lock-password",
+          "short": null,
+          "takes_value": false,
+          "value_name": "LOCK_PASSWORD",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Protect the store with a separate lock password, asked twice, which only AppRafter's prompt ever sees; then a recovery key is shown once, which you type back"
+        },
         {
           "id": "timeout",
           "long": "timeout",

@@ -87,7 +87,7 @@ fn holding(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
 fn lock_on_without_a_terminal_is_refused() {
     let sp = Spawn::new();
     seeded(&sp);
-    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("apprafter::cli::usage_refused"), "{stderr}");
     assert!(
@@ -131,7 +131,7 @@ fn lock_off_without_a_terminal_is_store_locked() {
 fn lock_on_on_a_locked_store_says_so() {
     let sp = Spawn::new();
     locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
-    let (code, stdout, stderr) = run(&sp, &["lock", "on"]);
+    let (code, stdout, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stdout.contains("is already locked."), "{stdout}");
 }
@@ -139,7 +139,7 @@ fn lock_on_on_a_locked_store_says_so() {
 #[test]
 fn a_window_longer_than_a_day_is_a_usage_error() {
     let sp = Spawn::new();
-    let (code, _, stderr) = run(&sp, &["lock", "on", "--timeout", "1441"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password", "--timeout", "1441"]);
     assert_eq!(code, Some(2), "{stderr}");
 }
 
@@ -165,7 +165,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
     const NOTE: &str = "INSECURE-FAST-KDF: this test build derives keys with weak parameters\n";
     let sp = Spawn::new().without_env("APPRAFTER_SANDBOX");
     seeded(&sp);
-    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(1), "{stderr}");
     if KdfPolicy::active().is_release() {
         assert!(stderr.contains("apprafter::cli::usage_refused"), "{stderr}");
@@ -196,21 +196,22 @@ mod at_a_terminal {
         format!("{}\r", shown_recovery_key(terminal)).into_bytes()
     }
 
-    /// `lock on` with PASSWORD and the key typed back.
+    /// `lock on`'s dialogue with PASSWORD and the key typed back (D.4a's).
+    fn lock_steps() -> Vec<Step> {
+        vec![
+            Step::Expect("Lock the secrets of the target store at "),
+            Step::Expect(NEW),
+            line(PASSWORD),
+            Step::Expect(REPEAT),
+            line(PASSWORD),
+            Step::Expect(CONFIRM),
+            Step::TypeFrom(type_key),
+        ]
+    }
+
+    /// `lock on --lock-password` with PASSWORD and the key typed back (G-LOCKON-D4A: D.4b B58).
     fn lock_at_terminal(sp: &Spawn) -> Ended {
-        converse(
-            sp,
-            &["lock", "on"],
-            &[
-                Step::Expect("Lock the secrets of the target store at "),
-                Step::Expect(NEW),
-                line(PASSWORD),
-                Step::Expect(REPEAT),
-                line(PASSWORD),
-                Step::Expect(CONFIRM),
-                Step::TypeFrom(type_key),
-            ],
-        )
+        converse(sp, &["lock", "on", "--lock-password"], &lock_steps())
     }
 
     const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
@@ -271,7 +272,7 @@ mod at_a_terminal {
         seeded(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(SHORT),
@@ -307,7 +308,7 @@ mod at_a_terminal {
         seeded(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(""),
@@ -348,7 +349,7 @@ mod at_a_terminal {
                 .replace('\n', " ");
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(PASSWORD),
@@ -480,7 +481,7 @@ mod at_a_terminal {
         interrupted(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect("did not finish; finishing it."),
                 Step::Expect(RESUME_PASSWORD),
@@ -513,7 +514,7 @@ mod at_a_terminal {
         let before = store_yaml(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(RESUME_PASSWORD),
                 line(PASSWORD),
@@ -565,6 +566,18 @@ mod at_a_terminal {
         assert!(!end.terminal.contains("shared age key"), "{}", end.terminal);
         assert!(!end.terminal.contains(&shown) && !end.stdout.contains(&shown));
         assert!(!dest.exists() && !default.exists());
+    }
+
+    /// G-LOCKON-D4A (D.4b B58 (1), B93): until `lock on` gets its default (d4b-e1a Task 4), a
+    /// plain `lock on` is `--lock-password`'s dialogue byte for byte.
+    #[test]
+    fn a_plain_lock_on_is_the_lock_password_dialogue() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let end = converse(&sp, &["lock", "on"], &lock_steps());
+        assert!(end.status.success(), "{}", end.terminal);
+        check_transcript("lock/lock_on_lock_password", &sp, &end);
     }
 
     /// D.4b-e1a: the transcript harness masks what varies per run — the root, the recovery

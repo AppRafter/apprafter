@@ -73,7 +73,12 @@ const CLEAR_AGAIN: &str = "The secrets will be on disk in clear again: any progr
 
 pub(crate) fn run(action: LockCommand) -> miette::Result<()> {
     match action {
-        LockCommand::On { timeout } => on(&Terminal, timeout),
+        // D.4b B58 (1): `--lock-password` names the flow every `lock on` takes until d4b-e1a
+        // Task 4 gives it its default — a separate lock password.
+        LockCommand::On {
+            timeout,
+            lock_password: _,
+        } => on(&Terminal, timeout),
         LockCommand::Off => off(&Terminal),
         LockCommand::Now => now(),
         LockCommand::Status => status(),

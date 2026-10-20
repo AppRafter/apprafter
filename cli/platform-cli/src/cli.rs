@@ -1645,6 +1645,10 @@ pub enum LockCommand {
     /// back. Run it again to finish an interrupted run; on a locked store, `--timeout` changes
     /// the default unlock window.
     On {
+        /// Protect the store with a separate lock password, asked twice, which only AppRafter's
+        /// prompt ever sees; then a recovery key is shown once, which you type back.
+        #[arg(long)]
+        lock_password: bool,
         /// Minutes an unlock window stays open by default, restarted by each command that uses
         /// it; 0 makes every command ask. Default 5.
         #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(0..=1440))]

@@ -183,7 +183,7 @@ fn a_renewal_refuses_before_its_wizard_asks_for_the_new_token() {
 fn lock_on_refuses_before_it_asks_for_a_password() {
     let sp = Spawn::new();
     let folder = files_store(&sp);
-    let args = ["lock", "on"];
+    let args = ["lock", "on", "--lock-password"];
     refused_before_asking(&converse(&sp, &args, &[]), &folder, &args);
 }
 

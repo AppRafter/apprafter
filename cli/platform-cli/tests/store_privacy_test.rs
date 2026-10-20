@@ -121,7 +121,7 @@ fn a_store_others_can_write_is_refused_reported_and_used_again_once_fixed() {
         (&["target", "use", "prod"], false),
         (&["whoami"], true),
         // d4a-h F1: refused when planned, before it asks for a password or shows a key.
-        (&["lock", "on"], false),
+        (&["lock", "on", "--lock-password"], false),
     ] {
         let (code, stdout, stderr) = run(&sp, args, ping);
         assert_eq!(code, Some(1), "{args:?}: {stderr}");

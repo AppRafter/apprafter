@@ -816,3 +816,13 @@ fn unlock_and_backup_unlock_name_each_other() {
     assert!(unlock.contains("apprafter backup unlock"), "{unlock}");
     assert!(backup.contains("apprafter unlock"), "{backup}");
 }
+
+/// D.4b B58 (d4b-e1a): `lock on` names `--lock-password`, the separate lock password by name,
+/// in its options — not only in an example: `-h` shows the Examples block (`after_help`),
+/// which names `apprafter lock on --lock-password` too (critic round, finding 2).
+#[test]
+fn lock_on_names_its_lock_password_flag() {
+    let help = short_help_for(&["lock", "on"]);
+    let flag = |l: &str| l.trim_start().starts_with("--lock-password");
+    assert!(help.lines().any(flag), "{help}");
+}

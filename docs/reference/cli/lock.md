@@ -60,12 +60,14 @@ Usage: apprafter lock on [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--lock-password` | flag | — | no | Protect the store with a separate lock password, asked twice, which only AppRafter's prompt ever sees; then a recovery key is shown once, which you type back |
 | `--timeout` | `<MINUTES>` | — | no | Minutes an unlock window stays open by default, restarted by each command that uses it; 0 makes every command ask. Default 5 |
 
 Examples:
 
 ```sh
 apprafter lock on
+apprafter lock on --lock-password
 apprafter lock on --timeout 15
 ```
 
