@@ -662,6 +662,21 @@ fn the_holder_refuses_a_terminal() {
     );
 }
 
+/// The conversation harness itself (GOTCHA-379): a child reaped is not a child read — its last
+/// output can still be in the terminal, or in the reader's hands — so a step decides "not shown"
+/// only once the terminal has closed. Forced: what the terminal shows reaches the steps only
+/// after the harness has seen the child exit (`__holder` at a terminal says it is no command,
+/// and exits 2 at once).
+#[test]
+fn converse_reads_the_terminal_to_its_end_before_it_says_a_text_was_not_shown() {
+    let ended = common::terminal::converse_holding_output(
+        &Spawn::new(),
+        &["__holder"],
+        &[common::terminal::Step::Expect("is not a command")],
+    );
+    assert_eq!(ended.status.code(), Some(2), "{}", ended.terminal);
+}
+
 /// T47: a holder whose init pipe carries no init frame writes nothing and exits.
 #[test]
 fn a_holder_without_an_init_frame_writes_nothing() {
