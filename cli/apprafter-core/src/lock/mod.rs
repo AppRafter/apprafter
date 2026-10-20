@@ -32,8 +32,10 @@ mod ways_tests;
 pub use status::status;
 
 pub use facts::{BackoffFact, CheckBackend, PasswordFact, WayFacts};
+pub use facts::{HelloKeyDeleted, HelloKeys, NoHelloKeys};
 pub use facts::{HostOs, MachineFact, SlotFacts, UnknownFacts};
 pub use faults::FaultPoint;
+pub use off::HelloKeyGone;
 pub use off::{execute_off, plan_off, LockOffPayload, LockOffStart, LockedOff};
 pub use on::{
     execute_on, plan_on, CacheDrop, DroppedCache, LockOnInput, LockOnPayload, LockOnStart,

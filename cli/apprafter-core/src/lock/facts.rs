@@ -9,7 +9,11 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
+use crate::secrets::StoreId;
 use crate::vault::MachineId;
+use crate::vault::SlotRecord;
 
 /// The operating system the slot backend plays (B15): the scripted stand-in names the one it
 /// plays, so S3's refusal (`not_on_this_os`) reads it here, never `cfg!`.
@@ -142,6 +146,56 @@ pub trait WayFacts: SlotFacts {
     fn backoff(&self) -> BackoffFact;
     /// This account's password status.
     fn password_status(&self) -> PasswordFact;
+}
+
+/// This computer's Windows Hello keys, as the client deletes them (D.4b B25; ADR 0069 §4):
+/// the core never calls the OS. `lock off` hands the client each Windows Hello slot of the
+/// vault it opened — after the files were written and read back, before the vault is
+/// deleted — so no key of AppRafter's own outlives its vault unsaid (Windows Hello has no
+/// list in which to find one later). d4b-w2 implements it over `apprafter-os-slots`; until
+/// then every `Context` carries [`NoHelloKeys`]. It is called under the store's held lock:
+/// it must not open a dialog (P-W10, as B84 says of R4b; critic round, finding 15).
+pub trait HelloKeys: Send + Sync + fmt::Debug {
+    /// Deletes this computer's key of `slot`, a Windows Hello slot of store `store`'s vault —
+    /// the key's name is the client's (d4b-w1) — and says what became of it.
+    fn delete(&self, store: &StoreId, slot: &SlotRecord) -> HelloKeyDeleted;
+}
+
+/// What became of this computer's key of one Windows Hello slot (D.4b B25): `lock off`
+/// lists each.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum HelloKeyDeleted {
+    /// Deleted from this computer.
+    Deleted,
+    /// The slot was made on another computer (its label names it): its key stays there and
+    /// still signs for copies of the vault made while the slot existed — "stays on" its
+    /// computer's label (B25; critic round, finding 4).
+    OtherComputer,
+    /// This computer's key of the slot is gone already.
+    NotHere,
+    /// Not deleted, and `why`: the key still signs for copies of the vault made while its
+    /// slot existed. Never a reason to keep the store from files (ADR 0068: a person can
+    /// always return to files).
+    Kept { why: String },
+}
+
+/// No Windows Hello in this client: what every `Context` builder carries until d4b-w2. A
+/// Windows Hello slot's key — one a newer AppRafter made here — is kept, and `lock off`
+/// lists it with why.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHelloKeys;
+
+impl HelloKeys for NoHelloKeys {
+    fn delete(&self, _store: &StoreId, _slot: &SlotRecord) -> HelloKeyDeleted {
+        HelloKeyDeleted::Kept {
+            why: "this AppRafter cannot reach Windows Hello".to_string(),
+        }
+    }
 }
 
 /// Tests: the facts a test sets (d4b-c1), on any OS.

@@ -16,6 +16,9 @@
 //! - how a locked store's secrets open in this client ([`VaultAccess`], D.4a §3.3):
 //!   [`NoVaultAccess`] from every builder, which refuses, until the client injects its own
 //!   ([`Context::with_vault_access`]);
+//! - how this computer's Windows Hello keys are deleted when `lock off` removes a vault
+//!   ([`HelloKeys`], D.4b B25): [`NoHelloKeys`] from every builder until d4b-w2
+//!   ([`Context::with_hello_keys`]);
 //! - the home directory (the age key's default, the `~/` of shown paths),
 //!   the age key path, the tool search path and where it came from
 //!   ([`PathSource`]), a private runtime dir, and on Linux and macOS where a
@@ -37,6 +40,7 @@ use zeroize::Zeroizing;
 
 use crate::env::EnvSource;
 use crate::error::{CoreError, CoreResult};
+use crate::lock::facts::{HelloKeys, NoHelloKeys};
 #[cfg(any(test, feature = "test-support"))]
 use crate::lock::FaultPoint;
 use crate::lock::{HolderBase, HolderBaseSource};
@@ -208,6 +212,9 @@ pub struct Context {
     no_ping: bool,
     /// How a locked store's secrets open here (D.4a T12): the client's, else `NoVaultAccess`.
     vault_access: Arc<dyn VaultAccess>,
+    /// How this computer's Windows Hello keys are deleted (D.4b B25): the client's, else
+    /// `NoHelloKeys`.
+    hello_keys: Arc<dyn HelloKeys>,
     /// Where a terminal's unlock holder keeps its endpoint (D.4a T49): the CLI's, from its
     /// environment; `None` on Windows (a pipe) and for the desktop (no holder).
     holder_base: Option<HolderBase>,
@@ -422,6 +429,7 @@ impl Context {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             no_ping: false,
             vault_access: Arc::new(NoVaultAccess),
+            hello_keys: Arc::new(NoHelloKeys),
             holder_base: None,
             insecure_kdf_roots: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
@@ -475,6 +483,17 @@ impl Context {
 
     pub fn vault_access(&self) -> &Arc<dyn VaultAccess> {
         &self.vault_access
+    }
+
+    /// How this computer's Windows Hello keys are deleted when `lock off` removes a vault
+    /// (D.4b B25): d4b-w2's client; a test's recorder.
+    pub fn with_hello_keys(mut self, keys: Arc<dyn HelloKeys>) -> Self {
+        self.hello_keys = keys;
+        self
+    }
+
+    pub fn hello_keys(&self) -> &Arc<dyn HelloKeys> {
+        &self.hello_keys
     }
 
     /// Where an `insecure-fast-kdf` build may create a password slot (D.4a T23, critic S2): the
