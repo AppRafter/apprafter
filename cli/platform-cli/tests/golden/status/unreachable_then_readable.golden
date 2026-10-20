@@ -1,0 +1,18 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (kubectl get platformstack failed (exit Some(1)): The connection to the server 127.0.0.1:1 was refused - did you specify the right host or port?
+)
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans awaiting approval (1) — rollouts are paused until each is decided:
+  shop/shop-prod-7f2a (destructive)
+  run `apprafter migration approve <name>` to let one through
+[stderr]

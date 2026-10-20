@@ -1,0 +1,12 @@
+$ apprafter top
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × the cluster reports no nodes, so there is no capacity to show
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

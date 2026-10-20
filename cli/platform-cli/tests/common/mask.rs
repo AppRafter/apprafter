@@ -83,3 +83,33 @@ pub fn mask_millis(s: &str) -> String {
     out.push_str(&s[copied..]);
     out
 }
+
+/// Replace every absolute minute `YYYY-MM-DD HH:MM UTC` (`cli_core::timefmt`'s absolute half)
+/// with `YYYY-MM-DD hh:mm UTC`, the same width, so a table built around one stays aligned
+/// (D.5 B55): a fixture's times are offsets from the run's clock, so the absolute minute
+/// varies per run while the relative words beside it do not.
+pub fn mask_utc_minutes(s: &str) -> String {
+    const SHAPE: &[u8] = b"9999-99-99 99:99 UTC";
+    const MASK: &str = "YYYY-MM-DD hh:mm UTC";
+    let bytes = s.as_bytes();
+    let (mut out, mut copied, mut at) = (String::with_capacity(s.len()), 0, 0);
+    while at < bytes.len() {
+        let after_a_digit = at > 0 && bytes[at - 1].is_ascii_digit();
+        let fits = bytes.get(at..at + SHAPE.len()).is_some_and(|head| {
+            head.iter().zip(SHAPE).all(|(b, want)| match want {
+                b'9' => b.is_ascii_digit(),
+                literal => b == literal,
+            })
+        });
+        if !after_a_digit && fits {
+            out.push_str(&s[copied..at]);
+            out.push_str(MASK);
+            at += SHAPE.len();
+            copied = at;
+        } else {
+            at += 1;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
+}

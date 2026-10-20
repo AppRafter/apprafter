@@ -1,0 +1,13 @@
+$ apprafter platform status --cached
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × PlatformStack apprafter-system/default not found in cluster — is
+  │ `apprafter cluster-bootstrap` complete?
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

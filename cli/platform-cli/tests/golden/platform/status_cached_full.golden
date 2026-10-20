@@ -1,0 +1,38 @@
+$ apprafter platform status --cached
+[exit 0]
+[stdout]
+PlatformStack apprafter-system/default — tier 1
+  channel:     stable
+  pin:         (unpinned)
+  autoUpgrade: false
+
+Versions:
+  current:   1.4.2
+  target:    1.4.2
+  available: 1.5.0
+  lastCheck: YYYY-MM-DD hh:mm UTC (3 hours ago)
+
+Conditions:
++------------------+--------+-----------------+--------------------------------------+
+| TYPE             | STATUS | REASON          | MESSAGE                              |
++------------------+--------+-----------------+--------------------------------------+
+| Ready            | True   | Healthy         | the platform Application is Healthy  |
++------------------+--------+-----------------+--------------------------------------+
+| Synced           | True   | Synced          | the platform Application is Synced   |
++------------------+--------+-----------------+--------------------------------------+
+| UpgradeAvailable | True   | NewerRelease    | 1.5.0 is available on channel stable |
++------------------+--------+-----------------+--------------------------------------+
+| BackupHealthy    | True   | BackupSucceeded | the last backup Job succeeded        |
++------------------+--------+-----------------+--------------------------------------+
+| BackupRetention  | True   | Pruned          | the last prune kept 14 snapshots     |
++------------------+--------+-----------------+--------------------------------------+
+
+Recent history (last 2):
++------------------------------------+---------+-----------+
+| APPLIED AT                         | VERSION | OUTCOME   |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (3 days ago)  | 1.4.2   | succeeded |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (12 days ago) | 1.3.7   | succeeded |
++------------------------------------+---------+-----------+
+[stderr]

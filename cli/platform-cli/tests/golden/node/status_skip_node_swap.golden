@@ -1,0 +1,15 @@
+$ apprafter node status
+[exit 0]
+[stdout]
+Node swap status for solo-1
+  swap skipped by env (APPRAFTER_SKIP_NODE_SWAP) — node runs cushionless by request
+
+  [api] kubeletVersion : v1.35.5+k3s1
+  [api] failSwapOn     : true
+  [api] swapBehavior   : unknown
+  [api] swap.capacity  : unknown
+  [ssh] swapon         : unknown
+  [ssh] vm.swappiness  : 60
+  [ssh] GOMEMLIMIT     : unknown
+  [ssh] provision      : unknown
+[stderr]

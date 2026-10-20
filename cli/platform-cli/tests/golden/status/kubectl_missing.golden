@@ -1,0 +1,15 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (spawn kubectl: No such file or directory (os error <N>))
+
+Applications: could not read (spawn kubectl: No such file or directory (os error <N>)) — problem state unknown.
+
+Migration plans: could not read (spawn kubectl: No such file or directory (os error <N>)) — approval state unknown.
+[stderr]

@@ -1,0 +1,18 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: 1.4.2
+
+Backups: not enabled.
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans: could not read (kubectl get migrationplan failed (exit Some(1)): Error from server (Forbidden): migrationplans.apprafter.io is forbidden: User "golden" cannot list resource "migrationplans" in API group "apprafter.io" at the cluster scope
+) — approval state unknown.
+[stderr]

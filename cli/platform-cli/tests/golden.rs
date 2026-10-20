@@ -107,6 +107,44 @@ fn harness_leaves_non_timestamps_alone() {
     }
 }
 
+/// D.5 B55: the absolute half of `cli_core::timefmt`'s rendering varies with the run's clock
+/// (fixtures are offsets from it); its relative half does not. The mask keeps the width, so a
+/// table built around the text stays aligned.
+#[test]
+fn harness_masks_the_absolute_utc_minute_and_keeps_its_width() {
+    assert_eq!(
+        mask_utc_minutes("  lastCheck: 2026-10-16 14:30 UTC (3 hours ago)"),
+        "  lastCheck: YYYY-MM-DD hh:mm UTC (3 hours ago)"
+    );
+    assert_eq!(
+        mask_utc_minutes("| 2026-10-13 12:00 UTC (3 days ago) | 1.4.2 |\n| 2026-10-04 12:00 UTC |"),
+        "| YYYY-MM-DD hh:mm UTC (3 days ago) | 1.4.2 |\n| YYYY-MM-DD hh:mm UTC |"
+    );
+    assert_eq!("YYYY-MM-DD hh:mm UTC".len(), "2026-10-16 14:30 UTC".len());
+}
+
+#[test]
+fn harness_leaves_other_date_text_alone() {
+    for s in [
+        "12026-10-16 14:30 UTC",
+        "2026-10-16T14:30:00Z",
+        "2026-10-16 14:30",
+        "2026-10-16 14:30 CET",
+        "2026-10-16 1:30 UTC",
+        "v0.2.80 build 20261016",
+    ] {
+        assert_eq!(mask_utc_minutes(s), s, "{s}");
+    }
+}
+
+#[test]
+fn harness_normalize_masks_the_absolute_utc_minute() {
+    assert_eq!(
+        Sandbox::new().normalize("at 2026-10-16 14:30 UTC (in 1 hour)"),
+        "at YYYY-MM-DD hh:mm UTC (in 1 hour)"
+    );
+}
+
 #[test]
 fn harness_replace_bounded_replaces_a_standalone_version() {
     assert_eq!(
@@ -304,7 +342,8 @@ fn harness_refuses_output_that_still_names_the_sandbox_root() {
 }
 
 /// Every recorded file must belong to a case in this file, in
-/// `golden_doctor.rs` or, for `lock on`'s transcripts (D.4b-e1a), in
+/// `golden_doctor.rs`, in `golden_reads.rs` (D.5's read leaves, its id spelled
+/// as a literal) or, for `lock on`'s transcripts (D.4b-e1a), in
 /// `lock_test.rs` or `lock_on_ways_test.rs` — by its case name, or by its
 /// file's path where a test reads it so (`lock_on_fallback_sandbox_windows`);
 /// otherwise a renamed or deleted case would leave a golden that nothing
@@ -326,6 +365,7 @@ fn every_golden_file_has_a_case() {
         include_str!("golden_doctor.rs"),
         include_str!("lock_test.rs"),
         include_str!("lock_on_ways_test.rs"),
+        include_str!("golden_reads.rs"),
     ];
     let root = golden_root();
     let mut files = Vec::new();
@@ -354,8 +394,9 @@ fn every_golden_file_has_a_case() {
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs, golden_doctor.rs, lock_test.rs or \
-         lock_on_ways_test.rs (restore the case or delete the file): {orphans:?}"
+        "golden files with no case in golden.rs, golden_doctor.rs, golden_reads.rs, \
+         lock_test.rs or lock_on_ways_test.rs (restore the case or delete the file): \
+         {orphans:?}"
     );
 }
 

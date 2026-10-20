@@ -1,0 +1,16 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (kubectl get platformstack failed (exit Some(1)): Error from server (Forbidden): platformstacks.apprafter.io "default" is forbidden: User "golden" cannot get resource "platformstacks" in API group "apprafter.io" in the namespace "apprafter-system"
+)
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans: none awaiting approval.
+[stderr]

@@ -1,0 +1,15 @@
+$ apprafter node status
+[exit 0]
+[stdout]
+Node swap status for solo-1
+  swap active (4G) — NoSwap for pods
+
+  [api] kubeletVersion : v1.35.5+k3s1
+  [api] failSwapOn     : false
+  [api] swapBehavior   : NoSwap
+  [api] swap.capacity  : 4294967296
+  [ssh] swapon         : /swapfile file 4G 0B -2
+  [ssh] vm.swappiness  : 10
+  [ssh] GOMEMLIMIT     : 2GiB
+  [ssh] provision      : applied: /swapfile 4G, swappiness 10
+[stderr]

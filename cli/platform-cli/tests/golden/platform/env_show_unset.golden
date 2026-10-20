@@ -1,0 +1,6 @@
+$ apprafter platform env show
+[exit 0]
+[stdout]
+Default environment: (unset)
+(soft default — preselects the `apprafter app add` env picker; it does NOT change rendering. An app added without `--env` is still base-only.)
+[stderr]

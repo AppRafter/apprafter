@@ -1,0 +1,42 @@
+$ apprafter platform status --cached
+[exit 0]
+[stdout]
+PlatformStack apprafter-system/default — tier 1
+  channel:     stable
+  pin:         (unpinned)
+  autoUpgrade: false
+
+Versions:
+  current:   0.2.9
+  target:    0.2.9
+  available: 0.2.9
+  lastCheck: YYYY-MM-DD hh:mm UTC (3 hours ago)
+
+Conditions:
++------------------+--------+-----------------+-----------------------------------------------------+
+| TYPE             | STATUS | REASON          | MESSAGE                                             |
++------------------+--------+-----------------+-----------------------------------------------------+
+| Ready            | True   | Healthy         | the platform Application is Healthy                 |
++------------------+--------+-----------------+-----------------------------------------------------+
+| Synced           | True   | Synced          | the platform Application is Synced                  |
++------------------+--------+-----------------+-----------------------------------------------------+
+| UpgradeAvailable | False  | UpToDate        | no newer release on channel stable                  |
++------------------+--------+-----------------+-----------------------------------------------------+
+| BackupHealthy    | True   | BackupSucceeded | NOT CURRENT: left by a newer release; the operator  |
+|                  |        |                 | of platform 0.2.9 does not report on backups. It la |
+|                  |        |                 | st said: the last backup Job succeeded              |
++------------------+--------+-----------------+-----------------------------------------------------+
+| BackupRetention  | True   | Pruned          | NOT CURRENT: left by a newer release; the operator  |
+|                  |        |                 | of platform 0.2.9 does not report on backups. It la |
+|                  |        |                 | st said: the last prune kept 14 snapshots           |
++------------------+--------+-----------------+-----------------------------------------------------+
+
+Recent history (last 2):
++------------------------------------+---------+-----------+
+| APPLIED AT                         | VERSION | OUTCOME   |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (3 days ago)  | 1.4.2   | succeeded |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (12 days ago) | 1.3.7   | succeeded |
++------------------------------------+---------+-----------+
+[stderr]

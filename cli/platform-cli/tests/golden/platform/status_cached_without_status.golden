@@ -1,0 +1,18 @@
+$ apprafter platform status --cached
+[exit 0]
+[stdout]
+PlatformStack apprafter-system/default — tier 1
+  channel:     stable
+  pin:         (unpinned)
+  autoUpgrade: false
+
+Versions:
+  current:   (unset)
+  target:    (unset)
+  available: (unset)
+  lastCheck: (never)
+
+Conditions: (none)
+
+Recent history: (none)
+[stderr]

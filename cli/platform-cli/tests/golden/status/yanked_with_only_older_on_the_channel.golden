@@ -1,0 +1,23 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: 1.5.0 — yanked; the channel's newest release that is not yanked, 1.4.2, is older than this one, so there is no upgrade to take
+  1 condition(s) not healthy:
+  +---------------+--------+--------+-----------------------------------------------+
+  | TYPE          | STATUS | REASON | MESSAGE                                       |
+  +---------------+--------+--------+-----------------------------------------------+
+  | YankedVersion | True   | Yanked | 1.5.0 was yanked: needs.redis is broken in it |
+  +---------------+--------+--------+-----------------------------------------------+
+
+Backups: not enabled.
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans: none awaiting approval.
+[stderr]

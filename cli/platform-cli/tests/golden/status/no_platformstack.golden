@@ -1,0 +1,15 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: no PlatformStack in apprafter-system — run `apprafter cluster-bootstrap` to finish bringing the cluster up
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans: none awaiting approval.
+[stderr]

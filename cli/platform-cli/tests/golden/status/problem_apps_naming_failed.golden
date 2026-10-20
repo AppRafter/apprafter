@@ -1,0 +1,22 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: 1.4.2
+
+Backups: not enabled.
+
+Applications: 4 checked, 3 reporting problems (most recent first):
+  shop/shop-prod  ImagePullBackOff (now, 4x): image ghcr.io/acme/shop:2026.10 not found (+1 more) — claimed by no registered application (it may not have synced yet)
+  lab/scratch  OOMKilled (now): container worker was killed at its memory limit — claimed by no registered application (it may not have synced yet)
+  blog/blog  EnvSecretMissing (held): secret blog/db-url not found (+1 more) — claimed by no registered application (it may not have synced yet)
+  note: could not read Argo CD registrations — applications are named by their CR
+  run `apprafter app status <name>` for the full ledger
+
+Migration plans: none awaiting approval.
+[stderr]

@@ -17,9 +17,11 @@ repository.workspace   = true
 # into this crate).
 ts = ["dep:ts-rs"]
 # `error::samples`, one value of every CoreError variant, for another crate's tests (the CLI's
-# CoreError renderer). Enabled only by platform-cli's [dev-dependencies]: under resolver 2 a
-# dev-dependency's features never reach the shipped binary.
-test-support = []
+# CoreError renderer), and `fixtures`, what a cluster answers, built at a given `now` (D.5
+# B76). Enabled only by [dev-dependencies] (platform-cli's, the desktop's): under resolver 2 a
+# dev-dependency's features never reach the shipped binary. `chrono` comes with it, for the
+# fixtures' times, until d5-b's reads take a `now` of their own (B62).
+test-support = ["dep:chrono"]
 # Tests and walks only (D.4a T23): `vault::KdfPolicy::active()` becomes the policy whose
 # Argon2id parameters a release build refuses. Nothing but [dev-dependencies] and the
 # desktop's `test-build` may turn it on (tests/guards.rs, L4); release-cli.yml checks the
@@ -33,6 +35,9 @@ insecure-fast-kdf = []
 cli-core      = { path = "../cli-core" }
 cli-providers = { path = "../cli-providers" }
 cli-state     = { path = "../cli-state" }
+# The fixtures' times (`test-support` only). Already in both locks through cli-core, at one
+# version: an edge, no package.
+chrono        = { workspace = true, optional = true }
 miette        = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
@@ -81,6 +86,8 @@ windows-sys   = { version = "0.61", features = ["Win32_Foundation", "Win32_Secur
 proc-macro2   = { version = "1", features = ["span-locations"] }
 syn           = { version = "2", features = ["full", "visit", "parsing"] }
 tempfile      = { workspace = true }
+# The fixtures' own tests: `cfg(test)` builds `fixtures` without `test-support`.
+chrono        = { workspace = true }
 toml          = "0.5"
 # A cli-only dev-dependency: a path crate's dev-dependencies are not resolved in
 # desktop/Cargo.lock, so this adds nothing there.

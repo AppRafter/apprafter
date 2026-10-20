@@ -1,0 +1,29 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: 1.4.2
+
+Backups: not enabled.
+
+Applications: 11 checked, 11 reporting problems (showing the 10 most recent):
+  app-01  CrashLoopBackOff (now): container main exited 1
+  app-02  CrashLoopBackOff (now): container main exited 1
+  app-03  CrashLoopBackOff (now): container main exited 1
+  app-04  CrashLoopBackOff (now): container main exited 1
+  app-05  CrashLoopBackOff (now): container main exited 1
+  app-06  CrashLoopBackOff (now): container main exited 1
+  app-07  CrashLoopBackOff (now): container main exited 1
+  app-08  CrashLoopBackOff (now): container main exited 1
+  app-09  CrashLoopBackOff (now): container main exited 1
+  app-10  CrashLoopBackOff (now): container main exited 1
+  … and 1 more
+  run `apprafter app status <name>` for the full ledger
+
+Migration plans: none awaiting approval.
+[stderr]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The golden harness of `apprafter` output — Phase D, D.1 Part A; shared
-//! by `golden.rs` and `golden_doctor.rs` since D.3a.
+//! by `golden.rs` and `golden_doctor.rs` since D.3a, and `golden_reads.rs`
+//! (with the fake `kubectl` and `ssh` of `fake_kube.rs`, `fake_ssh.rs`) since D.5.
 //!
 //! D.1 moves the CLI onto a shared `apprafter-core` crate (ADR 0067). Its
 //! invariant is that, on Unix, the CLI prints exactly what it printed
@@ -57,6 +58,9 @@
 //!   rewrite every file — only where it is not part of a longer number;
 //! - an RFC 3339 UTC timestamp `YYYY-MM-DDTHH:MM:SS[.fraction]Z` (tracing's
 //!   default timer) becomes `<TS>`;
+//! - an absolute minute `YYYY-MM-DD HH:MM UTC` (`cli_core::timefmt`'s absolute
+//!   half; D.5's fixtures are offsets from the run's clock) becomes
+//!   `YYYY-MM-DD hh:mm UTC`, the same width, so tables stay aligned;
 //! - a timing `<digits> ms`, where the digits start a token and `ms` ends
 //!   one (`182 ms`), becomes `<MS> ms`: timings vary per run;
 //! - `(os error N)` becomes `(os error <N>)`: errno values differ by OS
@@ -65,7 +69,8 @@
 //!   and editor-safe.
 //!
 //! Recording: `APPRAFTER_GOLDEN_UPDATE=1 cargo test -p apprafter --test
-//! golden` (or `--test golden_doctor`; the variable must equal `1`) writes
+//! golden` (or `--test golden_doctor`, `--test golden_reads`; the variable
+//! must equal `1`) writes
 //! every file and then FAILS on purpose, so a run in update mode can never
 //! pass CI. Rerun without the variable to verify, review the diff, and
 //! commit. A missing golden is a failure, never a silent pass.
@@ -81,7 +86,7 @@ use tempfile::TempDir;
 
 /// For `normalize` and, through `common::golden::*`, the cases' own tests of them
 /// (`tests/golden.rs`); `timestamp_len` is `mask_timestamps`' alone.
-pub use super::mask::{mask_millis, mask_timestamps};
+pub use super::mask::{mask_millis, mask_timestamps, mask_utc_minutes};
 use super::spawn::{Spawn, CLOSED_PORT_URL};
 
 pub const UPDATE_ENV: &str = "APPRAFTER_GOLDEN_UPDATE";
@@ -266,6 +271,7 @@ impl Sandbox {
         s = replace_isolated(&s, CLOSED_PORT_URL, "<HCLOUD>", |c| c.is_ascii_digit());
         s = replace_bounded(&s, VERSION, "<VERSION>");
         let s = mask_timestamps(&s);
+        let s = mask_utc_minutes(&s);
         let s = mask_millis(&s);
         mask_os_errors(&s).replace('\x1b', "<ESC>")
     }

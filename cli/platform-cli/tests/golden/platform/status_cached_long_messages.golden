@@ -1,0 +1,43 @@
+$ apprafter platform status --cached
+[exit 0]
+[stdout]
+PlatformStack apprafter-system/default — tier 1
+  channel:     stable
+  pin:         (unpinned)
+  autoUpgrade: false
+
+Versions:
+  current:   1.4.2
+  target:    1.4.2
+  available: 1.4.2
+  lastCheck: YYYY-MM-DD hh:mm UTC (3 hours ago)
+
+Conditions:
++------------------+--------+-----------+-----------------------------------------------------------+
+| TYPE             | STATUS | REASON    | MESSAGE                                                   |
++------------------+--------+-----------+-----------------------------------------------------------+
+| Ready            | False  | Degraded  | the platform Application apprafter-system/platform report |
+|                  |        |           | s Degraded: Deployment cert-manager/cert-manager-webhook  |
+|                  |        |           | has 0 of 1 replicas available after 600s, and the readine |
+|                  |        |           | ss probe of its pod cert-manager-webhook-7c9f4d6b5-x2k8q  |
+|                  |        |           | fails with HTTP 500 on /healthz                           |
++------------------+--------+-----------+-----------------------------------------------------------+
+| Synced           | False  | OutOfSync | the platform Application apprafter-system/platform report |
+|                  |        |           | s Degraded: Deployment cert-manager/cert-manager-webhook  |
+|                  |        |           | has 0 of 1 replicas available after 600s, and the readine |
+|                  |        |           | ss probe of its pod cert-manager-webhook-7c9f4d6b5-x2k8q  |
+|                  |        |           | fails with HTTP 500 on /healthz; and the sync of revision |
+|                  |        |           |  4f1c9e2 failed                                           |
++------------------+--------+-----------+-----------------------------------------------------------+
+| UpgradeAvailable | False  | UpToDate  | no newer release on channel stable                        |
++------------------+--------+-----------+-----------------------------------------------------------+
+
+Recent history (last 2):
++------------------------------------+---------+-----------+
+| APPLIED AT                         | VERSION | OUTCOME   |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (3 days ago)  | 1.4.2   | succeeded |
++------------------------------------+---------+-----------+
+| YYYY-MM-DD hh:mm UTC (12 days ago) | 1.3.7   | succeeded |
++------------------------------------+---------+-----------+
+[stderr]
