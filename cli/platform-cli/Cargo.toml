@@ -37,6 +37,14 @@ required-features = ["tool-stand-in"]
 test              = false
 doc               = false
 
+# D.4b-e1a: lock on's ways over the scripted account-password stand-in (B15, B16). Built only
+# with the dev-only feature test-os-slots (`cargo test --all-features`, every CI leg); a plain
+# build has no such target.
+[[test]]
+name              = "lock_on_ways_test"
+path              = "tests/lock_on_ways_test.rs"
+required-features = ["test-os-slots"]
+
 [features]
 tool-stand-in = []
 # D.4b B15, B16 (dev-only): the account-password check and this computer's facts come from the

@@ -32,6 +32,7 @@ const PROMPTS: &[&str] = &[
     "Token",
     "passphrase",
     "Lock password",
+    "Account password",
     "lock password",
     "recovery key",
     "Unlock the target store at",
@@ -184,6 +185,16 @@ fn lock_on_refuses_before_it_asks_for_a_password() {
     let sp = Spawn::new();
     let folder = files_store(&sp);
     let args = ["lock", "on", "--lock-password"];
+    refused_before_asking(&converse(&sp, &args, &[]), &folder, &args);
+}
+
+/// D.4b-e1a: `lock on`'s default asks for the account password, or a lock password where it
+/// falls back — refused all the same before it asks.
+#[test]
+fn lock_on_s_default_refuses_before_it_asks_for_a_password() {
+    let sp = Spawn::new();
+    let folder = files_store(&sp);
+    let args = ["lock", "on"];
     refused_before_asking(&converse(&sp, &args, &[]), &folder, &args);
 }
 

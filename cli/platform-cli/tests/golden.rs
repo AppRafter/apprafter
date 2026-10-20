@@ -305,9 +305,10 @@ fn harness_refuses_output_that_still_names_the_sandbox_root() {
 
 /// Every recorded file must belong to a case in this file, in
 /// `golden_doctor.rs` or, for `lock on`'s transcripts (D.4b-e1a), in
-/// `lock_test.rs` — by its case name, or by its file's path where a test
-/// reads it so (`lock_on_fallback_sandbox_windows`, D.4b-e1a); otherwise a
-/// renamed or deleted case would leave a golden that nothing checks.
+/// `lock_test.rs` or `lock_on_ways_test.rs` — by its case name, or by its
+/// file's path where a test reads it so (`lock_on_fallback_sandbox_windows`);
+/// otherwise a renamed or deleted case would leave a golden that nothing
+/// checks.
 #[test]
 fn every_golden_file_has_a_case() {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -324,6 +325,7 @@ fn every_golden_file_has_a_case() {
         include_str!("golden.rs"),
         include_str!("golden_doctor.rs"),
         include_str!("lock_test.rs"),
+        include_str!("lock_on_ways_test.rs"),
     ];
     let root = golden_root();
     let mut files = Vec::new();
@@ -352,8 +354,8 @@ fn every_golden_file_has_a_case() {
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs, golden_doctor.rs or lock_test.rs (restore the \
-         case or delete the file): {orphans:?}"
+        "golden files with no case in golden.rs, golden_doctor.rs, lock_test.rs or \
+         lock_on_ways_test.rs (restore the case or delete the file): {orphans:?}"
     );
 }
 

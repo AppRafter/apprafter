@@ -1,0 +1,25 @@
+[exit 1]
+[terminal]
+Lock the secrets of the target store at <SANDBOX>/apprafter-config (targets: prod):
+  move    Hetzner token of `prod`            credentials.yaml → vault
+  create  age key of this store              its own, in the vault
+  create  <SANDBOX>/apprafter-config/vault opened by your account password on this computer or a recovery key
+  note    the SSH key <SANDBOX>/home/.ssh/id_ed25519 that fetches kubeconfigs stays outside the vault: a program running as you can use it to reach the nodes
+  note    while a command or the app uses a secret, it is in that process's memory and, for a kubeconfig, in a file programs running as you can read
+It will open with your account password on this computer — checked with the system once, now — and with a recovery key you keep away from this computer.
+Anyone with a copy of the vault and this computer's id — any program running as you — can try to guess your account password offline; each computer you add it on is one more such copy. On another computer, after you reinstall the system, or if this computer's id changes, only the recovery key opens this store (and a lock password, if you add one): keep the recovery key at hand, or add a lock password to a store you use on more than one computer. After you change your account password, the old one keeps opening the store until you add the new one.
+Anyone who can open this store with your account password — an agent you gave it to for `sudo`, or one that saw you type it — can also change how it opens: give it a lock password and a recovery key only they know and remove yours, which locks you out of it. Run agents under a separate OS user or in a sandbox; on a computer where an agent gets your account password, use a separate lock password instead.
+To protect it with a separate lock password instead, press Ctrl-C now and run `apprafter lock on --lock-password`.
+Unlock window: 5 min (`--timeout` changes it). Once locked, a command that needs these secrets asks for your account password or the recovery key in its terminal, and a command with no terminal is refused. HCLOUD_TOKEN and APPRAFTER_AGE_KEY no longer stand in for the store's secrets.
+This stops an AI agent that runs AppRafter as you from reading these secrets or using them without you. It does not stop a program that sets out to capture what you type: for that, run agents under a separate OS account or in a sandbox (guide: Protecting secrets from agents).
+Your account password is checked with the system once, now. Type it at the prompt — a fingerprint reader does not count — and know that a wrong one may count as a failed login on systems that lock an account after failed logins.
+Account password of walker: 
+Error: apprafter::secrets::account_password_refused
+
+  × the system did not check the password that was typed: a fingerprint reader, another sign-in
+  │ module or a second question took its place
+  help: Nothing was written. Type the password when the system asks for it — not a fingerprint —
+        or use a separate lock password: `apprafter lock on --lock-password` for a new lock,
+        `apprafter lock slot add password` on a locked store.
+
+[stdout]

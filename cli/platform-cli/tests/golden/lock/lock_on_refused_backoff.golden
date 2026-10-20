@@ -1,0 +1,10 @@
+[exit 1]
+[terminal]
+Error: apprafter::secrets::account_password_refused
+
+  × an account-password check failed recently: the next is allowed in 9 min
+  help: AppRafter spaces out account-password checks after a failed one, so that typos cannot lock
+        your account: run the command again then, or use a separate lock password: `apprafter lock
+        on --lock-password` for a new lock, `apprafter lock slot add password` on a locked store.
+
+[stdout]
