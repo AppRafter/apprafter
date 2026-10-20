@@ -763,8 +763,11 @@ impl SecretStore {
             (None, None) => Ok(None),
             (Some(armored), _) => {
                 let key = self.cache_key(target)?;
+                // B86: a cache sealed to a store key a key change retired says so.
+                let record = hetzner.sealed_to(CachedSecret::Kubeconfig);
                 self.open_cache(&key, CachedSecret::Kubeconfig, target, armored)
                     .map(Some)
+                    .map_err(|e| cache::retired(e, record, &key))
             }
             (None, Some(plain)) => match self.state()? {
                 StoreState::Files => Ok(Some(Zeroizing::new(plain.to_string()))),
@@ -775,6 +778,26 @@ impl SecretStore {
                 StoreState::Incomplete(phase) => Err(self.incomplete(phase)),
             },
         }
+    }
+
+    /// `target`'s cached Argo CD admin password from its state's `hetzner_cloud`, opened with
+    /// its key; `Ok(None)` when none is cached. A key that does not open it is
+    /// `cache_undecryptable` naming the secret, the target and the key — in the words of a
+    /// store key a key change retired when the state records one (D.4b B86).
+    pub fn cached_argocd_password(
+        &self,
+        hetzner: &HetznerCloudState,
+        target: &str,
+    ) -> cli_core::Result<Option<Zeroizing<String>>> {
+        let Some(armored) = hetzner.argocd_admin_password_age.as_deref() else {
+            return Ok(None);
+        };
+        let key = self.cache_key(target)?;
+        // B86: a cache sealed to a store key a key change retired says so.
+        let record = hetzner.sealed_to(CachedSecret::ArgocdPassword);
+        self.open_cache(&key, CachedSecret::ArgocdPassword, target, armored)
+            .map(Some)
+            .map_err(|e| cache::retired(e, record, &key))
     }
 
     /// `armored`, `target`'s cached `secret`, opened with `key`. A key that does not open it

@@ -73,11 +73,14 @@ impl CacheKeyKind {
 
 /// Why a cached secret did not open (D.4a §3.12): it was not encrypted to the key it was tried
 /// with (age's `NoMatchingKeys`, or a passphrase-protected file), or it is damaged (anything
-/// else age refuses: an unreadable header, a wrong MAC, a broken payload).
+/// else age refuses: an unreadable header, a wrong MAC, a broken payload) — or, said by a
+/// locked store's secret store from the state's record and never by age, it was sealed to a
+/// store key a key change of that store retired (D.4b B86).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndecryptableWhy {
     NotForThisKey,
     Damaged,
+    RetiredKey,
 }
 
 impl UndecryptableWhy {
@@ -86,6 +89,7 @@ impl UndecryptableWhy {
         match self {
             UndecryptableWhy::NotForThisKey => "not_for_this_key",
             UndecryptableWhy::Damaged => "damaged",
+            UndecryptableWhy::RetiredKey => "retired_key",
         }
     }
 }

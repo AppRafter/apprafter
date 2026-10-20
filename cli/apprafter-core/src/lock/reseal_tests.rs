@@ -23,11 +23,14 @@ use super::reseal::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::secrets::testing::{locked_store, LockedTestStore};
+use crate::secrets::FixedVaultAccess;
 use crate::secrets::{transfer, vault_path, CacheKey, KeySession};
 use crate::target::testkit::TOKEN_A;
 use crate::vault::{
     self, KdfPolicy, KeptMaterial, OsRandom, RecoveryKey, Rotated, RotationIds, VaultFile, VaultId,
 };
+use crate::Context;
+use cli_core::secrets::{CacheKeyKind, UndecryptableWhy};
 
 const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
 const PW: &str = "argocd-admin-password";
@@ -631,4 +634,95 @@ fn a_key_that_cannot_open_fails_the_step_and_leaves_nothing() {
     );
     assert!(done.left.is_empty(), "{done:?}");
     assert_eq!(std::fs::read(state_file(&m.store, "prod")).unwrap(), before);
+}
+
+/// B86: after a key change, a cache sealed to the store key it retired says so — its record
+/// names this store's earlier vault — for both cached secrets; a record without a vault id
+/// (AppRafter 0.2.80's), another store's, or the vault on disk keeps the words as they were,
+/// and a damaged cache stays damaged.
+#[test]
+fn a_cache_sealed_to_a_retired_store_key_says_so() {
+    let m = mid(&[("prod", Some(TOKEN_A))]);
+    // R4: the retiring key leaves the vault.
+    let retired = m
+        .rotated
+        .vault
+        .retire_identity(WRITER, &mut OsRandom)
+        .unwrap();
+    let held = StoreLock::exclusive(&m.store).unwrap();
+    vault::file::replace(&vault_path(m.root()), &retired, &held).unwrap();
+    drop(held);
+    let ctx = Context::for_desktop(m.root().to_path_buf(), "http://127.0.0.1:1")
+        .with_home_dir(Some(m._dir.path().join("home")))
+        .with_vault_access(Arc::new(FixedVaultAccess::new(
+            m.rotated.vault.data_key().clone(),
+            m.new_vault(),
+        )));
+    let s = ctx.secrets();
+    let read = |record: serde_json::Value, armored: &str| {
+        let h: HetznerCloudState = serde_json::from_value(json!({
+            "server_id": 1, "server_name": "p",
+            "kubeconfig_age": armored, "kubeconfig_sealed_to": record,
+            "argocd_admin_password_age": armored, "argocd_admin_password_sealed_to": record,
+        }))
+        .unwrap();
+        (
+            s.cached_kubeconfig(&h, "prod").unwrap_err(),
+            s.cached_argocd_password(&h, "prod").unwrap_err(),
+        )
+    };
+    let why = |e: &CliError| match e {
+        CliError::CacheUndecryptable {
+            key: CacheKeyKind::StoreVault,
+            reason,
+            ..
+        } => *reason,
+        other => panic!("{other:?}"),
+    };
+    let old = sealed(m.made.recipient(), YAML);
+    let earlier = serde_json::to_value(m.record(m.made.vault_id)).unwrap();
+    let (kube, pw) = read(earlier.clone(), &old);
+    assert_eq!(
+        (why(&kube), why(&pw)),
+        (UndecryptableWhy::RetiredKey, UndecryptableWhy::RetiredKey)
+    );
+    assert!(
+        kube.to_string()
+            .contains("is recorded as sealed to the store key of an earlier key change"),
+        "{kube}"
+    );
+    // Critic round, finding 3: a cache R3 left (neither key opened it) keeps its record, so
+    // it reads with the same reason — and the words say only what the record says.
+    let left = sealed(&Identity::generate().to_public(), YAML);
+    assert_eq!(
+        why(&read(earlier.clone(), &left).0),
+        UndecryptableWhy::RetiredKey
+    );
+    let older = json!({"kind": "store_vault", "store_id": m.made.store_id.as_str()});
+    assert_eq!(
+        why(&read(older, &old).0),
+        UndecryptableWhy::NotForThisKey,
+        "0.2.80's record"
+    );
+    let other = json!({
+        "kind": "store_vault", "store_id": "0123456789abcdef",
+        "vault_id": m.made.vault_id.to_string(),
+    });
+    assert_eq!(
+        why(&read(other, &old).0),
+        UndecryptableWhy::NotForThisKey,
+        "another store's"
+    );
+    let foreign = sealed(&Identity::generate().to_public(), YAML);
+    let here = serde_json::to_value(m.record(m.new_vault())).unwrap();
+    assert_eq!(
+        why(&read(here, &foreign).0),
+        UndecryptableWhy::NotForThisKey,
+        "the vault on disk"
+    );
+    assert_eq!(
+        why(&read(earlier, "not an age file").0),
+        UndecryptableWhy::Damaged,
+        "damaged stays damaged"
+    );
 }
