@@ -492,6 +492,8 @@ pub enum SecretsModeKind {
     Locking,
     Locked,
     Unlocking,
+    /// A key change did not finish (D.4b B63).
+    Rotating,
 }
 
 impl SecretsModeKind {
@@ -502,6 +504,7 @@ impl SecretsModeKind {
             SecretsModeKind::Locking => "locking",
             SecretsModeKind::Locked => "locked",
             SecretsModeKind::Unlocking => "unlocking",
+            SecretsModeKind::Rotating => "rotating",
         }
     }
 }
@@ -513,6 +516,9 @@ pub enum LockPhase {
     Locking,
     /// `secrets: unlocking`: an earlier `lock off` did not finish.
     Unlocking,
+    /// `secrets: rotating`: an earlier `lock rekey` or `lock recovery` did not finish (D.4b
+    /// B63).
+    Rotating,
 }
 
 impl LockPhase {
@@ -521,6 +527,7 @@ impl LockPhase {
         match self {
             LockPhase::Locking => "locking",
             LockPhase::Unlocking => "unlocking",
+            LockPhase::Rotating => "rotating",
         }
     }
 
@@ -529,6 +536,7 @@ impl LockPhase {
         match self {
             LockPhase::Locking => "lock on",
             LockPhase::Unlocking => "lock off",
+            LockPhase::Rotating => "lock rekey` or `lock recovery",
         }
     }
 }
@@ -1047,6 +1055,13 @@ fn lock_incomplete_help(phase: LockPhase) -> String {
         LockPhase::Unlocking => "Run `apprafter lock off` again: it asks for the lock password \
              or the recovery key and finishes. Until then commands that need the store's \
              secrets refuse, because some may be only in the vault."
+            .to_string(),
+        LockPhase::Rotating => "Run `apprafter lock rekey` or `apprafter lock recovery` again: \
+             either asks for one of the store's secrets and finishes the key change: an earlier \
+             one if its new vault was not written yet, else a new one or a way in it kept. \
+             `apprafter lock off` returns the secrets to files instead. Until then commands that \
+             need the store's secrets refuse, because some may be sealed to the new store key and \
+             some to the old one."
             .to_string(),
     }
 }
@@ -3476,6 +3491,10 @@ mod tests {
              "apprafter::secrets::lock_incomplete",
              "an earlier `lock off` on the target store at /s did not finish",
              "Run `apprafter lock off` again"),
+            (CliError::LockIncomplete { store: s(), phase: LockPhase::Rotating },
+             "apprafter::secrets::lock_incomplete",
+             "an earlier `lock rekey` or `lock recovery` on the target store at /s did not finish",
+             "`apprafter lock off` returns the secrets to files"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfTooWeak },
              "apprafter::secrets::slot_refused",
              "the lock password of the target store at /s is kept with key-derivation settings weaker than this AppRafter accepts",

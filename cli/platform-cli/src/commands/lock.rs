@@ -1032,6 +1032,7 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
         }
         SecretsMode::Locking => Some(LockPhase::Locking),
         SecretsMode::Unlocking => Some(LockPhase::Unlocking),
+        SecretsMode::Rotating => Some(LockPhase::Rotating),
         SecretsMode::Locked => None,
     };
     // WI-478 (d4a-h F1's class): a store other accounts can change is refused before its lock
@@ -1287,6 +1288,11 @@ fn secrets_text(r: &LockReport) -> String {
         SecretsMode::Unlocking => {
             "unlocking — an earlier `apprafter lock off` did not finish: run it again".into()
         }
+        SecretsMode::Rotating => "rotating — an earlier key change (`apprafter lock rekey` or \
+                                  `apprafter lock recovery`) did not finish: run either \
+                                  again, or `apprafter lock off` to return the secrets to \
+                                  files"
+            .into(),
     }
 }
 
@@ -2373,6 +2379,11 @@ mod status_render_tests {
         unlocking.mode = SecretsMode::Unlocking;
         assert!(render_status(&unlocking).contains(
             "Secrets:        unlocking — an earlier `apprafter lock off` did not finish: run it again\n"
+        ));
+        let mut rotating = locked(UnlockWindow::Closed, vec![]);
+        rotating.mode = SecretsMode::Rotating;
+        assert!(render_status(&rotating).contains(
+            "Secrets:        rotating — an earlier key change (`apprafter lock rekey` or `apprafter lock recovery`) did not finish: run either again, or `apprafter lock off` to return the secrets to files\n"
         ));
     }
 }

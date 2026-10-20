@@ -279,6 +279,7 @@ fn write_files(store: &TargetStorePaths, held: &StoreLock) -> CoreResult<()> {
             id: None,
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         },
         held,
     )?;
@@ -325,6 +326,16 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
             detail: "it names no id".to_string(),
         }));
     };
+    // D.4b B63, F2: `lock off` from an unfinished key change opens each cache with either
+    // store key the vault holds (d4b-c2b). Until then it is refused here — never run as from
+    // `locked`, which would re-seal with the new key only and delete the vault that holds
+    // the old one, leaving caches sealed to a key no vault holds (rule 10).
+    if file.secrets == SecretsMode::Rotating {
+        return Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: cli_core::LockPhase::Rotating,
+        }));
+    }
     let vault = vault_on_disk(root)?;
     match file.secrets {
         SecretsMode::Locking if !vault => {
@@ -608,6 +619,15 @@ fn unlock(
             return Ok(Outcome::Completed { result: done });
         }
     };
+    // D.4b B63, F2: a key change that stopped after this `lock off` was planned is
+    // finished first (d4b-c2b brings `lock off` from `rotating`); D.4a's steps never run
+    // over it — whose `unlocking` write would carry the key change's fields on.
+    if matches!(file.secrets, SecretsMode::Rotating) {
+        return Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: cli_core::LockPhase::Rotating,
+        }));
+    }
     if file.id.as_ref() != Some(id) || !vault_on_disk(root)? {
         return Err(store_changed(root, from, file.secrets));
     }

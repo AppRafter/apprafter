@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::files::under_temp;
 use super::SecretsMode;
+use crate::vault::{SlotId, VaultId};
 use crate::vault::{VaultResult, VaultRng, VAULT_FILE};
 
 /// The file's name under the store root.
@@ -135,6 +136,22 @@ pub struct StoreFile {
     pub id: Option<StoreId>,
     pub slots: Vec<SlotInfo>,
     pub unlock_timeout_min: Option<u32>,
+    /// A key change's fields, with `secrets: rotating` only (D.4b B63); `None` in every other
+    /// state.
+    pub rotation: Option<Rotation>,
+}
+
+/// What `store.yaml` says of a key change that did not finish (D.4b B63, ADR 0069 §7):
+/// fields only `secrets: rotating` has, which AppRafter 0.2.80 never reads — it refuses the
+/// state first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotation {
+    /// `rotating_to`: the id of the vault the key change writes. A finish tells from it
+    /// whether the change was written (d4b-c2b).
+    pub to: VaultId,
+    /// `hello_drop`: the Windows Hello slots the key change drops, whose keys on this
+    /// computer are handed to the client before `store.yaml` forgets them (R4b, B84).
+    pub hello_drop: Vec<SlotId>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +164,10 @@ struct RawStoreFile {
     slots: Vec<RawSlot>,
     #[serde(default)]
     unlock_timeout_min: Option<u32>,
+    #[serde(default)]
+    rotating_to: Option<String>,
+    #[serde(default)]
+    hello_drop: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +187,10 @@ struct RawOut<'a> {
     slots: Vec<RawSlotOut<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     unlock_timeout_min: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotating_to: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hello_drop: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -235,7 +260,7 @@ fn check(path: &Path, raw: RawStoreFile) -> cli_core::Result<StoreFile> {
         unreadable(
             path,
             format!(
-                "`secrets: {:?}` is none of files, locking, locked, unlocking",
+                "`secrets: {:?}` is none of files, locking, locked, unlocking, rotating",
                 raw.secrets
             ),
         )
@@ -258,6 +283,7 @@ fn check(path: &Path, raw: RawStoreFile) -> cli_core::Result<StoreFile> {
             ),
         ));
     }
+    let rotation = rotation_of(path, secrets, &raw)?;
     Ok(StoreFile {
         format: raw.format,
         secrets,
@@ -271,7 +297,63 @@ fn check(path: &Path, raw: RawStoreFile) -> cli_core::Result<StoreFile> {
             })
             .collect(),
         unlock_timeout_min: raw.unlock_timeout_min,
+        rotation,
     })
+}
+
+/// `rotating_to` and `hello_drop` as `secrets: rotating` carries them (D.4b B63): its new
+/// vault id is required, every slot id must be one. In every other state the fields mean
+/// nothing and are not read.
+fn rotation_of(
+    path: &Path,
+    secrets: SecretsMode,
+    raw: &RawStoreFile,
+) -> cli_core::Result<Option<Rotation>> {
+    if secrets != SecretsMode::Rotating {
+        return Ok(None);
+    }
+    let to = raw
+        .rotating_to
+        .as_deref()
+        .and_then(hex16)
+        .map(VaultId)
+        .ok_or_else(|| {
+            unreadable(
+                path,
+                "it says a key change did not finish, and names no new vault id \
+                 (`rotating_to`: 32 lowercase hex characters)"
+                    .into(),
+            )
+        })?;
+    let hello_drop = raw
+        .hello_drop
+        .iter()
+        .map(|text| {
+            hex16(text).map(SlotId).ok_or_else(|| {
+                unreadable(
+                    path,
+                    format!(
+                        "`hello_drop` names {text:?}, which is no slot id (32 lowercase hex \
+                         characters)"
+                    ),
+                )
+            })
+        })
+        .collect::<cli_core::Result<Vec<_>>>()?;
+    Ok(Some(Rotation { to, hello_drop }))
+}
+
+/// `text` as 16 bytes when it is exactly 32 lowercase hex characters — a vault or slot id
+/// as its `Display` writes it.
+fn hex16(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 32 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn unreadable(path: &Path, detail: String) -> CliError {
@@ -305,6 +387,14 @@ pub fn write_store_file(root: &Path, file: &StoreFile, held: &StoreLock) -> cli_
             path.display()
         )));
     }
+    // D.4b B63: `rotating` is written with its key change's fields, and no other state is.
+    if (file.secrets == SecretsMode::Rotating) != file.rotation.is_some() {
+        return Err(CliError::Other(format!(
+            "{}: `secrets: rotating` is written with its key change's new vault id, and no \
+             other lock state is; nothing was written",
+            path.display()
+        )));
+    }
     let out = RawOut {
         format: file.format,
         secrets: file.secrets.as_str(),
@@ -318,6 +408,12 @@ pub fn write_store_file(root: &Path, file: &StoreFile, held: &StoreLock) -> cli_
             })
             .collect(),
         unlock_timeout_min: file.unlock_timeout_min,
+        rotating_to: file.rotation.as_ref().map(|r| r.to.to_string()),
+        hello_drop: file
+            .rotation
+            .as_ref()
+            .map(|r| r.hello_drop.iter().map(ToString::to_string).collect())
+            .unwrap_or_default(),
     };
     let body = serde_yaml::to_string(&out)?;
     cli_core::atomic_replace(

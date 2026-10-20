@@ -164,7 +164,12 @@ pub(crate) fn fences_the_age_key(
     matches!(command, crate::cli::Commands::Lock { .. })
         || !matches!(
             mode,
-            Some(SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking)
+            Some(
+                SecretsMode::Locked
+                    | SecretsMode::Locking
+                    | SecretsMode::Unlocking
+                    | SecretsMode::Rotating
+            )
         )
 }
 
@@ -386,6 +391,7 @@ mod tests {
             SecretsMode::Locked,
             SecretsMode::Locking,
             SecretsMode::Unlocking,
+            SecretsMode::Rotating,
         ] {
             assert!(!fences_the_age_key(&other, Some(mode)), "{mode:?}");
             assert!(fences_the_age_key(&lock_off, Some(mode)), "{mode:?}");

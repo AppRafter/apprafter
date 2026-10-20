@@ -130,9 +130,10 @@ pub fn hetzner_token(ctx: &Context, target: &TargetRef) -> CoreResult<SecretStri
                 store: ctx.config_root().to_path_buf(),
             }))
         }
-        SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Unlocking => {
-            secrets.stored_token(target.name())?.ok_or_else(not_stored)
-        }
+        SecretsMode::Locked
+        | SecretsMode::Locking
+        | SecretsMode::Unlocking
+        | SecretsMode::Rotating => secrets.stored_token(target.name())?.ok_or_else(not_stored),
     }
 }
 

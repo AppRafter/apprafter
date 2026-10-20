@@ -241,6 +241,11 @@ pub(crate) fn secrets_line(report: std::result::Result<LockReport, String>) -> S
             SecretsMode::Unlocking => cli_core::style::warn(
                 "  secrets:  an earlier `apprafter lock off` did not finish — run it again",
             ),
+            SecretsMode::Rotating => cli_core::style::warn(
+                "  secrets:  an earlier key change (`apprafter lock rekey` or `apprafter lock \
+                 recovery`) did not finish — run either again, or `apprafter lock off` to \
+                 return the secrets to files",
+            ),
         },
         Err(why) => cannot_be_read(&why),
     }
@@ -614,6 +619,13 @@ mod tests {
             .contains("an earlier `apprafter lock on` did not finish — run it again, or `apprafter lock off` to back out"));
         assert!(secrets_line(Ok(report(M::Unlocking, UnlockWindow::Closed)))
             .contains("an earlier `apprafter lock off` did not finish — run it again"));
+        assert!(
+            secrets_line(Ok(report(M::Rotating, UnlockWindow::Closed))).contains(
+                "an earlier key change (`apprafter lock rekey` or `apprafter lock recovery`) did \
+             not finish — run either again, or `apprafter lock off` to return the secrets to \
+             files"
+            )
+        );
         let unreadable = secrets_line(Err("the vault /s/vault is damaged: x".into()));
         assert!(
             unreadable.contains("cannot be read (the vault /s/vault is damaged: x)"),

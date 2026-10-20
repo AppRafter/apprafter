@@ -732,6 +732,9 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
             cli_core::LockPhase::Unlocking => "Unprotecting this target store's secrets was \
                  interrupted. Finish it on the Security page."
                 .into(),
+            cli_core::LockPhase::Rotating => "Changing this target store's keys was \
+                 interrupted. Finish it, or stop protecting the secrets, on the Security page."
+                .into(),
         },
         C::SlotRefused { reason, .. } => match reason {
             cli_core::SlotRefusal::KdfTooWeak | cli_core::SlotRefusal::KdfOutOfRange => {
@@ -1480,6 +1483,10 @@ pub mod samples {
             C::LockIncomplete {
                 store: store(),
                 phase: LockPhase::Unlocking,
+            },
+            C::LockIncomplete {
+                store: store(),
+                phase: LockPhase::Rotating,
             },
             C::CacheNotSealed {
                 secret: CachedSecret::Kubeconfig,

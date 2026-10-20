@@ -5,4 +5,4 @@
  * Where a store's secrets are; read from `<root>/store.yaml` on every call, never cached. No
  * `store.yaml` is `Files` (D.4a T31).
  */
-export type SecretsMode = "files" | "locking" | "locked" | "unlocking";
+export type SecretsMode = "files" | "locking" | "locked" | "unlocking" | "rotating";

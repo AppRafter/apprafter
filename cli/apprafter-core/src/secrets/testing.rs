@@ -127,6 +127,7 @@ pub fn locked_store(root: &Path, targets: &[(&str, Option<&str>)]) -> LockedTest
             label: RECOVERY_LABEL.into(),
         }],
         unlock_timeout_min: Some(5),
+        rotation: None,
     };
     write_store_file(root, &file, &held).expect("store.yaml");
     drop(held);

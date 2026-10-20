@@ -367,6 +367,7 @@ fn locked_vault(ctx: &Context) -> CoreResult<(StoreId, VaultFile)> {
         SecretsMode::Locked => {}
         SecretsMode::Locking => return Err(incomplete(root, LockPhase::Locking)),
         SecretsMode::Unlocking => return Err(incomplete(root, LockPhase::Unlocking)),
+        SecretsMode::Rotating => return Err(incomplete(root, LockPhase::Rotating)),
         SecretsMode::Files => return Err(not_locked(root)),
     }
     cli_core::store_privacy::ensure_private(&ctx.store())?;

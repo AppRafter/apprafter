@@ -1716,7 +1716,10 @@ fn lock_rows(
                 .collect();
         }
     };
-    let shows_limits = matches!(mode, SecretsMode::Locked | SecretsMode::Locking);
+    let shows_limits = matches!(
+        mode,
+        SecretsMode::Locked | SecretsMode::Locking | SecretsMode::Rotating
+    );
     // A store whose limits are not shown asks no ssh-agent (its 2 s bound is for a row).
     let asked = if shows_limits {
         client.clone()
@@ -1790,15 +1793,15 @@ fn secrets_row(mode: SecretsMode, report: &CoreResult<LockReport>, window: &Unlo
                 "Secrets in files (readable by any program running as you)",
             )
         },
-        (SecretsMode::Locking | SecretsMode::Unlocking, _) => Check {
+        (SecretsMode::Locking | SecretsMode::Unlocking | SecretsMode::Rotating, _) => Check {
             fix: Some(CheckFix::FinishLock { phase: mode }),
             ..row(
                 CheckId::Secrets,
                 CheckStatus::Fail,
-                if mode == SecretsMode::Locking {
-                    "Secrets: turning the lock on did not finish"
-                } else {
-                    "Secrets: turning the lock off did not finish"
+                match mode {
+                    SecretsMode::Locking => "Secrets: turning the lock on did not finish",
+                    SecretsMode::Rotating => "Secrets: a key change did not finish",
+                    _ => "Secrets: turning the lock off did not finish",
                 },
             )
         },
@@ -5019,6 +5022,11 @@ mod tests {
                 "Secrets: turning the lock off did not finish",
                 false,
             ),
+            (
+                SecretsMode::Rotating,
+                "Secrets: a key change did not finish",
+                true,
+            ),
         ] {
             let f = fx();
             let root = locked_at(&f, &[("prod", Some(TOKEN))]);
@@ -5029,7 +5037,15 @@ mod tests {
                 &yaml,
                 text.replace(
                     "secrets: locked\n",
-                    &format!("secrets: {}\n", phase.as_str()),
+                    &format!(
+                        "secrets: {}\n{}",
+                        phase.as_str(),
+                        if phase == SecretsMode::Rotating {
+                            "rotating_to: a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5\n"
+                        } else {
+                            ""
+                        }
+                    ),
                 ),
             )
             .unwrap();

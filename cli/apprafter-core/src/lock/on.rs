@@ -465,6 +465,12 @@ pub fn plan_on(
             store: root.to_path_buf(),
             phase: LockPhase::Unlocking,
         })),
+        // D.4b B63, F2: an unfinished key change is finished by `lock rekey` or `lock
+        // recovery`, never planned over as a new `lock on`.
+        Some((SecretsMode::Rotating, _)) => Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: LockPhase::Rotating,
+        })),
         Some((SecretsMode::Locking, Some(id))) if vault_on_disk(root)? => {
             // D.4b B56: what the resume asks besides the recovery key, from the vault's
             // header (F6).
@@ -851,6 +857,7 @@ fn on_new(
             },
         ],
         unlock_timeout_min: Some(payload.timeout_min),
+        rotation: None,
     };
     crate::secrets::write_store_file(root, &file, &held)?;
     sync_root(&store)?;
@@ -1166,6 +1173,7 @@ fn undo_locking(run: &Run<'_>, wrote_vault: bool) -> CoreResult<Outcome<LockedOn
             id: None,
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         },
         run.held,
     )?;

@@ -61,6 +61,7 @@ pub use access::{
     DiagnosticAccess, KeySession, NoVaultAccess, VaultAccess, VaultRequest, VaultSession,
 };
 pub use files::{lost_vaults, Held, Holding};
+pub use store_file::Rotation;
 pub use store_file::{
     read_store_file, write_store_file, LockSlotKind, SlotInfo, StoreFile, StoreId, STORE_FILE,
     STORE_FILE_FORMAT,
@@ -92,6 +93,10 @@ pub enum SecretsMode {
     Locked,
     /// An earlier `lock off` did not finish: every secret read refuses.
     Unlocking,
+    /// An earlier key change (`lock rekey`, `lock recovery`) did not finish (D.4b B63):
+    /// every secret read refuses until it is finished, or `lock off` returns the secrets to
+    /// files.
+    Rotating,
 }
 
 impl SecretsMode {
@@ -102,6 +107,7 @@ impl SecretsMode {
             SecretsMode::Locking => "locking",
             SecretsMode::Locked => "locked",
             SecretsMode::Unlocking => "unlocking",
+            SecretsMode::Rotating => "rotating",
         }
     }
 
@@ -112,6 +118,7 @@ impl SecretsMode {
             "locking" => Some(SecretsMode::Locking),
             "locked" => Some(SecretsMode::Locked),
             "unlocking" => Some(SecretsMode::Unlocking),
+            "rotating" => Some(SecretsMode::Rotating),
             _ => None,
         }
     }
@@ -124,6 +131,7 @@ impl From<SecretsMode> for SecretsModeKind {
             SecretsMode::Locking => SecretsModeKind::Locking,
             SecretsMode::Locked => SecretsModeKind::Locked,
             SecretsMode::Unlocking => SecretsModeKind::Unlocking,
+            SecretsMode::Rotating => SecretsModeKind::Rotating,
         }
     }
 }
@@ -340,6 +348,7 @@ impl StoreState {
             StoreState::Locked { .. } => SecretsModeKind::Locked,
             StoreState::Incomplete(LockPhase::Locking) => SecretsModeKind::Locking,
             StoreState::Incomplete(LockPhase::Unlocking) => SecretsModeKind::Unlocking,
+            StoreState::Incomplete(LockPhase::Rotating) => SecretsModeKind::Rotating,
         }
     }
 }
@@ -408,6 +417,7 @@ impl SecretStore {
             SecretsMode::Files => StoreState::Files,
             SecretsMode::Locking => StoreState::Incomplete(LockPhase::Locking),
             SecretsMode::Unlocking => StoreState::Incomplete(LockPhase::Unlocking),
+            SecretsMode::Rotating => StoreState::Incomplete(LockPhase::Rotating),
             SecretsMode::Locked => match file.id.clone() {
                 Some(id) => StoreState::Locked { file, id },
                 // `read_store_file` refuses this; the same refusal, should it ever not.
@@ -452,6 +462,7 @@ impl SecretStore {
             StoreState::Locked { .. } => SecretsMode::Locked,
             StoreState::Incomplete(LockPhase::Locking) => SecretsMode::Locking,
             StoreState::Incomplete(LockPhase::Unlocking) => SecretsMode::Unlocking,
+            StoreState::Incomplete(LockPhase::Rotating) => SecretsMode::Rotating,
         })
     }
 

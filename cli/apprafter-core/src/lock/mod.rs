@@ -24,6 +24,8 @@ pub mod open;
 mod reseal;
 #[cfg(test)]
 mod reseal_tests;
+#[cfg(test)]
+mod rotate_tests;
 pub mod slots;
 #[cfg(test)]
 mod slots_tests;

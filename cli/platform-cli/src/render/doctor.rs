@@ -264,6 +264,11 @@ pub(crate) fn hint(c: &Check) -> Option<String> {
         CheckFix::FinishLock {
             phase: SecretsMode::Unlocking,
         } => "run `apprafter lock off` again to finish it".to_string(),
+        CheckFix::FinishLock {
+            phase: SecretsMode::Rotating,
+        } => "run `apprafter lock rekey` or `apprafter lock recovery` again to finish it, or \
+              `apprafter lock off` to return the secrets to files"
+            .to_string(),
         // `locking`; a store in files or locked has nothing to finish, and no row names it.
         CheckFix::FinishLock { .. } => "run `apprafter lock on` again to finish it, or \
              `apprafter lock off` to back out of it"
@@ -872,6 +877,17 @@ mod tests {
             ))
             .unwrap(),
             "run `apprafter lock off` again to finish it"
+        );
+        assert_eq!(
+            hint(&fail(
+                CheckId::Secrets,
+                CheckFix::FinishLock {
+                    phase: SecretsMode::Rotating
+                }
+            ))
+            .unwrap(),
+            "run `apprafter lock rekey` or `apprafter lock recovery` again to finish it, or \
+             `apprafter lock off` to return the secrets to files"
         );
         assert_eq!(
             hint(&fail(CheckId::TokenPresent, CheckFix::UnlockFirst)).unwrap(),
