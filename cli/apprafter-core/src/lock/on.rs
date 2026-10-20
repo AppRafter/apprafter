@@ -43,6 +43,7 @@ use serde::Serialize;
 
 use super::faults::{self, FaultPoint};
 use super::open::SlotOpened;
+use super::reseal::StateFolder;
 use super::reseal::{reseal, OldKeys, ResealMode, Resealed};
 use super::ways::FirstSlot;
 use super::ways::{self, LockOnWay, Way, WayAsked, WayFallback};
@@ -1100,7 +1101,8 @@ fn finish(
     let targets = cli_core::list_target_names(run.store)?;
     let mut resealed = Resealed::default();
     for (n, target) in targets.iter().enumerate() {
-        reseal(run.store, run.held, target, key, &old, mode, &mut resealed)?;
+        let folder = StateFolder::target(target);
+        reseal(run.store, run.held, &folder, key, &old, mode, &mut resealed)?;
         faults::hit(run.ctx, FaultPoint::AfterCachesTarget(n))?;
     }
     done.caches_resealed += resealed.resealed;
