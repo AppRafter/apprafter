@@ -292,8 +292,10 @@ impl DesktopVaultAccess {
         kind: LockSlotKind,
         secret: SecretString,
     ) -> Result<SlotOpened, Refusal> {
+        // D.4b B56: an account-password slot opens only with this computer's machine id.
+        let machine = slot_facts().machine_id().id().cloned();
         self.gate
-            .attempt(|| lock::open_slot_at(root, id, kind, secret, KdfPolicy::active()))
+            .attempt(|| lock::open_slot_at(root, id, kind, secret, machine, KdfPolicy::active()))
     }
 
     /// Tests: `hook` runs inside every opening through the gate, before the vault opens (D.4a

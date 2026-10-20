@@ -441,13 +441,14 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
         }
         let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let secret = match plan.payload.start().clone() {
-            LockOnStart::Resume { id } => {
+            LockOnStart::Resume { id, .. } => {
                 let slot = |kind, secret: &str| {
                     open_slot_at(
                         f.ctx.config_root(),
                         &id,
                         kind,
                         SecretString::new(secret),
+                        None,
                         &KdfPolicy::INSECURE_FAST,
                     )
                     .unwrap()
@@ -456,7 +457,7 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
                     &f.ctx,
                     plan,
                     LockOnInput::Resume {
-                        password: slot(LockSlotKind::Password, PASSWORD),
+                        everyday: slot(LockSlotKind::Password, PASSWORD),
                         recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
                     },
                     &NullReporter,
@@ -512,7 +513,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
         seed(&f.ctx, target, serde_json::to_value(&h).unwrap());
     }
     let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
         panic!("{:?}", plan.payload.start());
     };
     let slot = |kind, secret: &str| {
@@ -521,6 +522,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
@@ -529,7 +531,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
         &f.ctx,
         plan,
         LockOnInput::Resume {
-            password: slot(LockSlotKind::Password, PASSWORD),
+            everyday: slot(LockSlotKind::Password, PASSWORD),
             recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
         },
         &NullReporter,
@@ -564,7 +566,7 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
     )
     .unwrap();
     let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
         panic!("a resume")
     };
     let slot = |kind, secret: &str| {
@@ -573,6 +575,7 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
@@ -581,7 +584,7 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
         &f.ctx,
         plan,
         LockOnInput::Resume {
-            password: slot(LockSlotKind::Password, PASSWORD),
+            everyday: slot(LockSlotKind::Password, PASSWORD),
             recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
         },
         &NullReporter,
@@ -636,6 +639,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
     };
@@ -662,6 +666,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &foreign.store_id,
             LockSlotKind::RecoveryKey,
             SecretString::new(foreign.recovery_key().expose()),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
@@ -677,7 +682,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &f.ctx,
             plan,
             LockOnInput::Resume {
-                password: slot(LockSlotKind::Password, PASSWORD).unwrap(),
+                everyday: slot(LockSlotKind::Password, PASSWORD).unwrap(),
                 recovery,
             },
             &NullReporter,

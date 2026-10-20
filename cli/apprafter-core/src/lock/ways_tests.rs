@@ -9,17 +9,20 @@ use std::sync::Mutex;
 
 use cli_core::{AccountPasswordRefusal, CliError};
 
+use super::on_tests::Files;
 use super::on_tests::{assert_locked_whole, lock, PASSWORD};
 use super::on_tests::{files_store, new_input};
 use super::*;
 use crate::secrets::{read_store_file, LockSlotKind, SlotInfo};
 use crate::vault::MachineId;
 use crate::vault::{KdfPolicy, NewSlot, OsRandom, RecoveryKey, SlotInput, VaultId};
+use crate::vault::{SlotBody, SlotRecord, FORMAT_V1};
 use crate::vault::{SlotId, SlotKind, VaultFile, VaultHeader, VAULT_FILE};
 use crate::Context;
 use crate::SecretString;
 use crate::{CancellationToken, CoreError, CoreResult, NullReporter, Outcome, Plan};
 use cli_core::{AccountCheckUnavailable, AccountPasswordUnusable};
+use cli_core::{LockPhase, StoreLock};
 
 /// This computer's facts as a test sets them (B15): each call recorded by name, in order, so
 /// a test sees what the plan asked — and what it did not.
@@ -928,4 +931,210 @@ fn a_short_account_password_comes_with_its_advice() {
             other => panic!("{typed}: {other:?}"),
         }
     }
+}
+
+/// A lock-password run interrupted with its vault on disk, then this computer's
+/// account-password slot added to that vault — a vault no `lock on` writes, which opens by
+/// both typed kinds (critic-plan M1's case): the recovery key's text.
+fn interrupted_with_both_kinds(f: &Files) -> String {
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let (input, shown) = new_input();
+    let at = f.ctx.clone().with_fault(FaultPoint::AfterVaultVerified);
+    execute_on(&at, plan, input, &NullReporter, &CancellationToken::new()).unwrap_err();
+    let root = f.ctx.config_root();
+    let id = read_store_file(root).unwrap().unwrap().id.unwrap();
+    let input = SlotInput::from_input(SecretString::new(shown.as_str()), None);
+    let key = open_at(root, &id, input, &KdfPolicy::INSECURE_FAST).unwrap();
+    let path = root.join(VAULT_FILE);
+    let bytes = crate::vault::file::read(&path).unwrap();
+    let mut vault = VaultFile::parse(&bytes)
+        .unwrap()
+        .open_with_key(&key.key, key.vault_id)
+        .unwrap();
+    let slot = NewSlot::OsPassword {
+        secret: SecretString::new(ACCOUNT),
+        label: "account password of walker on box-a".into(),
+        enrolled_at: 1_760_000_000,
+        machine: here(),
+    };
+    vault
+        .add_slot(slot, &KdfPolicy::INSECURE_FAST, &mut OsRandom)
+        .unwrap();
+    let sealed = vault.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+    let held = StoreLock::exclusive(&f.ctx.store()).unwrap();
+    crate::vault::file::replace(&path, &sealed, &held).unwrap();
+    shown
+}
+
+/// B56, critic-plan M1 (acceptance 3): a resume asks its plan's everyday slot by that slot's
+/// own kind and takes no other — the account password typed at the lock password's question
+/// opens nothing, nor the lock password at the account password's, and a vault opened by
+/// the account-password slot where the plan asked the lock password's finishes nothing and
+/// writes nothing; the lock password and the recovery key finish it.
+#[test]
+fn a_lock_password_resume_takes_no_account_password() {
+    let f = files_store();
+    let shown = interrupted_with_both_kinds(&f);
+    let root = f.ctx.config_root().to_path_buf();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let LockOnStart::Resume { id, everyday } = plan.payload.start().clone() else {
+        panic!("{:?}", plan.payload.start());
+    };
+    assert_eq!(everyday, LockSlotKind::Password);
+    let slot = |kind, secret: &str, machine| {
+        let secret = SecretString::new(secret);
+        open_slot_at(&root, &id, kind, secret, machine, &KdfPolicy::INSECURE_FAST)
+    };
+    let one_attempt = |opened: CoreResult<SlotOpened>| {
+        matches!(
+            opened,
+            Err(CoreError::Cli(CliError::UnlockFailed { attempts: 1, .. }))
+        )
+    };
+    assert!(
+        one_attempt(slot(LockSlotKind::Password, ACCOUNT, Some(here()))),
+        "the account password at the lock password's question"
+    );
+    assert!(
+        one_attempt(slot(LockSlotKind::OsPassword, PASSWORD, Some(here()))),
+        "the lock password at the account password's question"
+    );
+    let by_account = slot(LockSlotKind::OsPassword, ACCOUNT, Some(here())).unwrap();
+    assert_eq!(by_account.kind(), LockSlotKind::OsPassword);
+    let recovery = || slot(LockSlotKind::RecoveryKey, shown.as_str(), None).unwrap();
+    let before = crate::target::testkit::snapshot(&root);
+    let input = LockOnInput::Resume {
+        everyday: by_account,
+        recovery: recovery(),
+    };
+    let run = execute_on(
+        &f.ctx,
+        plan.clone(),
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            run,
+            Err(CoreError::Cli(CliError::LockIncomplete {
+                phase: LockPhase::Locking,
+                ..
+            }))
+        ),
+        "{run:?}"
+    );
+    assert_eq!(
+        crate::target::testkit::snapshot(&root),
+        before,
+        "nothing written"
+    );
+    let input = LockOnInput::Resume {
+        everyday: slot(LockSlotKind::Password, PASSWORD, None).unwrap(),
+        recovery: recovery(),
+    };
+    done(execute_on(
+        &f.ctx,
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    assert_locked_whole(&f.ctx, &shown);
+}
+
+/// B56 (acceptance 3): a run of the account password interrupted with its vault on disk
+/// resumes over that slot and the recovery key, each opened by its own kind — the account
+/// password with this computer's machine id, never without it, never as a lock password —
+/// and finishes; the resume asks this computer nothing.
+#[test]
+fn an_account_password_run_resumes_over_its_own_slot() {
+    let f = files_store();
+    let run = account_password_run(&f.ctx, HostOs::Linux, Some(FaultPoint::AfterVaultVerified));
+    let e = run.run.unwrap_err();
+    assert!(e.to_string().contains("injected fault"), "{e}");
+    let stand = Stand::ready(HostOs::Linux);
+    let plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    assert!(stand.asked().is_empty(), "{:?}", stand.asked());
+    let LockOnStart::Resume { id, everyday } = plan.payload.start().clone() else {
+        panic!("{:?}", plan.payload.start());
+    };
+    assert_eq!(everyday, LockSlotKind::OsPassword);
+    assert_eq!(
+        vault_line(&plan),
+        "written by the earlier run; opened with your account password and with the \
+         recovery key before anything leaves the files"
+    );
+    let root = f.ctx.config_root().to_path_buf();
+    let slot = |kind, secret: &str, machine| {
+        let secret = SecretString::new(secret);
+        open_slot_at(&root, &id, kind, secret, machine, &KdfPolicy::INSECURE_FAST)
+    };
+    assert!(
+        matches!(
+            slot(LockSlotKind::Password, ACCOUNT, None),
+            Err(CoreError::Cli(CliError::UnlockFailed { attempts: 1, .. }))
+        ),
+        "never as a lock password"
+    );
+    match slot(LockSlotKind::OsPassword, ACCOUNT, None) {
+        Err(CoreError::Cli(CliError::AccountPasswordRefused {
+            reason:
+                AccountPasswordRefusal::Unavailable {
+                    what: AccountCheckUnavailable::NoMachineId,
+                },
+            ..
+        })) => {}
+        other => panic!("without this computer's machine id: {other:?}"),
+    }
+    let everyday = slot(LockSlotKind::OsPassword, ACCOUNT, Some(here())).unwrap();
+    assert_eq!(everyday.kind(), LockSlotKind::OsPassword);
+    let recovery = slot(LockSlotKind::RecoveryKey, run.shown.as_str(), None).unwrap();
+    let input = LockOnInput::Resume { everyday, recovery };
+    done(execute_on(
+        &f.ctx,
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    assert_locked_whole(&f.ctx, &run.shown);
+}
+
+/// B56, Deviation 10: a resume finishes over an everyday slot this build opens by a typed
+/// secret — a lock password's or an account password's, wherever it sits — and over none
+/// other: a Windows Hello slot (until d4b-w2), or a vault holding the recovery key alone,
+/// is `lock off`'s to back out.
+#[test]
+fn a_resume_takes_an_everyday_slot_this_build_opens() {
+    let header = |kinds: &[SlotKind]| VaultHeader {
+        format_version: FORMAT_V1,
+        writer: "test".into(),
+        vault_id: VaultId([1; 16]),
+        store_id: "0123456789abcdef".into(),
+        slots: kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| SlotRecord {
+                id: SlotId([i as u8; 16]),
+                kind: *kind,
+                body: SlotBody::Opaque(Vec::new()),
+                label: String::new(),
+            })
+            .collect(),
+    };
+    let everyday = |kinds: &[SlotKind]| super::on::everyday_slot(&header(kinds));
+    assert_eq!(
+        everyday(&[SlotKind::Password, SlotKind::RecoveryKey]),
+        Some(LockSlotKind::Password)
+    );
+    assert_eq!(
+        everyday(&[SlotKind::RecoveryKey, SlotKind::OsPassword]),
+        Some(LockSlotKind::OsPassword)
+    );
+    assert_eq!(
+        everyday(&[SlotKind::WindowsHello, SlotKind::RecoveryKey]),
+        None
+    );
+    assert_eq!(everyday(&[SlotKind::RecoveryKey]), None);
 }

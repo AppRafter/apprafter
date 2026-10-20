@@ -402,7 +402,7 @@ pub fn plan_lock_finish(
 ) -> Result<PlanView, Refusal> {
     let plan = lock::plan_on(&shell.context, None, lock::WayAsked::LockPassword)
         .map_err(DesktopError::from)?;
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let LockOnStart::Resume { id, everyday } = plan.payload.start().clone() else {
         return Err(refused(
             "there is no interrupted Protect to finish in this target store",
             "The Security page shows where its secrets are.",
@@ -410,9 +410,9 @@ pub fn plan_lock_finish(
         .into());
     };
     let root = shell.context.config_root().to_path_buf();
-    let password = shell
-        .vault
-        .open_slot(&root, &id, LockSlotKind::Password, password)?;
+    // D.4b B56: the everyday slot by its own kind — the lock password's for every vault
+    // Protect writes until d4b-g2b offers the ways, whose Finish field then names it.
+    let everyday = shell.vault.open_slot(&root, &id, everyday, password)?;
     let recovery = shell
         .vault
         .open_slot(&root, &id, LockSlotKind::RecoveryKey, recovery)?;
@@ -431,7 +431,7 @@ pub fn plan_lock_finish(
         let result = lock::execute_on(
             &ctx,
             plan,
-            LockOnInput::Resume { password, recovery },
+            LockOnInput::Resume { everyday, recovery },
             reporter,
             cancel,
         );
@@ -955,8 +955,11 @@ mod tests {
             help.as_deref(),
             Some("The Security page shows where its secrets are.")
         );
-        // An interrupted Protect with its vault: the test store has a recovery slot only, so
-        // the lock password opens nothing — refused through the gate, before any plan.
+        // An interrupted Protect with its vault: the test store has a recovery slot only — no
+        // everyday slot a typed secret opens — so Finish's plan refuses it before any secret
+        // is tried (D.4b-c3 Deviation 10: `lock_incomplete`, whose way out is Stop
+        // protecting). A wrong lock password through the gate is
+        // `an_interrupted_protect_finishes_with_both_secrets`'.
         let mut made = None;
         let r = rig_with(
             |root| {
@@ -983,7 +986,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(*e.error, crate::errors::DesktopError::AuthFailed { .. }),
+            matches!(
+                &*e.error,
+                crate::errors::DesktopError::Core(CoreError::Cli(
+                    cli_core::CliError::LockIncomplete {
+                        phase: cli_core::LockPhase::Locking,
+                        ..
+                    }
+                ))
+            ),
             "{e:?}"
         );
     }
@@ -1222,6 +1233,18 @@ mod tests {
             text.replacen("secrets: locked", "secrets: locking", 1),
         )
         .unwrap();
+        // A lock password that is not the store's opens nothing: refused through the gate,
+        // before any plan (D.4b-c3: the everyday slot is opened by the kind its plan read).
+        let e = plan_lock_finish(
+            &r.shell,
+            SecretString::new("not the lock password"),
+            SecretString::new(key.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(*e.error, crate::errors::DesktopError::AuthFailed { .. }),
+            "{e:?}"
+        );
         let finish = plan_lock_finish(
             &r.shell,
             SecretString::new(PASSWORD),

@@ -922,7 +922,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         .unwrap_err();
         std::fs::write(f.ctx.age_key_path(), NOT_A_KEY).unwrap();
         let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
-        let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+        let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
             panic!("{at:?}: {:?}", plan.payload.start())
         };
         let slot = |kind, secret: &str| {
@@ -931,6 +931,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
                 &id,
                 kind,
                 SecretString::new(secret),
+                None,
                 &KdfPolicy::INSECURE_FAST,
             )
             .unwrap()
@@ -939,7 +940,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
             &f.ctx,
             plan,
             LockOnInput::Resume {
-                password: slot(LockSlotKind::Password, PASSWORD),
+                everyday: slot(LockSlotKind::Password, PASSWORD),
                 recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
             },
             &NullReporter,

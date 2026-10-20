@@ -54,6 +54,8 @@ const CONFIRM: &str = "Type the recovery key to confirm you saved it (the \
 /// A resume's answer that is not the slot's secret (C29's resume form).
 const NOT_THE_PASSWORD: &str = "That is not the lock password of this store.\n";
 const NOT_THE_KEY: &str = "That is not the recovery key of this store.\n";
+const NOT_THE_ACCOUNT_PASSWORD: &str =
+    "That is not the account password this store's slot on this computer was made with.\n";
 /// A resume without one of its two secrets: the way out (team decision 2026-10-13).
 const WAY_OUT: &str = "This `apprafter lock on` finishes only with both the lock password and \
                        the recovery key. Without one of them, `apprafter lock off` backs out of \
@@ -133,7 +135,7 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
         .tell(&on_plan_text(&ctx, &plan, &shown, &targets))
         .map_err(|e| miette::Report::new(refused(e)))?;
     let input = match plan.payload.start().clone() {
-        LockOnStart::Resume { id } => {
+        LockOnStart::Resume { id, everyday } => {
             asker
                 .tell(&format!(
                     "An earlier `apprafter lock on` on {shown} did not finish; finishing it. \
@@ -141,11 +143,11 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
                      lock password and with the recovery key.\n"
                 ))
                 .map_err(|e| miette::Report::new(refused(e)))?;
-            let password = ask_slot(asker, &root, &id, LockSlotKind::Password, &shown)
-                .map_err(miette::Report::new)?;
+            let everyday =
+                ask_slot(asker, &root, &id, everyday, &shown).map_err(miette::Report::new)?;
             let recovery = ask_slot(asker, &root, &id, LockSlotKind::RecoveryKey, &shown)
                 .map_err(miette::Report::new)?;
-            LockOnInput::Resume { password, recovery }
+            LockOnInput::Resume { everyday, recovery }
         }
         LockOnStart::New { restart } => {
             if restart {
@@ -371,6 +373,7 @@ fn new_input(
 fn resume_question(kind: LockSlotKind, shown: &str) -> String {
     let what = match kind {
         LockSlotKind::Password => "Lock password",
+        LockSlotKind::OsPassword => "Account password",
         _ => "Recovery key",
     };
     format!("{what} of {shown} (Enter alone if you no longer have it): ")
@@ -390,16 +393,19 @@ fn ask_slot(
 ) -> Result<SlotOpened, CliError> {
     let refused = prompt_refusal(root);
     let question = resume_question(kind, shown);
+    // D.4b B56: an account-password slot opens only with this computer's machine id.
+    let machine = crate::vault_access::slot_facts().machine_id().id().cloned();
     for _ in 0..ATTEMPTS {
         let secret = asker.ask(&question).map_err(&refused)?;
         if secret.expose().trim().is_empty() {
             break;
         }
-        match lock::open_slot_at(root, id, kind, secret, KdfPolicy::active()) {
+        match lock::open_slot_at(root, id, kind, secret, machine.clone(), KdfPolicy::active()) {
             Ok(opened) => return Ok(opened),
             Err(CoreError::Cli(CliError::UnlockFailed { .. })) => asker
                 .tell(match kind {
                     LockSlotKind::Password => NOT_THE_PASSWORD,
+                    LockSlotKind::OsPassword => NOT_THE_ACCOUNT_PASSWORD,
                     _ => NOT_THE_KEY,
                 })
                 .map_err(&refused)?,
@@ -1261,6 +1267,20 @@ mod tests {
         ));
         assert_eq!(s.told(), WAY_OUT);
         assert_eq!(s.asked(), vec![question]);
+    }
+
+    /// D.4b B56 (F8): a resume asks its everyday slot by the slot's own name — the account
+    /// password of a run that made one (d4b-e1a writes such vaults), never as a lock password.
+    #[test]
+    fn a_resume_asks_the_everyday_slot_by_its_own_name() {
+        assert_eq!(
+            resume_question(LockSlotKind::OsPassword, "~/store"),
+            "Account password of ~/store (Enter alone if you no longer have it): "
+        );
+        assert_eq!(
+            resume_question(LockSlotKind::Password, "~/store"),
+            "Lock password of ~/store (Enter alone if you no longer have it): "
+        );
     }
 }
 

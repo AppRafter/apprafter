@@ -18,7 +18,8 @@
 //!
 //! No clear datum is deleted before a vault verified with both slots (rule 4). A run
 //! interrupted with its vault on disk resumes at step 3 with both slots' secrets — the vault on
-//! disk opened with the password slot's key AND the recovery slot's, each slot opened by a
+//! disk opened with the everyday slot's key — of the kind the plan read from it (D.4b B56)
+//! — AND the recovery slot's, each slot opened by a
 //! secret of its own kind (`lock::open_slot_at`; team decision 2026-10-13); without one of
 //! them the way out is `lock off`, which backs out, and a new `lock on`. One interrupted before
 //! starts over, with a new id and a new recovery key (the one shown before is void, G13).
@@ -58,6 +59,7 @@ use crate::secrets::{
     StoreId, STORE_FILE, STORE_FILE_FORMAT,
 };
 use crate::vault::MachineId;
+use crate::vault::VaultHeader;
 use crate::vault::{
     self, ConfirmedRecoveryKey, NewSlot, OsRandom, RecoveryKey, SlotSecret, UnlockedVault,
     VaultError, VaultFile, VaultPayload, DEFAULT_UNLOCK_TIMEOUT_MIN,
@@ -86,9 +88,10 @@ thread_local! {
 pub enum LockOnStart {
     /// From files, or after a run that wrote no vault (`restart`: its recovery key is void).
     New { restart: bool },
-    /// A run interrupted with its vault on disk: finished once the vault opens with both
-    /// slots' secrets (rule 4).
-    Resume { id: StoreId },
+    /// A run interrupted with its vault on disk: finished once the vault opens with its
+    /// everyday slot's secret — `everyday`, that slot's kind, read from the vault when the
+    /// run was planned (D.4b B56) — and with the recovery key's (rule 4).
+    Resume { id: StoreId, everyday: LockSlotKind },
     /// The store is locked already.
     AlreadyLocked,
 }
@@ -229,10 +232,11 @@ pub enum LockOnInput {
         first: FirstSlot,
         recovery: ConfirmedRecoveryKey,
     },
-    /// Finishing an interrupted run: its vault, opened once by the lock password's slot and
-    /// once by the recovery key's (`lock::open_slot_at`; rule 4, team decision 2026-10-13).
+    /// Finishing an interrupted run: its vault, opened once by its everyday slot — of the
+    /// kind the plan read (`LockOnStart::Resume`'s `everyday`) — and once by the recovery
+    /// key's (`lock::open_slot_at`; rule 4, team decision 2026-10-13; D.4b B56).
     Resume {
-        password: SlotOpened,
+        everyday: SlotOpened,
         recovery: SlotOpened,
     },
 }
@@ -461,6 +465,9 @@ pub fn plan_on(
             phase: LockPhase::Unlocking,
         })),
         Some((SecretsMode::Locking, Some(id))) if vault_on_disk(root)? => {
+            // D.4b B56: what the resume asks besides the recovery key, from the vault's
+            // header (F6).
+            let everyday = resumable(&store, &id)?;
             let mut changes = Vec::new();
             for target in &targets {
                 if let Credentials::Clear(_) = transfer::credentials(&store, target)? {
@@ -483,12 +490,15 @@ pub fn plan_on(
                 "Vault",
                 &vault_path(root).display().to_string(),
                 ChangeAction::Keep,
-                "written by the earlier run; opened with the lock password and with the \
-                 recovery key before anything leaves the files",
+                &format!(
+                    "written by the earlier run; opened with {} and with the recovery key \
+                     before anything leaves the files",
+                    opener_noun(everyday)
+                ),
             ));
             let keys = keys_for_caches(ctx, &store, &targets)?;
             Ok(plan(
-                LockOnStart::Resume { id },
+                LockOnStart::Resume { id, everyday },
                 title("Finish locking the secrets of", root, &targets),
                 changes,
                 timeout,
@@ -521,6 +531,42 @@ pub fn plan_on(
                 }),
             ))
         }
+    }
+}
+
+/// The everyday slot's kind of an interrupted run's vault (D.4b B56), read from its header
+/// without a secret: what its resume asks besides the recovery key. A vault with no such
+/// slot this build opens by a typed secret — Windows Hello until d4b-w2 — cannot be
+/// finished here: `lock_incomplete`, whose help names `lock off`, which backs the run out
+/// with the recovery key.
+fn resumable(store: &TargetStorePaths, id: &StoreId) -> CoreResult<LockSlotKind> {
+    let disk = read_vault(store, id)?;
+    let parsed = VaultFile::parse(&disk).map_err(|e| vault_err(store.root(), e))?;
+    everyday_slot(parsed.header()).ok_or_else(|| {
+        CoreError::Cli(CliError::LockIncomplete {
+            store: store.root().to_path_buf(),
+            phase: LockPhase::Locking,
+        })
+    })
+}
+
+/// The kind of `header`'s everyday slot (D.4b B56): its first slot that is not a recovery
+/// key's, when that is a lock password's or an account password's — the kinds this build
+/// opens by a typed secret.
+pub(super) fn everyday_slot(header: &VaultHeader) -> Option<LockSlotKind> {
+    header
+        .slots
+        .iter()
+        .map(|slot| LockSlotKind::from(slot.kind))
+        .find(|kind| *kind != LockSlotKind::RecoveryKey)
+        .filter(|kind| matches!(kind, LockSlotKind::Password | LockSlotKind::OsPassword))
+}
+
+/// What a resume opens the everyday slot with, as its plan line says it (D.4a C6; D.4b B56).
+fn opener_noun(kind: LockSlotKind) -> &'static str {
+    match kind {
+        LockSlotKind::OsPassword => "your account password",
+        _ => "the lock password",
     }
 }
 
@@ -691,9 +737,21 @@ pub fn execute_on(
         (LockOnStart::New { restart }, LockOnInput::New { first, recovery }) => {
             on_new(ctx, &payload, restart, first, recovery, reporter, cancel)
         }
-        (LockOnStart::Resume { id }, LockOnInput::Resume { password, recovery }) => {
-            on_resume(ctx, &payload, &id, password, recovery, reporter, cancel)
-        }
+        (
+            LockOnStart::Resume {
+                id,
+                everyday: planned,
+            },
+            LockOnInput::Resume { everyday, recovery },
+        ) => on_resume(
+            ctx,
+            &payload,
+            (&id, planned),
+            everyday,
+            recovery,
+            reporter,
+            cancel,
+        ),
         (start, _) => Err(CoreError::Cli(CliError::Other(format!(
             "a `lock on` plan to start {start:?} was given the other kind of input; nothing \
              was written"
@@ -894,22 +952,25 @@ fn on_new(
 }
 
 /// Step 3 again, then steps 4–6 (rule 4; team decision 2026-10-13): the vault on disk opens
-/// with the password slot's key AND the recovery slot's, each slot opened by a secret of its
-/// own kind, before any clear datum goes. Two openings of one kind are refused as the
-/// interrupted lock they leave (`lock_incomplete`, whose help names `lock off` and a new
-/// `lock on`); a key for another vault is the store changing under the run (`store_changed`).
+/// with the everyday slot's key AND the recovery slot's, each slot opened by a secret of its
+/// own kind — the everyday one of the kind the plan read from the vault (D.4b B56), so an
+/// account password never stands in for a lock password, nor the reverse — before any
+/// clear datum goes. An opening of another kind than planned, or two of one kind, is
+/// refused as the interrupted lock it leaves (`lock_incomplete`, whose help names `lock
+/// off` and a new `lock on`); a key for another vault is the store changing under the run
+/// (`store_changed`). The id and the planned kind travel as one parameter (F4).
 fn on_resume(
     ctx: &Context,
     payload: &LockOnPayload,
-    id: &StoreId,
-    password: SlotOpened,
+    (id, planned): (&StoreId, LockSlotKind),
+    everyday: SlotOpened,
     recovery: SlotOpened,
     reporter: &dyn Reporter,
     cancel: &CancellationToken,
 ) -> CoreResult<Outcome<LockedOn>> {
     let store = ctx.store();
     let root = ctx.config_root();
-    if password.kind() != LockSlotKind::Password || recovery.kind() != LockSlotKind::RecoveryKey {
+    if everyday.kind() != planned || recovery.kind() != LockSlotKind::RecoveryKey {
         return Err(CoreError::Cli(CliError::LockIncomplete {
             store: root.to_path_buf(),
             phase: LockPhase::Locking,
@@ -943,7 +1004,7 @@ fn on_resume(
     let disk = read_vault(&store, id)?;
     let parsed = VaultFile::parse(&disk).map_err(|e| vault_err(root, e))?;
     let vault = parsed
-        .open_with_key(&password.opened().key, password.opened().vault_id)
+        .open_with_key(&everyday.opened().key, everyday.opened().vault_id)
         .map_err(|e| vault_err(root, e))?;
     parsed
         .open_with_key(&recovery.opened().key, recovery.opened().vault_id)
@@ -961,7 +1022,7 @@ fn on_resume(
         held: &held,
         id,
     };
-    let opened = password.opened();
+    let opened = everyday.opened();
     let key = transfer::store_key(
         root,
         KeySession::new(opened.key.clone(), opened.vault_id, root.to_path_buf()),

@@ -157,6 +157,7 @@ use cli_core::CliError;
 
 use crate::error::{CoreError, CoreResult};
 use crate::secrets::{read_vault, vault_error, StoreId};
+use crate::vault::MachineId;
 use crate::vault::{DataKey, KdfPolicy, SlotInput, SlotSecret, VaultError, VaultFile, VaultId};
 
 use super::SlotRef;
@@ -286,17 +287,17 @@ pub fn set_unlock_timeout(
 /// One slot of a store's vault, opened in this process by a secret of that slot's own kind
 /// (D.4a rule 4; team decision 2026-10-13): what a resumed `lock on` needs twice — the
 /// password slot and the recovery slot — before any clear datum goes. Made only by
-/// [`open_slot_at`], so its kind is the slot that opened, never a caller's claim.
+/// [`open_slot_at`], so its kind is the slot that opened — the vault names it
+/// (`OpenedVault::opened_with`, D.4b B56) — never a caller's claim.
 #[derive(Debug)]
 pub struct SlotOpened {
-    kind: crate::secrets::LockSlotKind,
     opened: OpenedVault,
 }
 
 impl SlotOpened {
     /// The kind of slot that opened the vault.
     pub fn kind(&self) -> crate::secrets::LockSlotKind {
-        self.kind
+        self.opened.opened_with().kind
     }
 
     /// The vault it opened: its data key, for that vault.
@@ -306,21 +307,27 @@ impl SlotOpened {
 }
 
 /// Opens the vault of the store at `root` (`id`) with `secret` as the secret of a `kind` slot,
-/// and of no other kind: a lock password tries the password slots only, so a recovery key typed
-/// there opens nothing; a recovery key is parsed first (`recovery_key_invalid` naming its group,
-/// one attempt) and tries the recovery slots only. A secret no slot of that kind takes is
-/// `unlock_failed`, one attempt, for the caller to count. Any other kind is the caller's
-/// mistake: `usage_refused`.
+/// and of no other kind: a lock password tries the lock-password slot only, so a recovery key
+/// or an account password typed there opens nothing; the account password tries this
+/// computer's account-password slot only — with its machine id, `machine` (D.4b B56; without
+/// one it is `account_password_refused`, never a try) — and asks the system nothing (B13); a
+/// recovery key is parsed first (`recovery_key_invalid` naming its group, one attempt) and
+/// tries the recovery slots only. A secret no slot of that kind takes is `unlock_failed`, one
+/// attempt, for the caller to count. Any other kind is the caller's mistake: `usage_refused`.
 pub fn open_slot_at(
     root: &Path,
     id: &StoreId,
     kind: crate::secrets::LockSlotKind,
     secret: crate::context::SecretString,
+    machine: Option<MachineId>,
     policy: &KdfPolicy,
 ) -> CoreResult<SlotOpened> {
     use crate::secrets::LockSlotKind;
     let input = match kind {
         LockSlotKind::Password => SlotInput::Password(secret),
+        LockSlotKind::OsPassword => {
+            SlotInput::AccountPassword(secret, machine.ok_or_else(no_machine_id)?)
+        }
         LockSlotKind::RecoveryKey => SlotInput::RecoveryKey(
             crate::vault::RecoveryKey::parse(secret.expose())
                 .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?,
@@ -336,8 +343,18 @@ pub fn open_slot_at(
         }
     };
     Ok(SlotOpened {
-        kind,
         opened: open_at(root, id, input, policy)?,
+    })
+}
+
+/// D.4b B54: an account-password slot opens only with this computer's machine id, which the
+/// client could not read here.
+fn no_machine_id() -> CoreError {
+    CoreError::Cli(CliError::AccountPasswordRefused {
+        reason: cli_core::AccountPasswordRefusal::Unavailable {
+            what: cli_core::AccountCheckUnavailable::NoMachineId,
+        },
+        messages: Vec::new(),
     })
 }
 
