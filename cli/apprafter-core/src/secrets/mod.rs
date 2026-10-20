@@ -37,6 +37,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::context::SecretString;
+use crate::vault::VaultFile;
 
 mod access;
 mod cache;
@@ -183,6 +184,26 @@ impl CacheKey {
         match &self.0 {
             KeyOf::SharedFile { .. } => CacheKeyView::SharedFile,
             KeyOf::StoreVault { .. } => CacheKeyView::StoreVault,
+        }
+    }
+
+    /// What a cache sealed to this key records (F13, D.4b B86): the target store vault this
+    /// key's identity is in — the store's id and the vault's, from that vault's header — and
+    /// nothing for the shared age key. A vault id names one store key (both change together,
+    /// at `lock on` and at every key change), so the record tells a store key a key change
+    /// retired from a damaged cache, and can never name a vault the key is not in.
+    pub(crate) fn record(&self) -> cli_core::Result<Option<SealedTo>> {
+        match &self.0 {
+            KeyOf::SharedFile { .. } => Ok(None),
+            KeyOf::StoreVault { vault, path, .. } => {
+                let root = path.parent().unwrap_or(path.as_path());
+                let parsed = VaultFile::parse(vault).map_err(|e| vault_error(root, e))?;
+                let header = parsed.header();
+                Ok(Some(SealedTo::StoreVault {
+                    store_id: header.store_id.clone(),
+                    vault_id: Some(header.vault_id.to_string()),
+                }))
+            }
         }
     }
 }
@@ -883,15 +904,10 @@ impl SecretStore {
                 )
             })?;
             let sealed = encrypt_for_recipient(plaintext, &new.key.recipient()?)?;
-            // F13: what sealed it goes with it — the store's vault on a locked store, else
-            // nothing (the shared key).
-            let sealed_to = match &new.settled {
-                Settled::Locked(id) => Some(SealedTo::StoreVault {
-                    store_id: id.as_str().to_string(),
-                    vault_id: None,
-                }),
-                Settled::Files => None,
-            };
+            // F13, B86: what sealed it goes with it — on a locked store the store's vault, by
+            // its store id and vault id (the vault this key's identity is in); else nothing
+            // (the shared key).
+            let sealed_to = new.key.record()?;
             let (slot, record) = hetzner.cache_mut(new.secret);
             *slot = Some(sealed.clone());
             *record = sealed_to;

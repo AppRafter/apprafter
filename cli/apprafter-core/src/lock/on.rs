@@ -1098,7 +1098,7 @@ fn finish(
             run.store,
             run.held,
             target,
-            (key, run.id),
+            key,
             &old,
             &payload.drops,
             resume,
@@ -1133,7 +1133,8 @@ fn finish(
 /// one already the store's skipped (a resume); one no key of this run opens dropped when the
 /// plan listed it (or on a resume, whose plan says so), else left; a winning plaintext
 /// kubeconfig sealed, a shadowed one dropped. F13: each cache sealed to the store's key — a
-/// skipped one too — records it (`SealedTo::StoreVault` with the store's id); a dropped one
+/// skipped one too — records it (`SealedTo::StoreVault` with the store's id and the vault's,
+/// B86: `CacheKey::record`); a dropped one
 /// loses its record; a left one keeps whatever it had. The state is read again under the held
 /// lock and only its caches change (WI-487, `State::update`).
 #[allow(clippy::too_many_arguments)]
@@ -1141,20 +1142,18 @@ fn reseal(
     store: &TargetStorePaths,
     held: &StoreLock,
     target: &str,
-    (key, id): (&CacheKey, &StoreId),
+    key: &CacheKey,
     old: &transfer::SharedKeys<'_>,
     agreed: &[CacheDrop],
     resume: bool,
     done: &mut LockedOn,
 ) -> CoreResult<()> {
     let paths = StatePaths::for_active_target(store, target);
+    // F13, B86: the store's vault the key is in, by its store id and vault id.
+    let sealed_to = key.record()?;
     State::update::<CoreError>(&paths, held, |state| {
         let Some(mut h) = state.hetzner_cloud.clone() else {
             return Ok(Write::Leave);
-        };
-        let vault = || SealedTo::StoreVault {
-            store_id: id.as_str().to_string(),
-            vault_id: None,
         };
         let shadowed = h.kubeconfig_age.is_some();
         let mut changed = false;
@@ -1165,8 +1164,8 @@ fn reseal(
             };
             if transfer::opens(key, secret, &armored).is_some() {
                 // A resume: sealed to the store's key already; recorded so, once.
-                if *record != Some(vault()) {
-                    *record = Some(vault());
+                if *record != sealed_to {
+                    *record = sealed_to.clone();
                     changed = true;
                 }
                 continue;
@@ -1174,7 +1173,7 @@ fn reseal(
             match transfer::open_with_any(&armored, old.get()?) {
                 Some(plain) => {
                     *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
-                    *record = Some(vault());
+                    *record = sealed_to.clone();
                     changed = true;
                     done.caches_resealed += 1;
                 }
@@ -1216,7 +1215,7 @@ fn reseal(
                     target,
                     &plain,
                 )?);
-                h.kubeconfig_sealed_to = Some(vault());
+                h.kubeconfig_sealed_to = sealed_to.clone();
                 done.caches_resealed += 1;
             }
         }

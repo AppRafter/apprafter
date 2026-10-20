@@ -240,10 +240,16 @@ pub(super) fn assert_locked_whole(ctx: &Context, secret: &str) {
         staging.argocd_admin_password_age.is_none(),
         "the cache no key opens was dropped"
     );
-    // F13: each cache sealed to the store's key says so; the dropped one has no record.
+    // F13, B86: each cache sealed to the store's key says so, with the vault's id; the
+    // dropped one has no record.
     let vault = Some(cli_state::SealedTo::StoreVault {
         store_id: file.id.as_ref().unwrap().as_str().to_string(),
-        vault_id: None,
+        vault_id: Some(
+            crate::secrets::vault_id_on_disk(root)
+                .unwrap()
+                .unwrap()
+                .to_string(),
+        ),
     });
     assert_eq!(
         (
