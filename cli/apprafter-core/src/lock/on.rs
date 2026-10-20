@@ -57,6 +57,7 @@ use crate::secrets::{
     vault_write_error, CacheKey, KeySession, LockSlotKind, SecretsMode, SlotInfo, StoreFile,
     StoreId, STORE_FILE, STORE_FILE_FORMAT,
 };
+use crate::vault::MachineId;
 use crate::vault::{
     self, ConfirmedRecoveryKey, NewSlot, OsRandom, RecoveryKey, SlotSecret, UnlockedVault,
     VaultError, VaultFile, VaultPayload, DEFAULT_UNLOCK_TIMEOUT_MIN,
@@ -120,6 +121,8 @@ struct NewRun {
     /// The new vault's id and its slots' — the first slot's, then the recovery key's —
     /// minted when the run is planned (B57, B80).
     ids: VaultIds,
+    /// ADR 0069 §1 answer 2: the account password was checked with the system already.
+    checked: bool,
 }
 
 /// Where the recovery key's slot is among a new vault's: after the first slot (B57).
@@ -185,6 +188,26 @@ impl LockOnPayload {
         self.new_run
             .as_ref()
             .map(|run| run.ids.slots[RECOVERY_SLOT])
+    }
+
+    /// The machine id a new run's account-password slot is bound to (D.4b B54): this
+    /// computer's, as the client's facts gave it to the plan.
+    pub(super) fn machine(&self) -> Option<&MachineId> {
+        self.new_run
+            .as_ref()
+            .and_then(|run| run.way.machine.as_ref())
+    }
+
+    /// ADR 0069 §1 answer 2: one check of the account password a run — `true` the first
+    /// time a new run's plan spends it, `false` after (F11).
+    pub(super) fn take_check(&mut self) -> bool {
+        match self.new_run.as_mut() {
+            Some(run) if !run.checked => {
+                run.checked = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A new run's ids, read before anything is written.
@@ -491,7 +514,11 @@ pub fn plan_on(
                 timeout,
                 keys,
                 drops,
-                Some(NewRun { way, ids }),
+                Some(NewRun {
+                    way,
+                    ids,
+                    checked: false,
+                }),
             ))
         }
     }
@@ -627,6 +654,20 @@ fn first_noun(way: LockOnWay) -> &'static str {
         LockOnWay::AccountPassword => "a slot the account password opens",
         LockOnWay::WindowsHello => "a slot Windows Hello opens",
         LockOnWay::LockPassword => "a slot the lock password opens",
+    }
+}
+
+/// B75 (2): a new run's plan after an empty entry where this account's password status
+/// could not be read — a separate lock password, `reason` named, its ids kept (B80: the
+/// recovery key is shown with the plan's id) and its Vault line saying so.
+pub(super) fn fall_back(plan: &mut Plan<LockOnPayload>, reason: WayFallback) {
+    if let Some(run) = plan.payload.new_run.as_mut() {
+        run.way = Way::lock_password(Some(reason));
+    }
+    for change in &mut plan.changes {
+        if change.kind == "Vault" {
+            change.detail = Some(vault_opened_by(LockOnWay::LockPassword).to_string());
+        }
     }
 }
 

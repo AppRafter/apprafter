@@ -48,6 +48,7 @@ pub use slots::{
     SlotRemoved,
 };
 pub use ways::{first_slot, FirstSecret, FirstSlot, FirstStep};
+pub use ways::{AccountChecked, AccountPasswordCheck};
 pub use ways::{LockOnWay, WayAsked, WayFallback};
 
 use std::path::{Path, PathBuf};

@@ -18,6 +18,7 @@ use std::fmt;
 
 use cli_core::{AccountPasswordRefusal, CliError};
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use super::facts::{BackoffFact, CheckBackend, HostOs, MachineFact, PasswordFact, WayFacts};
 use super::on::{LockOnPayload, PASSWORD_LABEL};
@@ -92,10 +93,6 @@ pub(super) struct Way {
     pub(super) way: LockOnWay,
     pub(super) fallback: Option<WayFallback>,
     /// The machine id an account-password slot is bound to (B54).
-    #[expect(
-        dead_code,
-        reason = "read by `LockOnPayload::machine` from d4b-c3 Task 5 on"
-    )]
     pub(super) machine: Option<MachineId>,
     /// B75 (2): the password status could not be read, so an empty entry means "no
     /// password".
@@ -174,9 +171,16 @@ fn fall_back(reason: WayFallback) -> CoreResult<Way> {
 
 /// The first slot's secret, as the client got it (D.4b B55, B56): what [`first_slot`] checks
 /// for the plan's way.
-pub enum FirstSecret {
+pub enum FirstSecret<'a> {
     /// A new lock password, as the person chose it (asked twice by the client, O2).
     LockPassword(SecretString),
+    /// This computer's account password as typed, once — an empty entry is B75 (2)'s "no
+    /// password" where the plan says so (`empty_entry_falls_back`) — with the client's check
+    /// with the system.
+    AccountPassword {
+        typed: SecretString,
+        check: &'a dyn AccountPasswordCheck,
+    },
 }
 
 /// A new vault's first slot, its secret checked for its plan's way (D.4b B55, B56). Its fields
@@ -273,7 +277,10 @@ pub enum FirstStep {
 /// vault's rules, then by the client's check with the system. A secret the plan does not
 /// take — another way's, or any for a plan that is no new run's — is `Err`, with nothing
 /// asked, drawn or written.
-pub fn first_slot(plan: &mut Plan<LockOnPayload>, secret: FirstSecret) -> CoreResult<FirstStep> {
+pub fn first_slot(
+    plan: &mut Plan<LockOnPayload>,
+    secret: FirstSecret<'_>,
+) -> CoreResult<FirstStep> {
     let Some(way) = plan.payload.way() else {
         return Err(misused("is no new run's"));
     };
@@ -286,6 +293,12 @@ pub fn first_slot(plan: &mut Plan<LockOnPayload>, secret: FirstSecret) -> CoreRe
                 Ok(first) => ready(first.of_plan(&plan.payload)),
                 Err(refused) => mistake(refused),
             }
+        }
+        FirstSecret::AccountPassword { typed, check } => {
+            if way != LockOnWay::AccountPassword {
+                return Err(misused("takes another way in than the account password"));
+            }
+            account_password(plan, typed, check)
         }
     }
 }
@@ -328,4 +341,100 @@ fn misused(what: &str) -> CoreError {
     CoreError::Cli(CliError::Other(format!(
         "this `lock on` plan {what}; nothing was asked, drawn or written"
     )))
+}
+
+/// The system's check of this computer's account password, as the client makes it (D.4b
+/// B10–B12, B56; ADR 0069 §9): d4b-e1a's and d4b-g2b's glue over `apprafter-os-slots` — the
+/// core never calls the OS. [`first_slot`] calls it once a run at most, after the core's own
+/// refusals, so no check is spent on a password no slot could hold. `Send + Sync + Debug`
+/// as `SlotFacts` and `HelloKeys` are (critic round, finding 9): a `FirstSecret` may cross to
+/// the desktop's blocking worker.
+pub trait AccountPasswordCheck: Send + Sync + fmt::Debug {
+    /// Checks `typed` with the system for the account running AppRafter — one check, under
+    /// the back-off across runs — and, when the system took it, builds the slot: `typed`
+    /// bound to `machine`, labelled by `lock::account_password_label` (only the glue builds
+    /// an account-password slot, G-OS6).
+    fn check(&self, typed: &SecretString, machine: &MachineId) -> AccountChecked;
+}
+
+/// What the system's check said (D.4b B55, B56, B74, B75): only `Verified` makes a slot.
+pub enum AccountChecked {
+    /// The system checked the typed text and took it: the slot to write.
+    Verified(NewSlot),
+    /// Refused — a wrong password, a stack that checked nothing (`not_checked`), a back-off
+    /// in force by now, no check here after all: the run ends `account_password_refused`,
+    /// nothing written, no recovery key drawn. `messages` are the system's own words.
+    Refused {
+        reason: AccountPasswordRefusal,
+        messages: Vec<String>,
+    },
+}
+
+/// This computer's account password as a new vault's first slot (D.4b B10, B11, B56, B75;
+/// F2, F10, F11): an empty entry falls back where the password status could not be read,
+/// before the system is asked anything; a password no slot holds is a mistake, said before
+/// the system's check; then the client's check, once a run; and only the slot of the text
+/// typed, bound to the plan's machine id, is taken.
+fn account_password(
+    plan: &mut Plan<LockOnPayload>,
+    typed: SecretString,
+    check: &dyn AccountPasswordCheck,
+) -> CoreResult<FirstStep> {
+    if typed.expose().is_empty() && plan.payload.empty_entry_falls_back() {
+        super::on::fall_back(plan, WayFallback::NoPassword);
+        return Ok(FirstStep::FellBack);
+    }
+    // B2 (critic round, finding 3): the pre-check's advice rides on the first slot.
+    let advice = match super::check_account_password(&typed) {
+        Ok(advice) => advice,
+        Err(refused) => return mistake(refused),
+    };
+    let Some(machine) = plan.payload.machine().cloned() else {
+        return Err(misused("holds no machine id for the account password"));
+    };
+    if !plan.payload.take_check() {
+        return Err(misused(
+            "had the account password checked once already: one check a run",
+        ));
+    }
+    let slot = match check.check(&typed, &machine) {
+        AccountChecked::Verified(slot) => slot,
+        AccountChecked::Refused { reason, messages } => {
+            return Err(CoreError::Cli(CliError::AccountPasswordRefused {
+                reason,
+                messages,
+            }));
+        }
+    };
+    // F2: the client built the slot (G-OS6); the core takes it only for the text typed and
+    // this computer's machine id, each compared in constant time.
+    let NewSlot::OsPassword {
+        secret,
+        machine: bound,
+        ..
+    } = &slot
+    else {
+        return Err(not_the_slot());
+    };
+    let same_text = bool::from(secret.expose().as_bytes().ct_eq(typed.expose().as_bytes()));
+    let same_machine = bool::from(bound.bytes().ct_eq(machine.bytes()));
+    if !(same_text && same_machine) {
+        return Err(not_the_slot());
+    }
+    ready(FirstSlot {
+        way: LockOnWay::AccountPassword,
+        slot,
+        secret: SlotSecret::AccountPassword(typed, machine),
+        advice,
+        plan_vault: plan.payload.vault_id(),
+    })
+}
+
+/// A slot the client's check gave back that is not the one asked for (F2): never written.
+fn not_the_slot() -> CoreError {
+    CoreError::Cli(CliError::Other(
+        "the account-password check gave back a slot that is not this computer's for the \
+         password typed; nothing was written"
+            .to_string(),
+    ))
 }

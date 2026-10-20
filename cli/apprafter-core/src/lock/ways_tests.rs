@@ -12,11 +12,14 @@ use cli_core::{AccountPasswordRefusal, CliError};
 use super::on_tests::{assert_locked_whole, lock, PASSWORD};
 use super::on_tests::{files_store, new_input};
 use super::*;
+use crate::secrets::{read_store_file, LockSlotKind, SlotInfo};
 use crate::vault::MachineId;
+use crate::vault::{KdfPolicy, NewSlot, OsRandom, RecoveryKey, SlotInput, VaultId};
 use crate::vault::{SlotId, SlotKind, VaultFile, VaultHeader, VAULT_FILE};
 use crate::Context;
 use crate::SecretString;
 use crate::{CancellationToken, CoreError, CoreResult, NullReporter, Outcome, Plan};
+use cli_core::{AccountCheckUnavailable, AccountPasswordUnusable};
 
 /// This computer's facts as a test sets them (B15): each call recorded by name, in order, so
 /// a test sees what the plan asked — and what it did not.
@@ -555,4 +558,374 @@ fn a_first_slot_is_written_only_under_its_own_plan() {
         crate::target::testkit::snapshot(f.ctx.config_root()),
         before
     );
+}
+
+const ACCOUNT: &str = "hunter2 is not a password";
+
+/// Another computer's machine id.
+fn elsewhere() -> MachineId {
+    MachineId::new(&[0x0b; 16]).unwrap()
+}
+
+/// What the stand-in check answers (B15).
+#[derive(Debug, Clone)]
+enum Answer {
+    /// The system took the typed text: the slot of that text, bound to the machine id given.
+    Verified,
+    /// The system refused it for `reason`.
+    Refused(AccountPasswordRefusal),
+    /// "Verified", but the slot holds other text.
+    OtherText,
+    /// "Verified", but the slot is bound to another computer.
+    OtherMachine,
+    /// "Verified", but the slot is a lock password's.
+    LockPasswordSlot,
+}
+
+/// The client's check with the system, played (B15): it counts its calls and never reaches
+/// PAM; it builds the slot as the os-slots glue does (test code, which G-OS6 lets build it).
+#[derive(Debug)]
+struct Check {
+    answer: Answer,
+    calls: Mutex<u32>,
+}
+
+impl Check {
+    fn answering(answer: Answer) -> Check {
+        Check {
+            answer,
+            calls: Mutex::new(0),
+        }
+    }
+
+    fn calls(&self) -> u32 {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl AccountPasswordCheck for Check {
+    fn check(&self, typed: &SecretString, machine: &MachineId) -> AccountChecked {
+        *self.calls.lock().unwrap() += 1;
+        let slot = |text: &str, machine: MachineId| NewSlot::OsPassword {
+            secret: SecretString::new(text),
+            label: "account password of walker on box-a".into(),
+            enrolled_at: 1_760_000_000,
+            machine,
+        };
+        match &self.answer {
+            Answer::Verified => AccountChecked::Verified(slot(typed.expose(), machine.clone())),
+            Answer::Refused(reason) => AccountChecked::Refused {
+                reason: reason.clone(),
+                messages: vec!["Authentication failure".to_string()],
+            },
+            Answer::OtherText => {
+                AccountChecked::Verified(slot("not what was typed", machine.clone()))
+            }
+            Answer::OtherMachine => AccountChecked::Verified(slot(typed.expose(), elsewhere())),
+            Answer::LockPasswordSlot => AccountChecked::Verified(NewSlot::Password {
+                secret: typed.clone(),
+                label: "lock password".into(),
+            }),
+        }
+    }
+}
+
+/// The account password's secret for `first_slot`: `typed`, checked by `check`.
+fn account<'a>(typed: &str, check: &'a Check) -> FirstSecret<'a> {
+    FirstSecret::AccountPassword {
+        typed: SecretString::new(typed),
+        check,
+    }
+}
+
+/// What a run of `lock on` with this computer's account password left.
+struct AccountRun {
+    /// The recovery key's text.
+    shown: String,
+    vault_id: VaultId,
+    recovery_id: SlotId,
+    run: CoreResult<Outcome<LockedOn>>,
+}
+
+/// `lock on` with this computer's account password on `ctx` — a stand-in playing `os`, its
+/// check taking `ACCOUNT` — interrupted at `at` when one is given.
+fn account_password_run(ctx: &Context, os: HostOs, at: Option<FaultPoint>) -> AccountRun {
+    let stand = Stand::ready(os);
+    let check = Check::answering(Answer::Verified);
+    let mut plan = plan_on(ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    let vault_id = plan.payload.vault_id().unwrap();
+    let recovery_id = plan.payload.recovery_slot_id().unwrap();
+    let (input, shown) = input_for(&mut plan, account(ACCOUNT, &check));
+    assert_eq!(check.calls(), 1, "one check a run");
+    let ctx = match at {
+        Some(at) => ctx.clone().with_fault(at),
+        None => ctx.clone(),
+    };
+    AccountRun {
+        shown,
+        vault_id,
+        recovery_id,
+        run: execute_on(&ctx, plan, input, &NullReporter, &CancellationToken::new()),
+    }
+}
+
+/// B55, B56 with each stand-in (acceptance 1): the account password is checked once and
+/// makes the first slot, bound to this computer — the vault holds the plan's ids,
+/// `store.yaml` mirrors the slot, and the recovery key and the account password with this
+/// computer's machine id open the store — and the run is D.4a's from there.
+#[test]
+fn the_account_password_makes_the_first_slot_bound_to_this_computer() {
+    for os in [HostOs::Linux, HostOs::Macos] {
+        let f = files_store();
+        let run = account_password_run(&f.ctx, os, None);
+        assert!(!done(run.run).already_locked, "{os:?}");
+        let header = header_of(&f.ctx);
+        assert_eq!(header.vault_id, run.vault_id, "{os:?}");
+        let kinds: Vec<SlotKind> = header.slots.iter().map(|slot| slot.kind).collect();
+        assert_eq!(
+            kinds,
+            [SlotKind::OsPassword, SlotKind::RecoveryKey],
+            "{os:?}"
+        );
+        assert_eq!(header.slots[1].id, run.recovery_id, "{os:?}");
+        assert!(header.slots[0].made_on(&here()), "{os:?}");
+        assert!(!header.slots[0].made_on(&elsewhere()), "{os:?}");
+        let file = read_store_file(f.ctx.config_root()).unwrap().unwrap();
+        assert_eq!(
+            file.slots,
+            [
+                SlotInfo {
+                    kind: LockSlotKind::OsPassword,
+                    label: "account password of walker on box-a".into(),
+                },
+                SlotInfo {
+                    kind: LockSlotKind::RecoveryKey,
+                    label: RECOVERY_LABEL.into(),
+                },
+            ],
+            "{os:?}"
+        );
+        assert_locked_whole(&f.ctx, &run.shown);
+        let input = SlotInput::AccountPassword(SecretString::new(ACCOUNT), here());
+        let id = file.id.as_ref().unwrap();
+        let opened = open_at(f.ctx.config_root(), id, input, &KdfPolicy::INSECURE_FAST).unwrap();
+        assert_eq!(opened.vault_id, run.vault_id, "{os:?}");
+    }
+}
+
+/// B75 (2) (acceptance 2): where this account's password status could not be read, an empty
+/// entry is "no password": the plan falls back to a separate lock password before the system
+/// is asked anything — `no_password` named, its Vault line a lock password's, its ids the
+/// same (B80) — and takes the account password no more.
+#[test]
+fn an_empty_entry_falls_back_before_any_check() {
+    let f = files_store();
+    let stand = Stand {
+        status: PasswordFact::Unknown,
+        ..Stand::ready(HostOs::Macos)
+    };
+    let check = Check::answering(Answer::Verified);
+    let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    assert!(plan.payload.empty_entry_falls_back());
+    let minted = (plan.payload.vault_id(), plan.payload.recovery_slot_id());
+    let step = first_slot(&mut plan, account("", &check)).unwrap();
+    assert!(matches!(step, FirstStep::FellBack), "{step:?}");
+    assert_eq!(check.calls(), 0, "nothing asked of the system");
+    assert_eq!(
+        (plan.payload.way(), plan.payload.fallback()),
+        (Some(LockOnWay::LockPassword), Some(WayFallback::NoPassword))
+    );
+    assert!(plan.payload.notes().is_empty());
+    assert!(!plan.payload.empty_entry_falls_back());
+    assert_eq!(
+        vault_line(&plan),
+        "opened by a lock password or a recovery key"
+    );
+    assert_eq!(
+        (plan.payload.vault_id(), plan.payload.recovery_slot_id()),
+        minted
+    );
+    let again = first_slot(&mut plan, account(ACCOUNT, &check));
+    assert!(
+        matches!(again, Err(CoreError::Cli(CliError::Other(_)))),
+        "{again:?}"
+    );
+    assert_eq!(check.calls(), 0);
+    let secret = FirstSecret::LockPassword(SecretString::new(PASSWORD));
+    let (input, _) = input_for(&mut plan, secret);
+    done(execute_on(
+        &f.ctx,
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    assert_eq!(Some(header_of(&f.ctx).vault_id), minted.0);
+    assert_locked_whole(&f.ctx, PASSWORD);
+}
+
+/// Deviation 7 (revisit after use): where this account's password status reads as set, an
+/// empty entry is a slip, not "no password" — said and asked again, the plan as it was, the
+/// system asked nothing.
+#[test]
+fn an_empty_entry_where_the_account_has_a_password_is_asked_again() {
+    let f = files_store();
+    let stand = Stand::ready(HostOs::Linux);
+    let check = Check::answering(Answer::Verified);
+    let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    match first_slot(&mut plan, account("", &check)).unwrap() {
+        FirstStep::Mistake(CoreError::Cli(CliError::AccountPasswordRefused {
+            reason: AccountPasswordRefusal::NoPassword,
+            ..
+        })) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(check.calls(), 0);
+    assert_eq!(
+        (plan.payload.way(), plan.payload.fallback()),
+        (Some(LockOnWay::AccountPassword), None)
+    );
+}
+
+/// d4b-d's hand-off (F10, Deviation 13): an account password no slot holds — longer than
+/// 1024 bytes, shaped like a recovery key — is said before the system's check and asked
+/// again, so no check is spent on it; one the vault takes is checked then.
+#[test]
+fn a_password_no_slot_holds_is_said_before_the_check() {
+    let f = files_store();
+    let stand = Stand::ready(HostOs::Linux);
+    let check = Check::answering(Answer::Verified);
+    let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    let long = "a".repeat(1025);
+    let shaped = RecoveryKey::generate(&mut OsRandom)
+        .unwrap()
+        .to_display()
+        .expose()
+        .to_string();
+    for (typed, why) in [
+        (
+            long.as_str(),
+            AccountPasswordUnusable::TooLong { max: 1024 },
+        ),
+        (shaped.as_str(), AccountPasswordUnusable::RecoveryKeyShape),
+    ] {
+        match first_slot(&mut plan, account(typed, &check)).unwrap() {
+            FirstStep::Mistake(CoreError::Cli(CliError::AccountPasswordRefused {
+                reason: AccountPasswordRefusal::Unusable { why: said },
+                ..
+            })) => assert_eq!(said, why),
+            other => panic!("{why:?}: {other:?}"),
+        }
+    }
+    assert_eq!(check.calls(), 0, "no check spent");
+    let step = first_slot(&mut plan, account(ACCOUNT, &check)).unwrap();
+    assert!(matches!(step, FirstStep::Ready { .. }), "{step:?}");
+    assert_eq!(check.calls(), 1);
+}
+
+/// B55, B74, B75 (3) (acceptance 2): a wrong password, a stack that checked nothing, a
+/// back-off in force by the time of the check and a check gone missing end the run —
+/// `account_password_refused` with the system's words, nothing written (no `FirstSlot`
+/// exists to write with: the snapshot guards a later step that would write), no recovery
+/// key drawn (only `Ready` holds one) — and never fall back. One check a run: asked again,
+/// the plan refuses before the system is asked.
+#[test]
+fn a_refused_check_ends_the_run_with_nothing_written() {
+    for reason in [
+        AccountPasswordRefusal::Wrong,
+        AccountPasswordRefusal::NotChecked,
+        AccountPasswordRefusal::Backoff {
+            wait_secs: Some(600),
+        },
+        AccountPasswordRefusal::Unavailable {
+            what: AccountCheckUnavailable::NoBackoffRecord,
+        },
+    ] {
+        let f = files_store();
+        let stand = Stand::ready(HostOs::Linux);
+        let check = Check::answering(Answer::Refused(reason.clone()));
+        let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+        let before = crate::target::testkit::snapshot(f.ctx.config_root());
+        match first_slot(&mut plan, account(ACCOUNT, &check)) {
+            Err(CoreError::Cli(CliError::AccountPasswordRefused {
+                reason: said,
+                messages,
+            })) => {
+                assert_eq!(said, reason);
+                assert_eq!(messages, ["Authentication failure"]);
+            }
+            other => panic!("{reason:?}: {other:?}"),
+        }
+        assert_eq!(
+            plan.payload.way(),
+            Some(LockOnWay::AccountPassword),
+            "{reason:?}"
+        );
+        let again = first_slot(&mut plan, account(ACCOUNT, &check));
+        assert!(
+            matches!(again, Err(CoreError::Cli(CliError::Other(_)))),
+            "{reason:?}: {again:?}"
+        );
+        assert_eq!(check.calls(), 1, "{reason:?}: one check a run");
+        assert_eq!(
+            crate::target::testkit::snapshot(f.ctx.config_root()),
+            before,
+            "{reason:?}"
+        );
+    }
+}
+
+/// F2: the client's check builds the slot (G-OS6), and the core takes it only for the text
+/// typed, bound to this computer's machine id — a slot of other text, of another computer
+/// or of a lock password is refused, nothing written.
+#[test]
+fn a_slot_not_made_for_the_text_typed_here_is_never_taken() {
+    for answer in [
+        Answer::OtherText,
+        Answer::OtherMachine,
+        Answer::LockPasswordSlot,
+    ] {
+        let f = files_store();
+        let stand = Stand::ready(HostOs::Linux);
+        let check = Check::answering(answer.clone());
+        let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+        let before = crate::target::testkit::snapshot(f.ctx.config_root());
+        let step = first_slot(&mut plan, account(ACCOUNT, &check));
+        assert!(
+            matches!(step, Err(CoreError::Cli(CliError::Other(_)))),
+            "{answer:?}: {step:?}"
+        );
+        assert_eq!(
+            crate::target::testkit::snapshot(f.ctx.config_root()),
+            before,
+            "{answer:?}"
+        );
+    }
+}
+
+/// B2 (critic round, finding 3): a short account password the system took comes with O2's
+/// advice, read from the first slot — the client asks "Add it anyway? [y/N]" before the
+/// recovery key is shown and keeps no copy of the password for it; a longer one comes with
+/// none.
+#[test]
+fn a_short_account_password_comes_with_its_advice() {
+    let f = files_store();
+    let stand = Stand::ready(HostOs::Linux);
+    let check = Check::answering(Answer::Verified);
+    for (typed, advice) in [
+        (
+            "hunter2",
+            Some(PasswordAdvice::Short {
+                chars: 7,
+                recommended: 15,
+            }),
+        ),
+        (ACCOUNT, None),
+    ] {
+        let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+        match first_slot(&mut plan, account(typed, &check)).unwrap() {
+            FirstStep::Ready { first, .. } => assert_eq!(first.advice(), advice, "{typed}"),
+            other => panic!("{typed}: {other:?}"),
+        }
+    }
 }
