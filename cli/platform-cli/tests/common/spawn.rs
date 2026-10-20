@@ -41,6 +41,8 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use tempfile::TempDir;
 
@@ -120,6 +122,10 @@ pub struct Spawn {
     /// The child's umask ([`Spawn::with_umask`]); the test's own otherwise.
     #[cfg(unix)]
     umask: Option<u32>,
+    /// Run by the reaper when it first meets a holder that is ending
+    /// ([`Spawn::when_a_holder_is_ending`]).
+    #[cfg(unix)]
+    on_ending: Option<Box<dyn FnOnce() + Send + Sync>>,
     #[cfg(windows)]
     shared_console: bool,
 }
@@ -171,6 +177,8 @@ impl Spawn {
             startup_checks: false,
             #[cfg(unix)]
             umask: None,
+            #[cfg(unix)]
+            on_ending: None,
             #[cfg(windows)]
             shared_console: false,
         }
@@ -249,6 +257,18 @@ impl Spawn {
     #[cfg(unix)]
     pub fn with_umask(mut self, mask: u32) -> Self {
         self.umask = Some(mask);
+        self
+    }
+
+    /// `ending` runs once, when this `Spawn`'s reaper first meets a holder that is ending — off
+    /// its endpoint, its lock still held — before it waits for that holder to let go: the
+    /// harness's own test of that wait (GOTCHA-337) lets a holder it stopped there go on.
+    #[cfg(unix)]
+    pub fn when_a_holder_is_ending(
+        mut self,
+        ending: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        self.on_ending = Some(Box::new(ending));
         self
     }
 
@@ -474,7 +494,8 @@ impl Spawn {
 
 /// No holder outlives its test (D.4a G8): a holder records its pid in its lock file
 /// (`<runtime dir>/apprafter/h-<id>.lock`, or `<store>/run` without `XDG_RUNTIME_DIR`); one whose
-/// lock is still held when the test's `Spawn` drops is killed, and the test fails naming it
+/// lock is still held when the test's `Spawn` drops — and that is not ending, or does not end
+/// within the hang guard ([`Spawn::let_go`]) — is killed, and the test fails naming it
 /// (Windows: the pid file `<store>\run\h-<id>-<pid>.pid`, for a living `apprafter.exe` only — a
 /// pid is reused there as anywhere).
 impl Drop for Spawn {
@@ -542,10 +563,10 @@ impl Spawn {
         leaked
     }
 
-    /// Kill every holder still holding a lock file under this root; their pids.
+    /// Kill every holder still holding a lock file under this root once it had its chance to
+    /// let go ([`Spawn::let_go`]); their pids.
     #[cfg(unix)]
-    fn reap_holders(&self) -> Vec<i32> {
-        use std::os::fd::AsRawFd;
+    fn reap_holders(&mut self) -> Vec<i32> {
         let mut leaked = Vec::new();
         for dir in [self.path("run").join("apprafter"), self.store().join("run")] {
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -558,15 +579,7 @@ impl Spawn {
                 if !(name.starts_with("h-") && name.ends_with(".lock")) {
                     continue;
                 }
-                let Ok(f) = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                else {
-                    continue;
-                };
-                // SAFETY: flock on a file this function opened; released when it closes.
-                if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                if self.let_go(&path) {
                     continue;
                 }
                 let pid = std::fs::read_to_string(&path)
@@ -581,6 +594,31 @@ impl Spawn {
             }
         }
         leaked
+    }
+
+    /// Whether no holder holds `lock` — at once, or once a holder that is ending has let go of
+    /// it (GOTCHA-337). A holder leaves its endpoint before its lock: End removes the socket
+    /// before the reply, every other way out (`Running`'s drop) before the lock closes. Nothing
+    /// orders that close before the test's end — the reply, the command's exit and its
+    /// session's all come first, and the holder is no child of the test's to wait for — so a
+    /// held lock whose socket is gone is a holder that is ending: waited for as an event, the
+    /// lock read again until it is free, bounded only by [`RUN_TIMEOUT`] as a hang guard. One
+    /// at its socket serves: a leak at once. A test that is failing already waits for nothing.
+    #[cfg(unix)]
+    fn let_go(&mut self, lock: &Path) -> bool {
+        let socket = lock.with_extension("sock");
+        let until = Instant::now() + RUN_TIMEOUT;
+        while holder_holds(lock) {
+            let serving = std::fs::symlink_metadata(&socket).is_ok();
+            if serving || std::thread::panicking() || Instant::now() >= until {
+                return false;
+            }
+            if let Some(ending) = self.on_ending.take() {
+                ending();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }
 
@@ -605,6 +643,52 @@ fn assert_scratch(dir: &Path) {
         "with_store({}): a store a test hands the CLI must be a temporary directory",
         dir.display()
     );
+}
+
+/// What [`probe_holder_lock`] found at a holder's lock file.
+#[cfg(unix)]
+pub enum HolderLock {
+    /// No file there, or none this process may open: no holder.
+    Absent,
+    /// A holder's lock refused the probe's.
+    Held,
+    /// No holder: the file, holding the probe's own lock until it drops.
+    Free(std::fs::File),
+}
+
+/// Whether a holder holds the lock file at `lock` — a holder takes it for its whole life, so a
+/// held lock is a living holder (D.4a G8). Every test that asks, and [`Spawn`]'s reaper, ask
+/// here.
+#[cfg(unix)]
+pub fn holder_holds(lock: &Path) -> bool {
+    matches!(probe_holder_lock(lock), HolderLock::Held)
+}
+
+/// [`holder_holds`]'s probe, the product's own (`holder::os::lock_held`): a shared,
+/// non-blocking `flock`. Never an exclusive one: a sibling test thread that forks while a probe
+/// holds its lock keeps that lock in its child until the child's exec (GOTCHA-240), and only a
+/// holder's exclusive lock refuses a shared one — so that copy never reads as a holder to the
+/// next probe, nor to the reaper (GOTCHA-337).
+#[cfg(unix)]
+pub fn probe_holder_lock(lock: &Path) -> HolderLock {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock)
+    else {
+        return HolderLock::Absent;
+    };
+    // SAFETY: flock on the file just opened; a lock taken here ends with it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return HolderLock::Free(file);
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+        HolderLock::Held
+    } else {
+        HolderLock::Absent
+    }
 }
 
 /// A pseudo-terminal of 24x100 as (master, slave), both close-on-exec: `Stdio` dups the slave
