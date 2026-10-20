@@ -1,0 +1,12 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: gone
+  cluster:  (unset)
+  tier:     (unset)
+  provider: (unset)
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (state has no hetzner_cloud section; run `apprafter apply` first)
+  applications and migration plans not checked — no cluster connection
+[stderr]

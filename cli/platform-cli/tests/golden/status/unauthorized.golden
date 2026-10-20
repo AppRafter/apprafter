@@ -1,0 +1,18 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (kubectl get platformstack failed (exit Some(1)): error: You must be logged in to the server (Unauthorized)
+)
+
+Applications: could not read (kubectl get application.apprafter.io -l  failed (exit Some(1)): error: You must be logged in to the server (Unauthorized)
+) — problem state unknown.
+
+Migration plans: could not read (kubectl get migrationplan failed (exit Some(1)): error: You must be logged in to the server (Unauthorized)
+) — approval state unknown.
+[stderr]

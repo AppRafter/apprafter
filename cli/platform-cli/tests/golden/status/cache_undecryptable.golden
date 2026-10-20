@@ -1,0 +1,12 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (the kubeconfig cached for target `prod` cannot be decrypted with the age key at <SANDBOX>/home/.config/apprafter/age.key: age decrypt: No matching keys found)
+  applications and migration plans not checked — no cluster connection
+[stderr]

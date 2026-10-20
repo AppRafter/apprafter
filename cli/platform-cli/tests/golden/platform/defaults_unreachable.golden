@@ -1,0 +1,30 @@
+$ apprafter platform autoscale show
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cluster::kubectl_failed
+
+  × kubectl get platformstack failed (exit Some(1)): The connection to the
+  │ server 127.0.0.1:1 was refused - did you specify the right host or port?
+  │ 
+  help: The cluster's apiserver did not answer. Check that the target is
+        running (`apprafter target ip`), that your kubeconfig points at it
+        (`apprafter kubeconfig`), and that nothing between you and port 6443
+        is blocking — the origin firewall leaves 6443 open by design, so a
+        refusal here is usually a stopped node or a stale kubeconfig.
+
+$ apprafter platform env show
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cluster::kubectl_failed
+
+  × kubectl get platformstack failed (exit Some(1)): The connection to the
+  │ server 127.0.0.1:1 was refused - did you specify the right host or port?
+  │ 
+  help: The cluster's apiserver did not answer. Check that the target is
+        running (`apprafter target ip`), that your kubeconfig points at it
+        (`apprafter kubeconfig`), and that nothing between you and port 6443
+        is blocking — the origin firewall leaves 6443 open by design, so a
+        refusal here is usually a stopped node or a stale kubeconfig.
+

@@ -1,0 +1,30 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: 1.4.2
+  4 condition(s) not healthy:
+  +---------------------+--------+-------------------+------------------------------------------------+
+  | TYPE                | STATUS | REASON            | MESSAGE                                        |
+  +---------------------+--------+-------------------+------------------------------------------------+
+  | Synced              | False  | OutOfSync         | the platform Application is OutOfSync          |
+  +---------------------+--------+-------------------+------------------------------------------------+
+  | NodeDiskPressure    | True   | DiskPressure      | node solo-1 reports DiskPressure               |
+  +---------------------+--------+-------------------+------------------------------------------------+
+  | ReconcileStalled    | True   | ReconcileTimedOut | the last reconcile did not finish within 120s  |
+  |                     |        |                   | and was abandoned                              |
+  +---------------------+--------+-------------------+------------------------------------------------+
+  | CertificateExpiring | True   | Expiring          | a condition this CLI has never heard of        |
+  +---------------------+--------+-------------------+------------------------------------------------+
+
+Backups: not enabled.
+
+Applications: 2 checked, none held, none reporting problems (last 24h).
+
+Migration plans: none awaiting approval.
+[stderr]

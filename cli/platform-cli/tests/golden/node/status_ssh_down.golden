@@ -1,0 +1,16 @@
+$ apprafter node status
+[exit 0]
+[stdout]
+Node swap status for solo-1
+  eligible, not applied — run `apprafter node prep`
+  ⚠ SSH unavailable — the [ssh] fields below could not be read (shown as `unknown`); the [api] fields are still authoritative.
+
+  [api] kubeletVersion : v1.35.5+k3s1
+  [api] failSwapOn     : false
+  [api] swapBehavior   : NoSwap
+  [api] swap.capacity  : 4294967296
+  [ssh] swapon         : unknown
+  [ssh] vm.swappiness  : unknown
+  [ssh] GOMEMLIMIT     : unknown
+  [ssh] provision      : unknown
+[stderr]

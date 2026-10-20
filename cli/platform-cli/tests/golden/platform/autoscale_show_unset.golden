@@ -1,0 +1,12 @@
+$ apprafter platform autoscale show
+[exit 0]
+[stdout]
+Autoscale mode: full (default)
+
+Modes:
+• full      VPA applies both CPU and memory recommendations (up and down)
+• up-only   VPA scales resources up but never below the platform seed
+• off       VPA recommendations recorded but NOT applied to pods
+
+Set with: apprafter platform autoscale set <full|up-only|off>
+[stderr]

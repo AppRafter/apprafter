@@ -1,0 +1,24 @@
+$ apprafter platform autoscale show
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × spawn kubectl: No such file or directory (os error <N>)
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+
+$ apprafter platform env show
+[exit 1]
+[stdout]
+[stderr]
+Error: apprafter::cli::other
+
+  × spawn kubectl: No such file or directory (os error <N>)
+  help: This is the catch-all CLI error. The message above is the only
+        context. If you see this often with the same wording, please file an
+        issue — recurring messages should be promoted to a typed `CliError`
+        variant with its own help text.
+

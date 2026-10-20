@@ -1,0 +1,29 @@
+$ apprafter top
+[exit 0]
+[stdout]
+
+Node solo-1 — Ready · schedulable
+ RESOURCE   CAPACITY   ALLOCATABLE   REQUESTED   SCHEDULABLE   IN-USE   FREE  
+ CPU        2          1.9           400m        1.5           413m     1.5   
+ Memory     3.7Gi      3.2Gi         704Mi       2.5Gi         1.2Gi    2.0Gi 
+ Disk       39Gi       37Gi          0           37Gi          11Gi     26Gi  
+
+Workload breakdown — 4 pods, cluster-wide
+ BUCKET                PODS   CPU REQ   CPU USE   MEM REQ   MEM USE   DISK REQ   DISK USE 
+ platform              1      100m      3m        128Mi     20Mi      0          512Ki    
+ integrated services   1      250m      3m        512Mi     20Mi      0          512Ki    
+ applications          2      100m      3m        128Mi     20Mi      0          512Ki    
+ other                 0      0m        0m        0         0         0          0        
+ TOTAL                 4      450m      9m        768Mi     60Mi      0          1.5Mi    
+
+SCHEDULABLE is allocatable − requested: what a new pod could still ask for.
+FREE is allocatable − in-use: what is unused right now. A node can be fully requested
+and barely used, or barely requested and full; these two columns are what tells them apart.
+
+Disk is `ephemeral-storage` — the node's root filesystem. The node's IN-USE is the whole
+filesystem (OS, container images, logs and volume data included), so it is larger than the
+DISK USE column, which counts only each pod's writable layer, logs and emptyDir volumes.
+
+1 pod(s) are not scheduled to a node. Their requests are in the breakdown and in no
+node's REQUESTED, so the two tables will not add up until they are placed.
+[stderr]

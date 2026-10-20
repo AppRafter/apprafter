@@ -1,0 +1,12 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     (unset)
+  provider: hetzner-cloud
+  secrets:  locked (recovery key) · not run from a terminal
+
+Platform: could not read the cluster (the target store at <SANDBOX>/apprafter-config is locked, and there is no unlock window here)
+  applications and migration plans not checked — no cluster connection
+[stderr]

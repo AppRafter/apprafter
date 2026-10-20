@@ -1,0 +1,12 @@
+$ apprafter status
+[exit 0]
+[stdout]
+Target: prod
+  cluster:  apprafter-prod
+  tier:     solo
+  provider: hetzner-cloud
+  secrets:  in files (readable by any program running as you)
+
+Platform: could not read the cluster (other accounts can write to <SANDBOX>/apprafter-config/targets, so they could replace the target store's files there: AppRafter neither uses nor writes this store's secrets until that is fixed)
+  applications and migration plans not checked — no cluster connection
+[stderr]
