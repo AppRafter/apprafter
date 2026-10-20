@@ -25,7 +25,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use apprafter_core::lock::{self, OpenedVault, SlotFacts, UnknownFacts};
+use apprafter_core::lock::{self, OpenedVault, SlotFacts};
 use apprafter_core::secrets::{KeySession, StoreId, VaultAccess, VaultRequest, VaultSession};
 use apprafter_core::vault::{KdfPolicy, SlotInput};
 use apprafter_core::{CoreError, SecretString, Zeroizing};
@@ -55,11 +55,12 @@ pub(crate) fn process() -> Arc<CliVaultAccess> {
         .clone()
 }
 
-/// What this computer tells the lock (D.4b B30): every fact unknown until d4b-e1a answers
-/// them over `apprafter-os-slots` — so typed text tries the lock-password slot only, as
-/// before (B81).
+/// What this computer tells the lock (D.4b B30): the os-slots glue's facts
+/// (`crate::os_slots`) — this computer's machine id among them, so typed text also tries its
+/// account-password slot (B27) — every one unknown where APPRAFTER_SANDBOX's fence refuses the
+/// account (B82).
 pub(crate) fn slot_facts() -> Arc<dyn SlotFacts> {
-    Arc::new(UnknownFacts)
+    crate::os_slots::process()
 }
 
 /// The command this process runs, as its prompt names it (`run()` records its clap path).

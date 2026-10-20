@@ -39,6 +39,13 @@ doc               = false
 
 [features]
 tool-stand-in = []
+# D.4b B15, B16 (dev-only): the account-password check and this computer's facts come from the
+# scripted stand-in (`apprafter_os_slots::stand_in`) when APPRAFTER_TEST_OS_SLOTS names its
+# script; unset, the real backends behind the APPRAFTER_SANDBOX fence (src/os_slots.rs). Never in
+# a shipped binary: release-cli.yml builds without it and checks so (G-OS3), and
+# apprafter-core/tests/guards.rs refuses an edge that turns it on outside [dev-dependencies]
+# (G-OS2). `cargo test --all-features` turns it on for tests/lock_on_ways_test.rs.
+test-os-slots = ["apprafter-os-slots/test-support"]
 
 [dependencies]
 age           = { workspace = true }
@@ -80,6 +87,10 @@ signal-hook   = "0.3"
 libc          = "0.2"
 # The holder's endpoint id (D.4a T50): already in cli/Cargo.lock (apprafter-core's); an edge.
 sha2          = { workspace = true }
+# The OS side of the lock's everyday slots (D.4b B9): the account-password check by PAM loaded
+# at run time, this computer's machine id, the back-off, the fence. A path crate of this
+# workspace: no new package in cli/Cargo.lock.
+apprafter-os-slots = { path = "../os-slots" }
 
 [target.'cfg(windows)'.dependencies]
 # SetConsoleCtrlHandler: the Windows form of the SIGINT/SIGTERM stop in
@@ -106,6 +117,9 @@ cli-core   = { path = "../cli-core", features = ["test-support"] }
 # `seam::testing` (cli-state's test-support): the forced interleavings of `apply`, `destroy`,
 # `import` and `init` with a cache write and `lock on` (WI-487). Never in a shipped binary.
 cli-state  = { path = "../cli-state", features = ["test-support"] }
+# The scripted stand-in for the glue's unit tests (src/os_slots.rs, commands/lock.rs; B15). A
+# dev-dependency's feature never reaches a shipped binary (G-OS2).
+apprafter-os-slots = { path = "../os-slots", features = ["test-support"] }
 mockito    = { workspace = true }
 predicates = { workspace = true }
 # tests/spawn_guard.rs reads every source of cli/ as tokens: the version already in the lock (as

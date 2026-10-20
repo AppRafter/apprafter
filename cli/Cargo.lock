@@ -242,6 +242,7 @@ version = "0.2.80"
 dependencies = [
  "age",
  "apprafter-core",
+ "apprafter-os-slots",
  "arboard",
  "assert_cmd",
  "backup-core",

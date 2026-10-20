@@ -3016,11 +3016,21 @@ const INSECURE_KDF: FeatureRule = FeatureRule {
 };
 
 /// G-OS2 (D.4b B43): the os-slots stand-ins (`ScriptedAccountPassword`) reach no shipped build.
-/// `platform-cli`'s `test-os-slots` (d4b-e1a) and the desktop's test build (d4b-g1b) join
-/// `forwarders` when they forward it; e1a adds the rule for `test-os-slots` itself.
+/// `platform-cli`'s dev-only `test-os-slots` forwards it (d4b-e1a), under a rule of its own
+/// ([`TEST_OS_SLOTS`]); the desktop's test build (d4b-g1b) joins `forwarders` when it does.
 const OS_SLOTS_TEST_SUPPORT: FeatureRule = FeatureRule {
     package: "apprafter-os-slots",
     feature: "test-support",
+    forwarders: &[("cli/platform-cli/Cargo.toml", "test-os-slots")],
+};
+
+/// G-OS2 (D.4b B16, d4b-e1a): `platform-cli`'s `test-os-slots`, which lets
+/// `APPRAFTER_TEST_OS_SLOTS` replace the account-password check by the stand-in, reaches no
+/// shipped build either: only a `[dev-dependencies]` edge or a command line turns it on.
+/// release-cli.yml's dry run checks the shipped binary itself (G-OS3).
+const TEST_OS_SLOTS: FeatureRule = FeatureRule {
+    package: "apprafter",
+    feature: "test-os-slots",
     forwarders: &[],
 };
 
@@ -3541,6 +3551,31 @@ fn the_os_slots_stand_ins_reach_no_shipped_build() {
     }
 }
 
+#[test]
+fn the_cli_s_os_slots_stand_in_feature_reaches_no_shipped_build() {
+    let manifests = every_manifest();
+    let hits: Vec<String> = manifests
+        .iter()
+        .flat_map(|(rel, text)| feature_edges(&TEST_OS_SLOTS, rel, text))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "platform-cli's test-os-slots must never reach a shipped build (D.4b B16, G-OS2):\n{}",
+        hits.join("\n")
+    );
+    let (_, own) = manifests
+        .iter()
+        .find(|(rel, _)| rel == "cli/platform-cli/Cargo.toml")
+        .expect("cli/platform-cli/Cargo.toml is there");
+    let doc: toml::Value = own.parse().unwrap();
+    assert!(
+        doc.get("features")
+            .and_then(|f| f.get(TEST_OS_SLOTS.feature))
+            .is_some(),
+        "platform-cli declares no `test-os-slots`: this guard would see nothing"
+    );
+}
+
 mod os_slots_test_support {
     use super::*;
 
@@ -3700,7 +3735,11 @@ const REAL_BACKEND_SELF_TESTS: &[(&str, &str)] = &[
 /// d4b-g1b's glue add theirs — and a test that calls a listed one (by its last path segment) is
 /// held to G-OS1 as if it called `admit`, so a wrapper cannot hide the real backend (critic
 /// round). A caller of a wrapper is not followed (Risk 6).
-const ADMIT_WRAPPERS: &[(&str, &str)] = &[];
+const ADMIT_WRAPPERS: &[(&str, &str)] = &[
+    // d4b-e1a: the CLI's glue — the process's backend through the fence; this crate's tests pass
+    // the `OsSlots` they mean and never call it.
+    ("cli/platform-cli/src/os_slots.rs", "admit_real"),
+];
 
 /// G-OS5: one thing that builds a real backend in production code, and the one `(file,
 /// function)` that may: a one-segment `path` is a name any path through which counts (the

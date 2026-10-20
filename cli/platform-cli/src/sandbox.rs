@@ -38,6 +38,14 @@ use apprafter_core::{Context, EnvSource};
 /// The variable (module docs).
 pub(crate) const SANDBOX_ENV: &str = "APPRAFTER_SANDBOX";
 
+/// D.4b B16, B82: `APPRAFTER_SANDBOX`'s roots as `apprafter-os-slots`' fence takes them, as
+/// listed — the fence canonicalises each and refuses one that is no absolute directory — or
+/// `None` when the variable is unset (the person's own use, and the owner's walk).
+pub(crate) fn fence_roots(env: &dyn EnvSource) -> Option<Vec<PathBuf>> {
+    let value = env.var_os(SANDBOX_ENV)?;
+    Some(std::env::split_paths(&value).collect())
+}
+
 /// What the fence checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Location {
@@ -345,6 +353,21 @@ mod tests {
             e.code().map(|c| c.to_string()).as_deref(),
             Some("apprafter::sandbox::escape")
         );
+    }
+
+    /// D.4b B82: the os-slots fence gets the roots as listed — it canonicalises each and
+    /// refuses one that is no absolute directory — and none when the variable is unset.
+    #[test]
+    fn the_os_slots_fence_gets_the_sandbox_roots_as_listed() {
+        assert_eq!(fence_roots(&apprafter_core::MapEnv::new()), None);
+        let list = std::env::join_paths(["/a", "/b"]).unwrap();
+        let env = apprafter_core::MapEnv::new().with(SANDBOX_ENV, list.to_str().unwrap());
+        assert_eq!(
+            fence_roots(&env),
+            Some(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+        let empty = apprafter_core::MapEnv::new().with(SANDBOX_ENV, "");
+        assert_eq!(fence_roots(&empty), Some(vec![PathBuf::new()]));
     }
 
     /// T5: the age key is fenced unless the store's lock state says the shared key is never
