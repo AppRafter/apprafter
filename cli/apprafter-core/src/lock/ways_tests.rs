@@ -12,6 +12,8 @@ use cli_core::{AccountPasswordRefusal, CliError};
 use super::on_tests::{files_store, new_input};
 use super::*;
 use crate::vault::MachineId;
+use crate::vault::{SlotId, SlotKind, VaultFile, VaultHeader, VAULT_FILE};
+use crate::Context;
 use crate::{CancellationToken, CoreError, CoreResult, NullReporter, Outcome, Plan};
 
 /// This computer's facts as a test sets them (B15): each call recorded by name, in order, so
@@ -391,4 +393,53 @@ fn a_plan_for_another_way_is_never_written_with_a_lock_password() {
         crate::target::testkit::snapshot(f.ctx.config_root()),
         before
     );
+}
+
+/// The header of `ctx`'s vault, read without a secret.
+fn header_of(ctx: &Context) -> VaultHeader {
+    let bytes = crate::vault::file::read(&ctx.config_root().join(VAULT_FILE)).unwrap();
+    VaultFile::parse(&bytes).unwrap().header().clone()
+}
+
+/// B57, B80 (acceptance 4): a new run's plan mints the vault's id and its slots' — a plan of
+/// its own, ids of its own — and the run writes exactly them, the recovery key's slot second,
+/// whatever the way: asked for, or fallen back to. A store locked already mints none.
+#[test]
+fn every_new_run_writes_the_ids_its_plan_minted() {
+    let fenced = Stand {
+        fenced: true,
+        ..Stand::ready(HostOs::Linux)
+    };
+    for asked in [WayAsked::LockPassword, WayAsked::Everyday(&fenced)] {
+        let f = files_store();
+        let plan = plan_on(&f.ctx, None, asked).unwrap();
+        let other = plan_on(&f.ctx, None, asked).unwrap();
+        let vault_id = plan.payload.vault_id().unwrap();
+        let recovery_id = plan.payload.recovery_slot_id().unwrap();
+        assert_ne!(other.payload.vault_id(), Some(vault_id));
+        assert_ne!(other.payload.recovery_slot_id(), Some(recovery_id));
+        let (input, _) = new_input();
+        done(execute_on(
+            &f.ctx,
+            plan,
+            input,
+            &NullReporter,
+            &CancellationToken::new(),
+        ));
+        let header = header_of(&f.ctx);
+        assert_eq!(header.vault_id, vault_id);
+        let slots: Vec<(SlotKind, SlotId)> = header
+            .slots
+            .iter()
+            .map(|slot| (slot.kind, slot.id))
+            .collect();
+        assert_eq!(slots.len(), 2, "{slots:?}");
+        assert_eq!(slots[0].0, SlotKind::Password);
+        assert_eq!(slots[1], (SlotKind::RecoveryKey, recovery_id));
+        let locked = plan_on(&f.ctx, None, asked).unwrap();
+        assert_eq!(
+            (locked.payload.vault_id(), locked.payload.recovery_slot_id()),
+            (None, None)
+        );
+    }
 }

@@ -59,6 +59,7 @@ use crate::vault::{
     self, ConfirmedRecoveryKey, NewSlot, OsRandom, RecoveryKey, SlotSecret, UnlockedVault,
     VaultError, VaultFile, VaultPayload, DEFAULT_UNLOCK_TIMEOUT_MIN,
 };
+use crate::vault::{SlotId, VaultId, VaultIds};
 use crate::CancellationToken;
 
 /// The labels of the two slots `lock on` makes (`store.yaml` mirrors them).
@@ -114,7 +115,13 @@ pub struct LockOnPayload {
 struct NewRun {
     /// The way its first slot takes, from the client's facts in B88's order.
     way: Way,
+    /// The new vault's id and its slots' — the first slot's, then the recovery key's —
+    /// minted when the run is planned (B57, B80).
+    ids: VaultIds,
 }
+
+/// Where the recovery key's slot is among a new vault's: after the first slot (B57).
+const RECOVERY_SLOT: usize = 1;
 
 impl LockOnPayload {
     pub fn start(&self) -> &LockOnStart {
@@ -161,6 +168,30 @@ impl LockOnPayload {
             Some(run) => &run.way.notes,
             None => &[],
         }
+    }
+
+    /// The new vault's id, minted when the run was planned (D.4b B57): `None` for a resume or
+    /// a store locked already.
+    pub fn vault_id(&self) -> Option<VaultId> {
+        self.new_run.as_ref().map(|run| run.ids.vault_id)
+    }
+
+    /// The recovery key's slot id, minted when the run was planned (D.4b B80): shown with the
+    /// key, so a key shown before a crash is never taken for one that opens the store — its
+    /// id is then in no slot list. `None` for a resume or a store locked already.
+    pub fn recovery_slot_id(&self) -> Option<SlotId> {
+        self.new_run
+            .as_ref()
+            .map(|run| run.ids.slots[RECOVERY_SLOT])
+    }
+
+    /// A new run's ids, read before anything is written.
+    fn ids(&self) -> CoreResult<&VaultIds> {
+        self.new_run.as_ref().map(|run| &run.ids).ok_or_else(|| {
+            CoreError::Cli(CliError::Other(
+                "a `lock on` plan for a new run holds no ids; nothing was written".to_string(),
+            ))
+        })
     }
 }
 
@@ -445,6 +476,9 @@ pub fn plan_on(
             // D.4b B55, B74, B88: the way in first, from the client's facts; a back-off in
             // force refuses here, before a cache is read or anything is asked.
             let way = ways::decide(asked)?;
+            // D.4b B57, B80: the vault's id and both slots' — the first, then the recovery
+            // key's — minted now, so the recovery key is shown with its slot's id.
+            let ids = VaultIds::draw(2, &mut OsRandom).map_err(|e| vault_err(root, e))?;
             let keys = keys_for_caches(ctx, &store, &targets)?;
             let (changes, drops) = survey(&store, root, &targets, &keys, way.way)?;
             Ok(plan(
@@ -454,7 +488,7 @@ pub fn plan_on(
                 timeout,
                 keys,
                 drops,
-                Some(NewRun { way }),
+                Some(NewRun { way, ids }),
             ))
         }
     }
@@ -647,6 +681,9 @@ fn on_new(
     }
     check_password(&password)?;
     super::permit(ctx)?;
+    // D.4b B57, B80: the ids the plan minted, the recovery key's shown with it — read
+    // before anything is written.
+    let ids = payload.ids()?;
     let policy = super::kdf_policy(ctx);
     let store = ctx.store();
     let root = ctx.config_root();
@@ -727,7 +764,8 @@ fn on_new(
     let again = RecoveryKey::parse(shown.expose())
         .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?;
     let writer = ctx.vault_access().writer();
-    let (bytes, made) = vault::create(
+    let (bytes, made) = vault::create_with(
+        ids,
         id.as_str(),
         &writer,
         contents,
