@@ -249,6 +249,33 @@ fn without_libpam_there_is_no_check() {
     assert_eq!(backend.backoff(now()), Ok(BackoffState::Clear));
 }
 
+/// WI-545: under no_new_privs (`--no-new-privs`: `setpriv --no-new-privs`, as bubblewrap,
+/// Flatpak and `NoNewPrivileges=` set it) `unix_chkpwd` cannot gain its privileges and the stack
+/// would refuse even the right password — and count it. No check runs: the check is refused
+/// before the back-off's record is read or written — asserted first, with the record, so a build
+/// without the fix shows the real stack's answer, `(Wrong, true)` — the backend says so before
+/// libpam is loaded, and faillock's tally, which a login made so that a failure would be
+/// recorded, stays empty (the script checks it after a passing test). `passwd -S` prints
+/// `walker P` here too: unknown.
+#[test]
+#[ignore = "needs the PAM container: bash scripts/test-os-slots-linux.sh"]
+fn under_no_new_privs_no_check_runs_and_nothing_is_counted() {
+    let password = walker();
+    let backend = backend();
+    let uid = current_account().unwrap().uid;
+    let record =
+        PathBuf::from(format!("/run/user/{uid}")).join(apprafter_os_slots::backoff::RECORD_FILE);
+    let check = backend.check(&password, now());
+    assert_eq!(
+        (check.outcome.clone(), record.exists()),
+        (CheckOutcome::Unavailable(Unavailable::NoNewPrivs), false),
+        "(outcome, {} touched): {check:?}",
+        record.display()
+    );
+    assert_eq!(backend.backend(), Err(Unavailable::NoNewPrivs));
+    assert_eq!(backend.password_status().state, PasswordState::Unknown);
+}
+
 #[test]
 #[ignore = "needs the PAM container: bash scripts/test-os-slots-linux.sh"]
 fn without_a_pam_service_there_is_no_check() {

@@ -25,6 +25,7 @@ pub mod machine;
 mod macos;
 pub mod outcome;
 mod pam;
+mod privileges;
 #[cfg(feature = "test-support")]
 pub mod stand_in;
 
@@ -56,7 +57,9 @@ pub trait AccountPassword: Send + Sync {
     fn os(&self) -> Os;
     /// The account a check is for (`getpwuid_r(getuid())`, never a name from input), for labels.
     fn account_name(&self) -> Option<String>;
-    /// Whether a check could run here: the account, libpam and its service. Asks PAM nothing.
+    /// Whether a check could run here: the account; on Linux, a process whose set-uid password
+    /// helper can gain its privileges (no no_new_privs, WI-545); libpam and its service. Asks PAM
+    /// nothing.
     fn backend(&self) -> Result<(), Unavailable>;
     /// The back-off as it stands; `Unavailable::NoBackoffRecord` when its record has no place.
     /// Takes no lock and writes nothing (a plan's read, B74). The real backend reads the system

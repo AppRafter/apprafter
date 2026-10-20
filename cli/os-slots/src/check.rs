@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! One account-password check, end to end (D.4b B10–B13, B74): the entry refused before PAM
-//! when it is empty or holds a NUL; the account, libpam and its service; the back-off record's
-//! place; the attempt counted before PAM is asked; PAM; the attempt taken back when PAM
+//! when it is empty or holds a NUL; the account; on Linux, no check under no_new_privs
+//! (WI-545); libpam and its service; the back-off record's place; the attempt counted before
+//! PAM is asked; PAM; the attempt taken back when PAM
 //! reported success. A [`Checker`] is what `fence::SystemAccountPassword` wraps; tests build
 //! one over a scripted libpam and a scratch record directory, so they never name the real
 //! backend (G-OS1).
@@ -18,6 +19,7 @@ use crate::outcome::{
     BackoffState, CheckOutcome, InputRefused, Os, PasswordCheck, PasswordStatus, Unavailable,
 };
 use crate::pam::{self, Pam};
+use crate::privileges;
 
 /// Where the back-off record lives: the system's place, or a directory a test gives.
 /// `Dir` exists only in the Unix tests, its one user, so no build has a dead variant (critic
@@ -28,12 +30,34 @@ pub(crate) enum RecordAt {
     Dir(PathBuf),
 }
 
+/// Where a checker reads whether this process runs with no_new_privs (WI-545): the system's
+/// reading, or a `/proc/<pid>/status` text a test gives — read as the system's is, with `prctl`
+/// answering "not set" — so no test depends on the flag of the process that runs it (an
+/// agent's sandbox may set it; CI's runners do not). `Status` exists only in the Unix tests,
+/// as `RecordAt::Dir` does.
+pub(crate) enum PrivsAt {
+    System,
+    #[cfg(all(test, unix))]
+    Status(&'static str),
+}
+
+impl PrivsAt {
+    fn no_new_privs(&self) -> bool {
+        match self {
+            PrivsAt::System => privileges::system_no_new_privs(),
+            #[cfg(all(test, unix))]
+            PrivsAt::Status(text) => privileges::no_new_privs_from(Some(*text), || false),
+        }
+    }
+}
+
 /// The check behind every real account-password backend (module docs).
 pub(crate) struct Checker {
     pub(crate) os: Os,
     pub(crate) account: Option<Account>,
     pub(crate) pam: Pam,
     pub(crate) record_at: RecordAt,
+    pub(crate) privs: PrivsAt,
 }
 
 impl Checker {
@@ -54,12 +78,19 @@ impl Checker {
         }
     }
 
-    /// The service a check would use: this OS has the slot, the account exists, libpam loads.
+    /// The service a check would use: this OS has the slot, the account exists, on Linux the
+    /// process is not under no_new_privs (WI-545), libpam loads.
     fn service(&self) -> Result<&'static str, Unavailable> {
         if self.os == Os::Windows {
             return Err(Unavailable::NotOnThisOs);
         }
         self.account()?;
+        // WI-545: under no_new_privs `unix_chkpwd` cannot read the password database and the
+        // stack would refuse even the right password and count it: no check — said before
+        // libpam is loaded, and (`checked`) before the back-off's record is read or written.
+        if self.os == Os::Linux && self.privs.no_new_privs() {
+            return Err(Unavailable::NoNewPrivs);
+        }
         self.pam.backend()
     }
 
@@ -133,6 +164,11 @@ mod tests {
 
     const RIGHT: &str = "correct horse battery staple";
 
+    /// `/proc/self/status` texts (WI-545), cut to the lines around the flag as a kernel prints
+    /// them: no_new_privs unset, and set (as bubblewrap leaves a process).
+    const PRIVS_CLEAR: &str = "Name:\tapprafter\nNoNewPrivs:\t0\nSeccomp:\t0\n";
+    const PRIVS_SET: &str = "Name:\tapprafter\nNoNewPrivs:\t1\nSeccomp:\t2\n";
+
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
     }
@@ -172,6 +208,7 @@ mod tests {
             }),
             pam: Pam::with(services.path(), Os::Linux, Box::new(Arc::clone(&library))),
             record_at: RecordAt::Dir(record.path().to_path_buf()),
+            privs: PrivsAt::Status(PRIVS_CLEAR),
         };
         Fixture {
             _services: services,
@@ -335,6 +372,71 @@ mod tests {
             CheckOutcome::Unavailable(Unavailable::NotOnThisOs)
         );
         assert!(f.library.calls().is_empty());
+    }
+
+    /// WI-545: under no_new_privs no check runs — `backend` says so, and `check` says so for the
+    /// right password and a wrong one alike, before PAM is asked and before the back-off's
+    /// record is read or written, so nothing is counted.
+    #[test]
+    fn under_no_new_privs_no_check_runs_and_nothing_is_counted() {
+        let mut f = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        f.checker.privs = PrivsAt::Status(PRIVS_SET);
+        assert_eq!(f.checker.backend(), Err(Unavailable::NoNewPrivs));
+        for typed in [RIGHT, "not it"] {
+            assert_eq!(
+                f.checker.check(&secret(typed), now()).outcome,
+                CheckOutcome::Unavailable(Unavailable::NoNewPrivs),
+                "{typed}"
+            );
+        }
+        assert!(f.library.calls().is_empty(), "PAM was asked");
+        let record = f.record.path().join(crate::backoff::RECORD_FILE);
+        assert!(!record.exists(), "the back-off's record was written");
+        assert_eq!(f.checker.backoff(now()), Ok(BackoffState::Clear));
+    }
+
+    /// WI-545, B88 (3): no account is said before no_new_privs, and no_new_privs before libpam
+    /// is loaded or a service looked for — under it no check could succeed whatever libpam and
+    /// the services are, so naming them would send the person after what would not help.
+    #[test]
+    fn no_new_privs_comes_after_the_account_and_before_libpam() {
+        let mut no_account = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        no_account.checker.privs = PrivsAt::Status(PRIVS_SET);
+        no_account.checker.account = None;
+        assert_eq!(no_account.checker.backend(), Err(Unavailable::NoAccount));
+        let mut library = ScriptedLibrary::new(vec![Step::Hidden], RIGHT);
+        library.loads = false;
+        let mut no_libpam = fixture(library);
+        no_libpam.checker.privs = PrivsAt::Status(PRIVS_SET);
+        assert_eq!(no_libpam.checker.backend(), Err(Unavailable::NoNewPrivs));
+        let mut no_service = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        std::fs::remove_file(no_service._services.path().join("etc/pam.d/common-auth")).unwrap();
+        no_service.checker.privs = PrivsAt::Status(PRIVS_SET);
+        assert_eq!(no_service.checker.backend(), Err(Unavailable::NoNewPrivs));
+    }
+
+    /// WI-545: the flag is Linux's. macOS's check goes through no set-uid helper and Windows has
+    /// no slot, so there it changes nothing; and a status text with the flag unset changes
+    /// nothing on Linux.
+    #[test]
+    fn no_new_privs_changes_nothing_off_linux_or_when_unset() {
+        let mut mac = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        let chkpasswd = mac._services.path().join("etc/pam.d/chkpasswd");
+        std::fs::write(chkpasswd, "auth required pam_opendirectory.so\n").unwrap();
+        mac.checker.os = Os::Macos;
+        mac.checker.pam = Pam::with(
+            mac._services.path(),
+            Os::Macos,
+            Box::new(Arc::clone(&mac.library)),
+        );
+        mac.checker.privs = PrivsAt::Status(PRIVS_SET);
+        assert_eq!(mac.checker.backend(), Ok(()));
+        let mut windows = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        windows.checker.os = Os::Windows;
+        windows.checker.privs = PrivsAt::Status(PRIVS_SET);
+        assert_eq!(windows.checker.backend(), Err(Unavailable::NotOnThisOs));
+        let linux = fixture(ScriptedLibrary::new(vec![Step::Hidden], RIGHT));
+        assert_eq!(linux.checker.backend(), Ok(()), "PRIVS_CLEAR");
     }
 
     #[test]

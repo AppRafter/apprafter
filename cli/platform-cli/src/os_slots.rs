@@ -258,6 +258,7 @@ fn check_backend(answer: Result<(), Unavailable>) -> CheckBackend {
         Err(Unavailable::NoLibpam { .. }) => CheckBackend::NoLibpam,
         Err(Unavailable::NoService) => CheckBackend::NoService,
         Err(Unavailable::NoAccount) => CheckBackend::NoAccount,
+        Err(Unavailable::NoNewPrivs) => CheckBackend::NoNewPrivs,
         Err(
             Unavailable::NoCheckRoute
             | Unavailable::NotOnThisOs
@@ -316,6 +317,7 @@ fn refusal(outcome: CheckOutcome, now: SystemTime) -> Option<AccountPasswordRefu
             Unavailable::NoLibpam { .. } => AccountCheckUnavailable::NoLibpam,
             Unavailable::NoService => AccountCheckUnavailable::NoService,
             Unavailable::NoAccount => AccountCheckUnavailable::NoAccount,
+            Unavailable::NoNewPrivs => AccountCheckUnavailable::NoNewPrivs,
             Unavailable::NoBackoffRecord { .. } => AccountCheckUnavailable::NoBackoffRecord,
             // The plan stops at (2) on Windows; read as no check route, it fails closed.
             Unavailable::NoCheckRoute | Unavailable::NotOnThisOs => {
@@ -380,6 +382,7 @@ mod tests {
                 CheckBackend::NoCheckRoute,
             ),
             ("account none\n", CheckBackend::NoAccount),
+            ("backend no-new-privs\n", CheckBackend::NoNewPrivs),
         ] {
             assert_eq!(facts(script).account_check(), backend, "{script}");
         }
@@ -543,6 +546,11 @@ mod tests {
                 "backend no-libpam\ncheck wrong\n",
                 "x",
                 unavailable(AccountCheckUnavailable::NoLibpam),
+            ),
+            (
+                "backend no-new-privs\ncheck wrong\n",
+                "x",
+                unavailable(AccountCheckUnavailable::NoNewPrivs),
             ),
             ("check wrong\n", "", AccountPasswordRefusal::NoPassword),
             (

@@ -18,7 +18,7 @@
 //! host <name>|none
 //! environment plain|container|wsl|container+wsl
 //! status usable|locked|empty|unknown [day YYYY-MM-DD|at <unix seconds>]
-//! backend ready|no-libpam|no-service|no-check-route|no-account|not-on-this-os
+//! backend ready|no-libpam|no-service|no-check-route|no-account|no-new-privs|not-on-this-os
 //! backoff clear|no-record|wait <seconds> recent-failure|two-in-an-hour|another-check-running
 //! check verified-if <password>|wrong|not-checked no-password-asked|other-prompt|user-changed|system-error <code>
 //! ```
@@ -259,6 +259,7 @@ fn unavailable_of(word: &str) -> Option<Unavailable> {
         "no-service" => Some(Unavailable::NoService),
         "no-check-route" => Some(Unavailable::NoCheckRoute),
         "no-account" => Some(Unavailable::NoAccount),
+        "no-new-privs" => Some(Unavailable::NoNewPrivs),
         "not-on-this-os" => Some(Unavailable::NotOnThisOs),
         _ => None,
     }
@@ -628,6 +629,21 @@ mod tests {
         assert_eq!(defaults.account_name().as_deref(), Some("walker"));
         let other = CheckOutcome::NotChecked(NotCheckedWhy::OtherPrompt);
         assert_eq!(defaults.check(&secret("x"), now()).outcome, other);
+    }
+
+    /// WI-545: `backend no-new-privs` answers as the real backend under no_new_privs — before
+    /// the back-off, so a check in a back-off still reads no_new_privs and uses no answer.
+    #[test]
+    fn no_new_privs_answers_before_the_back_off() {
+        let s = scripted(
+            "backend no-new-privs\nbackoff wait 600 recent-failure\ncheck verified-if x\n",
+        );
+        assert_eq!(s.backend(), Err(Unavailable::NoNewPrivs));
+        assert_eq!(
+            s.check(&secret("x"), now()).outcome,
+            CheckOutcome::Unavailable(Unavailable::NoNewPrivs)
+        );
+        assert_eq!(s.calls(), [Call::Backend, Call::Check { chars: 1 }]);
     }
 
     #[test]

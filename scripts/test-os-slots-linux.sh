@@ -37,6 +37,8 @@
 #   --no-marker | --root-marker    no marker, or one root owns
 #   --machine-id absent|empty|<32 hex>
 #   --passwd-no-setuid   drop passwd's set-uid bit: shadow's passwd then cannot read /etc/shadow
+#   --no-new-privs       run the test under no_new_privs (setpriv --no-new-privs), as bubblewrap,
+#                        Flatpak and NoNewPrivileges= do: set-uid helpers lose their privileges
 #
 # A case passes only when its one test reported `ok`, the harness ran exactly one test, and the
 # driver's own checks held; the cases here must be exactly the tests in the binary, so a renamed
@@ -61,6 +63,7 @@ CASES=(
     "a_locked_password_reads_locked_and_is_wrong --locked-password"
     "a_passwd_without_its_set_uid_bit_says_nothing_clear --passwd-no-setuid --empty-password"
     "without_libpam_there_is_no_check --no-libpam"
+    "under_no_new_privs_no_check_runs_and_nothing_is_counted --no-new-privs --stack faillock --tally --expect-tally 0"
     "without_a_pam_service_there_is_no_check --no-pam-service"
     "without_a_runtime_directory_there_is_no_back_off_record --no-run-user --stack permit"
     "an_unmarked_account_is_fenced --no-marker"
@@ -171,7 +174,7 @@ cat >"$work/os-slots-case" <<'DRIVER_EOF'
 #   os-slots-case [flags] <test name>
 set -euo pipefail
 stack=distro tally=no expect_tally="" password=set libpam=yes service=yes run_user=yes
-marker=walker machine_id=keep passwd_setuid=keep
+marker=walker machine_id=keep passwd_setuid=keep nnp=no
 while [[ $# -gt 1 ]]; do
     case "$1" in
     --stack) stack="$2"; shift ;;
@@ -186,6 +189,7 @@ while [[ $# -gt 1 ]]; do
     --root-marker) marker=root ;;
     --machine-id) machine_id="$2"; shift ;;
     --passwd-no-setuid) passwd_setuid=drop ;;
+    --no-new-privs) nnp=yes ;;
     *) echo "os-slots-case: unknown flag $1" >&2; exit 2 ;;
     esac
     shift
@@ -262,7 +266,11 @@ esac
 
 loaders=(/lib64/ld-linux-*.so.2)
 status=0
-setpriv --reuid=walker --regid=walker --init-groups --reset-env \
+nnp_flag=()
+if [[ $nnp == yes ]]; then
+    nnp_flag=(--no-new-privs)
+fi
+setpriv --reuid=walker --regid=walker --init-groups --reset-env "${nnp_flag[@]}" \
     env APPRAFTER_OS_SLOTS_CONTAINER=1 APPRAFTER_OS_SLOTS_PASSWORD="$OS_SLOTS_PASSWORD" \
     "${loaders[0]}" --library-path "$LIBDIR" \
     /opt/os-slots/pam_container --ignored --exact --nocapture "$name" || status=$?

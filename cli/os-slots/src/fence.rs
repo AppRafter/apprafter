@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use zeroize::Zeroizing;
 
 use crate::account::{self, Account};
-use crate::check::{Checker, RecordAt};
+use crate::check::{Checker, PrivsAt, RecordAt};
 use crate::outcome::{BackoffState, Os, PasswordCheck, PasswordStatus, Unavailable};
 use crate::pam::Pam;
 use crate::AccountPassword;
@@ -106,6 +106,7 @@ pub fn admit(sandbox_roots: Option<&[PathBuf]>) -> Result<SystemAccountPassword,
             account,
             pam: Pam::system(os),
             record_at: RecordAt::System,
+            privs: PrivsAt::System,
         },
     })
 }
@@ -398,6 +399,7 @@ mod tests {
                 account: Some(account(Path::new("/home/walker"))),
                 pam: Pam::with(services.path(), Os::Linux, Box::new(Arc::clone(&library))),
                 record_at: RecordAt::Dir(record.path().to_path_buf()),
+                privs: PrivsAt::Status("NoNewPrivs:\t0\n"),
             },
         };
         let wrong = backend.check(&Zeroizing::new("wrong".to_owned()), SystemTime::now());

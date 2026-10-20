@@ -39,6 +39,11 @@ pub enum Unavailable {
     NoCheckRoute,
     /// The running uid has no passwd entry with a name.
     NoAccount,
+    /// Linux: this process runs with no_new_privs (a sandbox such as Flatpak or bubblewrap, a
+    /// service started with `NoNewPrivileges=`): `pam_unix`'s set-uid helper cannot read the
+    /// password database, so the stack would refuse even the right password and may count it
+    /// (WI-545; `privileges`).
+    NoNewPrivs,
     /// The back-off record has no place that is this account's alone: Linux `/run/user/<uid>`
     /// missing — no login session: a container, WSL 1, `su`, `sudo`, ssh without logind — or a
     /// directory another account owns or others can write.
