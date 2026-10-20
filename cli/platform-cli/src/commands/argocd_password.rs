@@ -35,12 +35,9 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     let secrets = ctx.secrets();
 
     // Cached fast-path: a read through the core's secret store, which never creates the age
-    // key (GOTCHA-120).
-    if let Some(armored) = &hetzner.argocd_admin_password_age {
-        if !refresh {
-            let key = secrets.cache_key(target)?;
-            let plaintext =
-                secrets.open_cache(&key, CachedSecret::ArgocdPassword, target, armored)?;
+    // key (GOTCHA-120) and names a cache sealed to a store key a key change retired (B86).
+    if !refresh {
+        if let Some(plaintext) = secrets.cached_argocd_password(&hetzner, target)? {
             print!("{}", plaintext.as_str());
             age_cache::note_outside_lock(&ctx, "the Argo CD admin password");
             return Ok(());

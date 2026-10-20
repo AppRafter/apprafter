@@ -486,6 +486,9 @@ fn why_code(w: UndecryptableWhy) -> u8 {
     match w {
         UndecryptableWhy::NotForThisKey => 1,
         UndecryptableWhy::Damaged => 2,
+        // D.4b B86: the secret store words a refusal so from the state's record after the
+        // session answered; no holder sends it. Here so every reason has its own byte.
+        UndecryptableWhy::RetiredKey => 3,
     }
 }
 
@@ -493,6 +496,7 @@ fn why_of(b: u8) -> Result<UndecryptableWhy, FrameError> {
     match b {
         1 => Ok(UndecryptableWhy::NotForThisKey),
         2 => Ok(UndecryptableWhy::Damaged),
+        3 => Ok(UndecryptableWhy::RetiredKey),
         _ => Err(FrameError::Field(tag::REASON)),
     }
 }
@@ -1321,6 +1325,20 @@ mod tests {
     fn a_reply_never_shows_its_item_in_debug() {
         let shown = format!("{:?}", Reply::Item(Zeroizing::new(b"tok".to_vec())));
         assert!(!shown.contains("tok") && !shown.contains("116"), "{shown}");
+    }
+
+    /// D.4b B86: every reason a cache refusal can carry has a byte of its own, read back as
+    /// itself; no other byte is a reason.
+    #[test]
+    fn every_undecryptable_reason_has_a_byte_of_its_own() {
+        for why in [
+            UndecryptableWhy::NotForThisKey,
+            UndecryptableWhy::Damaged,
+            UndecryptableWhy::RetiredKey,
+        ] {
+            assert_eq!(why_of(why_code(why)).unwrap(), why);
+        }
+        assert!(why_of(0).is_err() && why_of(4).is_err());
     }
 
     #[test]

@@ -803,6 +803,7 @@ mod tests {
                 what: age_cache::Holding::Secret(CachedSecret::Kubeconfig),
                 sealed_to: Some(cli_state::SealedTo::StoreVault {
                     store_id: "0123456789abcdef".into(),
+                    vault_id: None,
                 }),
             }],
             ..lost_prod()

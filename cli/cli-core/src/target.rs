@@ -913,18 +913,45 @@ pub fn save_target_config(
 /// which `Path::exists` read as no `targets/` at all, an empty store
 /// (WI-482). Any other failure names the path it could not read.
 pub fn list_target_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
-    let dir = paths.targets_dir();
-    if !store_path_exists(paths, &dir, paths.root())? {
+    folder_names(paths, &paths.targets_dir(), false)
+}
+
+/// The folders of `<root>/state/` (D.4b B85): each a target's per-target state, or one a
+/// best-effort `target remove` or `rename` left behind. Read as [`list_target_names`] reads
+/// `targets/`: folders only, UTF-8 names that do not start with a dot (no target name does),
+/// sorted; no `state/` folder is none — except that a link to a folder counts (a dangling
+/// one does not): every reader and writer of a target's state goes through such a link, as
+/// `store_privacy` reads the store, so a key change must walk it too. A link whose target
+/// cannot be read (a loop, a folder another account owns) is the store's I/O error, naming
+/// it: never skipped (critic round, finding 20).
+pub fn list_state_folder_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
+    folder_names(paths, &paths.root().join(STATE_DIR_NAME), true)
+}
+
+/// The names of the folders in `dir`, a folder of the store: UTF-8 names that do not start
+/// with a dot, sorted; none when `dir` is not there. With `follow_links`, an entry that is a
+/// link counts when it leads to a folder; without, a link is never a folder.
+fn folder_names(paths: &TargetStorePaths, dir: &Path, follow_links: bool) -> Result<Vec<String>> {
+    if !store_path_exists(paths, dir, paths.root())? {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(&dir).map_err(|e| store_io(paths, &dir, &dir, e))?;
+    let entries = fs::read_dir(dir).map_err(|e| store_io(paths, dir, dir, e))?;
     let mut names: Vec<String> = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| store_io(paths, &dir, &dir, e))?;
+        let entry = entry.map_err(|e| store_io(paths, dir, dir, e))?;
         let file_type = entry
             .file_type()
-            .map_err(|e| store_io(paths, &entry.path(), &dir, e))?;
-        if !file_type.is_dir() {
+            .map_err(|e| store_io(paths, &entry.path(), dir, e))?;
+        let is_dir = if follow_links && file_type.is_symlink() {
+            match fs::metadata(entry.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(store_io(paths, &entry.path(), dir, e)),
+            }
+        } else {
+            file_type.is_dir()
+        };
+        if !is_dir {
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
@@ -1785,6 +1812,43 @@ mod tests {
         fs::create_dir_all(paths.targets_dir().join(".scratch")).unwrap();
         let names = list_target_names(&paths).unwrap();
         assert_eq!(names, vec!["alpha", "midline", "zeta"]);
+    }
+
+    /// D.4b B85: `state/`'s folders, read as `targets/` is — folders only, no dot-names,
+    /// sorted — and none when there is no `state/` folder.
+    #[test]
+    fn list_state_folder_names_reads_folders_only_sorted() {
+        let (_dir, paths) = make_paths();
+        assert!(list_state_folder_names(&paths).unwrap().is_empty());
+        for name in [
+            "delta", "alpha", "foxtrot", "bravo", "echo", "charlie", ".scratch",
+        ] {
+            fs::create_dir_all(paths.state_dir(name)).unwrap();
+        }
+        fs::write(paths.state_dir("notes.txt"), b"a file").unwrap();
+        fs::create_dir_all(paths.target_dir("only-a-target")).unwrap();
+        assert_eq!(
+            list_state_folder_names(&paths).unwrap(),
+            ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+        );
+    }
+
+    /// D.4b B85 (critic round, finding 1): a folder of `state/` that is a link to a folder is
+    /// listed — the store is read and written through its links (`store_privacy`) — and a
+    /// dangling link is not; `targets/` is read as before: a link there is no target.
+    #[cfg(unix)]
+    #[test]
+    fn list_state_folder_names_follows_a_link_to_a_folder() {
+        let (dir, paths) = make_paths();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(paths.state_dir("real")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.state_dir("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), paths.state_dir("dangling")).unwrap();
+        fs::create_dir_all(paths.targets_dir()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.target_dir("linked")).unwrap();
+        assert_eq!(list_state_folder_names(&paths).unwrap(), ["linked", "real"]);
+        assert!(list_target_names(&paths).unwrap().is_empty());
     }
 
     #[test]

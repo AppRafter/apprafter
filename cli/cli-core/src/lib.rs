@@ -31,6 +31,7 @@ pub use error::{
     StoreFolderProblem, TransportFailure, UnavailableKind, VaultProblem, VaultWriteProblem,
 };
 pub use fsutil::atomic_replace;
+pub use target::list_state_folder_names;
 pub use target::{
     config_root_from_override, default_config_root, list_target_names, load_active_target_config,
     load_global_config, load_target, load_target_config, remove_target, rename_target,

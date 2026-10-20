@@ -396,21 +396,32 @@ fn refetch(secret: &crate::secrets::CachedSecret, target: &str) -> String {
     }
 }
 
-/// `CacheUndecryptable`'s message: the shared key's file, or the store's own key in its vault.
+/// `CacheUndecryptable`'s message: the shared key's file, or the store's own key in its vault
+/// — and, for a cache whose record names a store key a key change of this store retired
+/// (D.4b B86), that key change, said as the record's: the record is no proof (critic
+/// round, finding 3).
 fn cache_undecryptable_message(
     secret: &crate::secrets::CachedSecret,
     target: &str,
     path: &str,
     detail: &str,
     key: crate::secrets::CacheKeyKind,
+    reason: crate::secrets::UndecryptableWhy,
 ) -> String {
-    match key {
-        crate::secrets::CacheKeyKind::SharedFile => format!(
+    use crate::secrets::{CacheKeyKind, UndecryptableWhy};
+    match (key, reason) {
+        (CacheKeyKind::StoreVault, UndecryptableWhy::RetiredKey) => format!(
+            "the {} cached for target `{target}` is recorded as sealed to the store key of an \
+             earlier key change, which that change retired: this target store's own key, in \
+             its vault {path}, does not decrypt it",
+            secret.noun()
+        ),
+        (CacheKeyKind::SharedFile, _) => format!(
             "the {} cached for target `{target}` cannot be decrypted with the age key at {path}: \
              {detail}",
             secret.noun()
         ),
-        crate::secrets::CacheKeyKind::StoreVault => format!(
+        (CacheKeyKind::StoreVault, _) => format!(
             "the {} cached for target `{target}` cannot be decrypted with this target store's \
              own key, in its vault {path}: {detail}",
             secret.noun()
@@ -420,21 +431,30 @@ fn cache_undecryptable_message(
 
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
 /// again under the key there is now, for `target`, whichever target is active. On a locked
-/// store the store's own key is the only one, so only the fetch (D.4a T38; ADR 0068 §6).
+/// store the store's own key is the only one, so only the fetch (D.4a T38; ADR 0068 §6) —
+/// after the key change that retired the key it was sealed to, when that is why (B86).
 fn cache_undecryptable_help(
     secret: &crate::secrets::CachedSecret,
     target: &str,
     key: crate::secrets::CacheKeyKind,
+    reason: crate::secrets::UndecryptableWhy,
 ) -> String {
+    use crate::secrets::{CacheKeyKind, UndecryptableWhy};
     let refetch = refetch(secret, target);
-    match key {
-        crate::secrets::CacheKeyKind::SharedFile => format!(
+    match (key, reason) {
+        (CacheKeyKind::StoreVault, UndecryptableWhy::RetiredKey) => format!(
+            "A key change (`apprafter lock rekey` or `apprafter lock recovery`) replaced this \
+             target store's own key, and this copy's record names the key it replaced: it was \
+             cached before that change, or restored from a copy made before it — or the copy \
+             is damaged. {refetch} and caches it under the store's key."
+        ),
+        (CacheKeyKind::SharedFile, _) => format!(
             "It was cached under a different age key (one that was lost and replaced), or the \
              cached copy is damaged. If you still have the key it was cached under, set \
              `APPRAFTER_AGE_KEY` to it. Otherwise {refetch} and caches it under the key at that \
              path."
         ),
-        crate::secrets::CacheKeyKind::StoreVault => format!(
+        (CacheKeyKind::StoreVault, _) => format!(
             "It was not encrypted to this target store's own key — an older AppRafter wrote it \
              under the shared age key, or another program did — or the copy is damaged. \
              {refetch} and caches it under the store's key."
@@ -1787,10 +1807,10 @@ pub enum CliError {
     /// or the ciphertext is damaged. `detail` is the age library's own account; `key` says which
     /// key (the shared file at `path`, or the store's own, in its vault at `path`) and `reason`
     /// which failure (D.4a §3.12).
-    #[error("{}", cache_undecryptable_message(secret, target, path, detail, *key))]
+    #[error("{}", cache_undecryptable_message(secret, target, path, detail, *key, *reason))]
     #[diagnostic(
         code(apprafter::secrets::cache_undecryptable),
-        help("{}", cache_undecryptable_help(secret, target, *key))
+        help("{}", cache_undecryptable_help(secret, target, *key, *reason))
     )]
     CacheUndecryptable {
         secret: crate::secrets::CachedSecret,
@@ -3314,6 +3334,47 @@ mod tests {
             "{help}"
         );
         assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
+    }
+
+    /// D.4b B86: a cache whose record names a store key a key change of this store retired
+    /// says so — what the record says, that the copy may be damaged (critic round, finding 3),
+    /// and the refresh — and its reason reads `retired_key` on the wire.
+    #[test]
+    fn a_cache_sealed_to_a_retired_store_key_names_the_key_change_and_the_refresh() {
+        use crate::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        let err = CliError::CacheUndecryptable {
+            secret: CachedSecret::Kubeconfig,
+            target: "prod".into(),
+            path: "/s/vault".into(),
+            detail: "age decrypt: No matching keys found".into(),
+            key: CacheKeyKind::StoreVault,
+            reason: UndecryptableWhy::RetiredKey,
+        };
+        assert_eq!(code_of(&err), "apprafter::secrets::cache_undecryptable");
+        assert_eq!(
+            err.to_string(),
+            "the kubeconfig cached for target `prod` is recorded as sealed to the store key of \
+             an earlier key change, which that change retired: this target store's own key, \
+             in its vault /s/vault, does not decrypt it"
+        );
+        let help = help_of(&err);
+        assert!(
+            help.starts_with(
+                "A key change (`apprafter lock rekey` or `apprafter lock recovery`) replaced \
+                 this target store's own key"
+            ),
+            "{help}"
+        );
+        assert!(help.contains("— or the copy is damaged."), "{help}");
+        assert!(
+            help.ends_with(
+                "`apprafter kubeconfig --refresh --target prod` fetches it from the node again \
+                 and caches it under the store's key."
+            ),
+            "{help}"
+        );
+        assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
+        assert_eq!(UndecryptableWhy::RetiredKey.as_str(), "retired_key");
     }
 
     /// D.4a §3.12: every lock refusal has its code, a message that names the store or the target

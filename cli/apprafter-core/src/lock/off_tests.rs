@@ -312,7 +312,8 @@ fn lock_off_backs_out_of_an_interrupted_lock_on() {
         assert_eq!(
             hetzner_of(&f.ctx, "staging").argocd_admin_password_sealed_to,
             (!dropped_by_lock_on).then(|| cli_state::SealedTo::StoreVault {
-                store_id: "0123456789abcdef".into()
+                store_id: "0123456789abcdef".into(),
+                vault_id: None
             }),
             "{at:?}"
         );
