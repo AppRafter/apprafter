@@ -10,6 +10,7 @@ test("a protected store's token reads the same on every OS (D.4a D21), an interr
     expect(secretCopy(os, 'locked')).toBe("Encrypted in this target store's vault");
     expect(secretCopy(os, 'locking')).toContain('protecting was interrupted');
     expect(secretCopy(os, 'unlocking')).toContain('stopping protection was interrupted');
+    expect(secretCopy(os, 'rotating')).toContain('changing its keys was interrupted');
     expect(secretCopy(os, 'locked', 'lock_state')).not.toContain('Encrypted');
   }
 });

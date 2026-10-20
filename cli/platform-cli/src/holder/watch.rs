@@ -143,6 +143,7 @@ pub(crate) mod tests {
             id: id.map(|i| StoreId::parse(i).unwrap()),
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         }))
     }
 
@@ -158,6 +159,7 @@ pub(crate) mod tests {
             (read(SecretsMode::Files, None), "files"),
             (read(SecretsMode::Locking, Some(OWN)), "locking"),
             (read(SecretsMode::Unlocking, Some(OWN)), "unlocking"),
+            (read(SecretsMode::Rotating, Some(OWN)), "rotating"),
             (Ok(None), "gone"),
             (Err(CliError::Other("unreadable".into())), "unreadable"),
         ] {

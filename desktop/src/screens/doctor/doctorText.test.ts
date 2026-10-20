@@ -250,6 +250,9 @@ describe('fixText', () => {
     expect(fixed({ kind: 'finish_lock', phase: 'unlocking' })).toBe(
       "Unprotecting this target store's secrets did not finish: finish it on the Security page.",
     );
+    expect(fixed({ kind: 'finish_lock', phase: 'rotating' })).toBe(
+      "Changing this target store's keys did not finish: finish it on the Security page.",
+    );
     expect(fixed({ kind: 'unlock_first' })).toBe('Unlock the app to run these checks.');
     expect(fixed({ kind: 'protect_ssh_key', path: '/home/alex/.ssh/id_ed25519' })).toBe(
       '/home/alex/.ssh/id_ed25519 reaches your servers and stays outside the lock: give it a passphrase, and keep it out of any ssh-agent other programs can reach.',

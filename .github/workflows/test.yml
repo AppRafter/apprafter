@@ -43,6 +43,8 @@ jobs:
           filters: |
             rust_cli:
               - 'cli/**'
+              - 'scripts/test-os-slots-linux.sh'
+              - 'scripts/test-os-slots-macos.sh'
               - '.github/workflows/test.yml'
             rust_operator:
               - 'operator/**'
@@ -193,27 +195,73 @@ jobs:
   # This job passes when every leg passed, or when the matrix was skipped
   # because nothing under cli/ changed, and fails otherwise. "Skipped" is
   # only that when the change detection itself succeeded: a failed
-  # `changes` job skips the matrix too, and must not read as a pass.
+  # `changes` job skips the matrix too, and must not read as a pass. It
+  # also stands for os-slots-linux and os-slots-macos, the CLI's other test
+  # jobs (real PAM and macOS accounts), as rust-desktop-result stands for
+  # osauth-linux.
   rust-cli-result:
     name: cargo test cli/
-    needs: [changes, rust-cli]
+    needs: [changes, rust-cli, os-slots-linux, os-slots-macos]
     if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: every leg of the matrix passed
+      - name: every CLI test job passed
         env:
           CHANGES: ${{ needs.changes.result }}
           RESULT: ${{ needs.rust-cli.result }}
+          OS_SLOTS_LINUX: ${{ needs.os-slots-linux.result }}
+          OS_SLOTS_MACOS: ${{ needs.os-slots-macos.result }}
         run: |
-          echo "changes: $CHANGES, rust-cli: $RESULT"
+          echo "changes: $CHANGES, rust-cli: $RESULT," \
+            "os-slots-linux: $OS_SLOTS_LINUX, os-slots-macos: $OS_SLOTS_MACOS"
           if [ "$CHANGES" != success ]; then
             exit 1
           fi
-          case "$RESULT" in
-            success | skipped) ;;
-            *) exit 1 ;;
-          esac
+          for result in "$RESULT" "$OS_SLOTS_LINUX" "$OS_SLOTS_MACOS"; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
+
+  # The account-password check of cli/os-slots (D.4b-d) against the real PAM stacks of Debian 13
+  # and Fedora 42, as a normal user, in throwaway containers: every case of
+  # cli/os-slots/tests/pam_container.rs, through the same script a developer runs. The script
+  # fails, never skips, when podman is missing. Rootful podman, as osauth-linux runs it.
+  os-slots-linux:
+    name: account-password check on Linux (PAM containers)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: PAM cases, Debian and Fedora
+        env:
+          PODMAN: sudo podman
+        run: bash scripts/test-os-slots-linux.sh
+
+  # The macOS route of the account-password check (D.4b-d; GOTCHA-327: the PAM service
+  # chkpasswd) against accounts this job makes on a GitHub-hosted runner: every case of
+  # cli/os-slots/tests/macos_real.rs, through scripts/test-os-slots-macos.sh, which refuses to
+  # run anywhere else because it creates accounts.
+  os-slots-macos:
+    name: account-password check on macOS (accounts the job makes)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+      - name: macOS cases
+        run: bash scripts/test-os-slots-macos.sh
 
   # AppRafter Desktop (ADR 0067) ships for Linux, macOS and Windows, so it is
   # tested and built on all three. fail-fast off for the reason rust-cli gives.

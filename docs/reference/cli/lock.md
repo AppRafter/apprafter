@@ -52,7 +52,7 @@ apprafter lock off
 
 ## `apprafter lock on`
 
-Move this target store's secrets into an encrypted vault: its targets' Hetzner tokens, a new age key of its own, and the cached kubeconfigs and Argo CD passwords re-encrypted to it. Asks for a new lock password twice and shows a recovery key once, which you type back. Run it again to finish an interrupted run; on a locked store, `--timeout` changes the default unlock window
+Move this target store's secrets into an encrypted vault: its targets' Hetzner tokens, a new age key of its own, and the cached kubeconfigs and Argo CD passwords re-encrypted to it. By default the vault opens with your account password on this computer, checked with the system once, now (Linux, macOS), and with a recovery key shown once, which you type back. Where this computer cannot check the account password — and on Windows, until AppRafter supports Windows Hello there — it asks for a new lock password twice instead, and says why. Run it again to finish an interrupted run; on a locked store, `--timeout` changes the default unlock window
 
 ```text
 Usage: apprafter lock on [OPTIONS]
@@ -60,12 +60,14 @@ Usage: apprafter lock on [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--lock-password` | flag | — | no | Protect the store with a separate lock password instead of your account password: asked twice, only AppRafter's prompt ever sees it; then a recovery key is shown once, which you type back. Use it on a computer where an agent gets your account password, or for a store you use on more than one computer |
 | `--timeout` | `<MINUTES>` | — | no | Minutes an unlock window stays open by default, restarted by each command that uses it; 0 makes every command ask. Default 5 |
 
 Examples:
 
 ```sh
 apprafter lock on
+apprafter lock on --lock-password
 apprafter lock on --timeout 15
 ```
 

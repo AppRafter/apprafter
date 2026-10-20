@@ -150,7 +150,8 @@ describe("this computer's limits (rule 1)", () => {
   });
   /** Each exported function, on the arguments that reach every sentence it can say. */
   const SAMPLES: Record<string, () => unknown> = {
-    protectSub: () => (['files', 'locking', 'locked', 'unlocking'] as const).map(protectSub),
+    protectSub: () =>
+      (['files', 'locking', 'locked', 'unlocking', 'rotating'] as const).map(protectSub),
     unlockNote: () => (['linux', 'windows', 'macos'] as const).map(unlockNote),
     terminalsLine: () => [terminalsLine(0), terminalsLine(5)],
     limitText: () => EVERY_LIMIT.map(limitText),
@@ -179,7 +180,7 @@ describe("this computer's limits (rule 1)", () => {
     storeLine: () => [lockText.storeLine('~/s')],
     coveredLine: () => [coveredLine([]), coveredLine(['a']), coveredLine(['a', 'b'])],
     secretsWord: () =>
-      (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
+      (['files', 'locking', 'locked', 'unlocking', 'rotating'] as const).flatMap((m) => [
         secretsWord(m, null),
         secretsWord(m, 'lock_state'),
         secretsWord(m, 'not_private'),
@@ -193,14 +194,14 @@ describe("this computer's limits (rule 1)", () => {
     storeProblemSub: () => [storeProblemSub('lock_state'), storeProblemSub('not_private')],
     storeProblemReason: () => [storeProblemReason('lock_state'), storeProblemReason('not_private')],
     securityRowSub: () =>
-      (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
+      (['files', 'locking', 'locked', 'unlocking', 'rotating'] as const).flatMap((m) => [
         securityRowSub(m, false, null),
         securityRowSub(m, true, null),
         securityRowSub(m, true, 'lock_state'),
         securityRowSub(m, true, 'not_private'),
       ]),
     lockFooter: () =>
-      (['files', 'locking', 'locked', 'unlocking'] as const).flatMap((m) => [
+      (['files', 'locking', 'locked', 'unlocking', 'rotating'] as const).flatMap((m) => [
         lockFooter(m, false),
         lockFooter(m, true),
       ]),
@@ -305,6 +306,11 @@ describe('the state of the store', () => {
         ['finish'],
       ],
     ]);
+    // D.4b: Finish and Stop protecting from an unfinished key change are d4b-g3b's.
+    expect([protectSub('rotating'), PROTECT_ACTIONS.rotating]).toEqual([
+      'Changing the keys was interrupted. Finish it to re-encrypt the remaining secrets.',
+      [],
+    ]);
   });
   test('the terminals line and the unlock note, in plain text the page shows as it is', () => {
     expect(terminalsLine(5)).toBe(
@@ -328,8 +334,9 @@ describe('the state of the store', () => {
     );
     expect(lockFooter('locking', false)).toContain('some credentials may still be in files');
     expect(lockFooter('unlocking', false)).toContain('some credentials may be in files again');
+    expect(lockFooter('rotating', false)).toContain('Changing the keys was interrupted');
     // A lock state that cannot be used is never "encrypted" (critic B finding 8).
-    for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
+    for (const mode of ['files', 'locking', 'locked', 'unlocking', 'rotating'] as const) {
       expect(lockFooter(mode, true)).not.toContain('encrypted');
     }
   });
@@ -432,12 +439,12 @@ describe('the Security page’s words (WI-476)', () => {
   });
 
   test('the Security row says why the rows above stay on, and where that changes', () => {
-    const all = ['files', 'locking', 'locked', 'unlocking'] as const;
+    const all = ['files', 'locking', 'locked', 'unlocking', 'rotating'] as const;
     expect(securityRowSub('files', false, null)).toBe(SECURITY_ROW_SUB);
     expect(securityRowSub('locked', true, null)).toBe(
       "This target store's secrets are protected, so the settings above stay on until you stop protecting them on the Security page.",
     );
-    for (const mode of ['locking', 'unlocking'] as const) {
+    for (const mode of ['locking', 'unlocking', 'rotating'] as const) {
       expect(securityRowSub(mode, true, null)).toBe(
         "Changing this target store's protection was interrupted: the Security page offers to finish it.",
       );
@@ -458,7 +465,8 @@ describe('the Security page’s words (WI-476)', () => {
     expect(storeIndicator('~/s', 'files', null)).toBe('Target store ~/s · Secrets: in files');
     expect(secretsWord('locking', null)).toBe('protecting was interrupted');
     expect(secretsWord('unlocking', null)).toBe('stopping protection was interrupted');
-    for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
+    expect(secretsWord('rotating', null)).toBe('changing the keys was interrupted');
+    for (const mode of ['files', 'locking', 'locked', 'unlocking', 'rotating'] as const) {
       expect(secretsWord(mode, 'lock_state')).toBe('lock state cannot be used');
     }
   });
@@ -471,7 +479,7 @@ describe('the Security page’s words (WI-476)', () => {
     for (const [, secrets] of STORE_PROBLEMS) {
       expect(storeProblemOf(secrets.problem)).toBe('lock_state');
     }
-    for (const mode of ['files', 'locking', 'locked', 'unlocking'] as const) {
+    for (const mode of ['files', 'locking', 'locked', 'unlocking', 'rotating'] as const) {
       expect(storeIndicator('~/s', mode, 'not_private')).toBe(
         'Target store ~/s · Secrets: not used while other accounts can change this store',
       );

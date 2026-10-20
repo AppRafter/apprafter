@@ -179,7 +179,7 @@ pub fn lost_vaults(held: &[Held]) -> Option<Vec<&str>> {
     let mut ids: Vec<&str> = Vec::new();
     for h in held {
         match (&h.what, &h.sealed_to) {
-            (Holding::Secret(_), Some(SealedTo::StoreVault { store_id })) => {
+            (Holding::Secret(_), Some(SealedTo::StoreVault { store_id, .. })) => {
                 if !ids.contains(&store_id.as_str()) {
                     ids.push(store_id);
                 }

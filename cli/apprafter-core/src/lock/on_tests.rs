@@ -107,7 +107,9 @@ pub(super) fn new_input() -> (LockOnInput, String) {
     let (recovery, shown) = confirmed();
     (
         LockOnInput::New {
-            password: SecretString::new(PASSWORD),
+            // D.4b-c3: the first slot `first_slot` makes for a lock-password plan — what
+            // D.4a's suites have always run their plans with (F14).
+            first: super::ways::lock_password_slot(SecretString::new(PASSWORD)).unwrap(),
             recovery,
         },
         shown,
@@ -116,7 +118,7 @@ pub(super) fn new_input() -> (LockOnInput, String) {
 
 /// `lock on` run to its end; the recovery key it was given.
 pub(super) fn lock(ctx: &Context) -> String {
-    let plan = plan_on(ctx, None).unwrap();
+    let plan = plan_on(ctx, None, WayAsked::LockPassword).unwrap();
     let (input, shown) = new_input();
     let done = execute_on(ctx, plan, input, &NullReporter, &CancellationToken::new()).unwrap();
     assert!(matches!(done, Outcome::Completed { .. }), "{done:?}");
@@ -129,7 +131,7 @@ pub(super) fn opened(ctx: &Context, secret: &str) -> Context {
     let key = open_at(
         ctx.config_root(),
         file.id.as_ref().unwrap(),
-        SlotInput::from_input(SecretString::new(secret)),
+        SlotInput::from_input(SecretString::new(secret), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();
@@ -152,7 +154,7 @@ pub(super) fn token_of(ctx: &Context, shown: &str, target: &str) -> String {
             let o = open_at(
                 ctx.config_root(),
                 &id,
-                SlotInput::from_input(SecretString::new(shown)),
+                SlotInput::from_input(SecretString::new(shown), None),
                 &KdfPolicy::INSECURE_FAST,
             )
             .unwrap();
@@ -238,9 +240,16 @@ pub(super) fn assert_locked_whole(ctx: &Context, secret: &str) {
         staging.argocd_admin_password_age.is_none(),
         "the cache no key opens was dropped"
     );
-    // F13: each cache sealed to the store's key says so; the dropped one has no record.
+    // F13, B86: each cache sealed to the store's key says so, with the vault's id; the
+    // dropped one has no record.
     let vault = Some(cli_state::SealedTo::StoreVault {
         store_id: file.id.as_ref().unwrap().as_str().to_string(),
+        vault_id: Some(
+            crate::secrets::vault_id_on_disk(root)
+                .unwrap()
+                .unwrap()
+                .to_string(),
+        ),
     });
     assert_eq!(
         (
@@ -289,7 +298,7 @@ fn lock_on_puts_every_secret_in_the_vault_and_none_stays_in_clear() {
 fn the_plan_lists_each_move_and_writes_nothing() {
     let f = files_store();
     let before = anywhere(f.ctx.config_root(), "");
-    let plan = plan_on(&f.ctx, Some(15)).unwrap();
+    let plan = plan_on(&f.ctx, Some(15), WayAsked::LockPassword).unwrap();
     assert_eq!(plan.class, PlanClass::Bounded);
     assert_eq!(plan.payload.start(), &LockOnStart::New { restart: false });
     assert_eq!(plan.payload.timeout_min(), 15);
@@ -336,7 +345,7 @@ fn the_plan_lists_each_move_and_writes_nothing() {
 fn a_cache_sealed_to_a_lost_vault_names_the_vault_in_the_plan() {
     let f = files_store();
     let drop_of = |ctx: &Context| {
-        plan_on(ctx, None)
+        plan_on(ctx, None, WayAsked::LockPassword)
             .unwrap()
             .changes
             .into_iter()
@@ -383,7 +392,7 @@ fn an_unreadable_record_stops_the_plan() {
     )
     .unwrap();
     assert!(matches!(
-        plan_on(&f.ctx, None).unwrap_err(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap_err(),
         CoreError::Cli(CliError::InvalidTargetConfig { .. })
     ));
     let f = files_store();
@@ -392,7 +401,7 @@ fn an_unreadable_record_stops_the_plan() {
         "{ not json",
     )
     .unwrap();
-    assert!(plan_on(&f.ctx, None).is_err());
+    assert!(plan_on(&f.ctx, None, WayAsked::LockPassword).is_err());
 }
 
 /// Rule 4 and T36: an interruption at every step loses no token, readers in between refuse,
@@ -411,7 +420,7 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
         FaultPoint::AfterLocked,
     ] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         let e = execute_on(
             &f.ctx.clone().with_fault(at),
@@ -437,15 +446,16 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
                 "{at:?}: readers refuse"
             );
         }
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let secret = match plan.payload.start().clone() {
-            LockOnStart::Resume { id } => {
+            LockOnStart::Resume { id, .. } => {
                 let slot = |kind, secret: &str| {
                     open_slot_at(
                         f.ctx.config_root(),
                         &id,
                         kind,
                         SecretString::new(secret),
+                        None,
                         &KdfPolicy::INSECURE_FAST,
                     )
                     .unwrap()
@@ -454,7 +464,7 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
                     &f.ctx,
                     plan,
                     LockOnInput::Resume {
-                        password: slot(LockSlotKind::Password, PASSWORD),
+                        everyday: slot(LockSlotKind::Password, PASSWORD),
                         recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
                     },
                     &NullReporter,
@@ -491,7 +501,7 @@ fn an_interruption_at_every_step_loses_nothing_and_a_rerun_finishes() {
 #[test]
 fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let (input, shown) = new_input();
     let e = execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterCachesTarget(1)),
@@ -509,8 +519,8 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
         h.argocd_admin_password_sealed_to = None;
         seed(&f.ctx, target, serde_json::to_value(&h).unwrap());
     }
-    let plan = plan_on(&f.ctx, None).unwrap();
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
         panic!("{:?}", plan.payload.start());
     };
     let slot = |kind, secret: &str| {
@@ -519,6 +529,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
@@ -527,7 +538,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
         &f.ctx,
         plan,
         LockOnInput::Resume {
-            password: slot(LockSlotKind::Password, PASSWORD),
+            everyday: slot(LockSlotKind::Password, PASSWORD),
             recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
         },
         &NullReporter,
@@ -542,7 +553,7 @@ fn a_resume_records_caches_already_sealed_to_the_store_s_key() {
 #[test]
 fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let (input, shown) = new_input();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterVaultVerified),
@@ -561,8 +572,8 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
         },
     )
     .unwrap();
-    let plan = plan_on(&f.ctx, None).unwrap();
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
         panic!("a resume")
     };
     let slot = |kind, secret: &str| {
@@ -571,6 +582,7 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
@@ -579,7 +591,7 @@ fn a_resume_never_replaces_a_clear_token_it_did_not_vault() {
         &f.ctx,
         plan,
         LockOnInput::Resume {
-            password: slot(LockSlotKind::Password, PASSWORD),
+            everyday: slot(LockSlotKind::Password, PASSWORD),
             recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
         },
         &NullReporter,
@@ -616,7 +628,7 @@ fn opened_secrets(ctx: &Context, secret: &str) -> crate::secrets::SecretStore {
 #[test]
 fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let (input, shown) = new_input();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterVaultVerified),
@@ -634,6 +646,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &id,
             kind,
             SecretString::new(secret),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
     };
@@ -660,12 +673,13 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &foreign.store_id,
             LockSlotKind::RecoveryKey,
             SecretString::new(foreign.recovery_key().expose()),
+            None,
             &KdfPolicy::INSECURE_FAST,
         )
         .unwrap()
     };
     let resume = |recovery: SlotOpened| {
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         assert!(
             matches!(plan.payload.start(), LockOnStart::Resume { .. }),
             "{:?}",
@@ -675,7 +689,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
             &f.ctx,
             plan,
             LockOnInput::Resume {
-                password: slot(LockSlotKind::Password, PASSWORD).unwrap(),
+                everyday: slot(LockSlotKind::Password, PASSWORD).unwrap(),
                 recovery,
             },
             &NullReporter,
@@ -727,7 +741,7 @@ fn a_resume_opens_the_vault_with_both_slots_before_any_clear_data_goes() {
 #[test]
 fn a_run_without_a_vault_starts_over_with_a_new_store_id() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let (input, _) = new_input();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterStoreFileLocking),
@@ -738,7 +752,7 @@ fn a_run_without_a_vault_starts_over_with_a_new_store_id() {
     )
     .unwrap_err();
     let first = read_store_file(f.ctx.config_root()).unwrap().unwrap().id;
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     assert_eq!(plan.payload.start(), &LockOnStart::New { restart: true });
     let (input, shown) = new_input();
     let done = execute_on(
@@ -761,7 +775,7 @@ fn a_run_without_a_vault_starts_over_with_a_new_store_id() {
 #[test]
 fn a_run_that_lost_the_race_writes_nothing() {
     let f = files_store();
-    let late = plan_on(&f.ctx, None).unwrap();
+    let late = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     lock(&f.ctx);
     let vault = std::fs::read(f.ctx.config_root().join(VAULT_FILE)).unwrap();
     let (input, _) = new_input();
@@ -788,7 +802,7 @@ fn a_run_that_lost_the_race_writes_nothing() {
 fn the_vault_is_checked_with_both_slots_before_any_clear_data_goes() {
     for spoil in ["another recovery key", "no token"] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, _) = new_input();
         let rewrite = move |path: &Path| {
             let fast = &KdfPolicy::INSECURE_FAST;
@@ -850,7 +864,7 @@ fn the_vault_is_checked_with_both_slots_before_any_clear_data_goes() {
 #[test]
 fn a_cache_that_stops_opening_after_the_plan_is_left() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let mut prod = hetzner_of(&f.ctx, "prod");
     prod.kubeconfig_age =
         Some(encrypt_for_recipient(YAML, &Identity::generate().to_public()).unwrap());
@@ -880,14 +894,14 @@ fn a_weak_policy_plans_nothing_outside_its_roots() {
     let (dir, ctx) = store(&["prod"], Some("prod"));
     let weak = ctx.clone().with_kdf_policy(&KdfPolicy::INSECURE_FAST);
     assert!(matches!(
-        plan_on(&weak, None).unwrap_err(),
+        plan_on(&weak, None, WayAsked::LockPassword).unwrap_err(),
         CoreError::InsecureKdfRefused { root } if root == ctx.config_root()
     ));
     let elsewhere = tempfile::tempdir().unwrap();
     let wrong_root = weak
         .clone()
         .with_insecure_kdf_root(elsewhere.path().to_path_buf());
-    assert!(plan_on(&wrong_root, None).is_err());
+    assert!(plan_on(&wrong_root, None, WayAsked::LockPassword).is_err());
     assert!(insecure_kdf_permitted(
         &weak.with_insecure_kdf_root(dir.path().to_path_buf())
     ));
@@ -900,7 +914,7 @@ fn a_weak_policy_plans_nothing_outside_its_roots() {
 fn a_locked_or_unlocking_store_is_not_planned_again() {
     let f = files_store();
     lock(&f.ctx);
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     assert_eq!(plan.payload.start(), &LockOnStart::AlreadyLocked);
     let (input, _) = new_input();
     assert!(matches!(
@@ -913,7 +927,7 @@ fn a_locked_or_unlocking_store_is_not_planned_again() {
     write_store_file(f.ctx.config_root(), &file, &held).unwrap();
     drop(held);
     assert!(matches!(
-        plan_on(&f.ctx, None).unwrap_err(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap_err(),
         CoreError::Cli(CliError::LockIncomplete {
             phase: cli_core::LockPhase::Unlocking,
             ..
@@ -924,7 +938,7 @@ fn a_locked_or_unlocking_store_is_not_planned_again() {
 #[test]
 fn a_cancelled_run_writes_nothing() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let (input, _) = new_input();
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -956,7 +970,7 @@ impl crate::Reporter for CancelAt {
 fn a_cancel_before_the_caches_undoes_what_the_run_wrote() {
     for (at, wrote_vault) in [(1, false), (2, true)] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, _) = new_input();
         let token = CancellationToken::new();
         let reporter = CancelAt {
@@ -1005,7 +1019,7 @@ fn a_cancel_before_the_caches_undoes_what_the_run_wrote() {
 #[test]
 fn the_window_lives_in_the_vault_and_changes_there() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, Some(15)).unwrap();
+    let plan = plan_on(&f.ctx, Some(15), WayAsked::LockPassword).unwrap();
     let (input, shown) = new_input();
     execute_on(
         &f.ctx,
@@ -1024,7 +1038,7 @@ fn the_window_lives_in_the_vault_and_changes_there() {
     let o = open_at(
         f.ctx.config_root(),
         &id,
-        SlotInput::from_input(SecretString::new(shown.as_str())),
+        SlotInput::from_input(SecretString::new(shown.as_str()), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();
@@ -1033,7 +1047,7 @@ fn the_window_lives_in_the_vault_and_changes_there() {
     let o = open_at(
         f.ctx.config_root(),
         &id,
-        SlotInput::from_input(SecretString::new(shown.as_str())),
+        SlotInput::from_input(SecretString::new(shown.as_str()), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap();
@@ -1061,7 +1075,7 @@ fn a_store_another_account_can_change_is_refused_before_anything_is_asked() {
     {
         let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);
         for timeout in [None, Some(15)] {
-            match plan_on(&f.ctx, timeout) {
+            match plan_on(&f.ctx, timeout, WayAsked::LockPassword) {
                 Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => {
                     assert_eq!(path, staging)
                 }
@@ -1071,7 +1085,7 @@ fn a_store_another_account_can_change_is_refused_before_anything_is_asked() {
     }
     lock(&f.ctx);
     let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);
-    match plan_on(&f.ctx, Some(15)) {
+    match plan_on(&f.ctx, Some(15), WayAsked::LockPassword) {
         Err(CoreError::Cli(CliError::StoreNotPrivate { path, .. })) => assert_eq!(path, staging),
         other => panic!("{:?}", other.map(|p| p.title)),
     }
@@ -1082,7 +1096,7 @@ fn a_store_another_account_can_change_is_refused_before_anything_is_asked() {
 #[test]
 fn a_store_another_account_can_change_is_not_locked() {
     let f = files_store();
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     let before = crate::target::testkit::snapshot(f.ctx.config_root());
     let staging = f.ctx.store().target_dir("staging");
     let _foreign = cli_core::owner_only::pretend::foreign_owner(&staging);

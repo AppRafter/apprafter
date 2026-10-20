@@ -1,0 +1,2 @@
+AppRafter does not ask Windows Hello while APPRAFTER_SANDBOX is set: the variable fences tests and agents away from it.
+The store gets a separate lock password instead.

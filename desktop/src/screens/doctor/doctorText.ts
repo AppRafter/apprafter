@@ -170,6 +170,8 @@ export function fixText(check: Check, target: string | null): string | null {
     case 'protect_secrets':
       return 'Security › Protect secrets encrypts them.';
     case 'finish_lock':
+      if (fix.phase === 'rotating')
+        return "Changing this target store's keys did not finish: finish it on the Security page.";
       return fix.phase === 'unlocking'
         ? "Unprotecting this target store's secrets did not finish: finish it on the Security page."
         : "Protecting this target store's secrets did not finish: finish it on the Security page.";

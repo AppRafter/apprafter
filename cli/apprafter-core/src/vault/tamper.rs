@@ -16,8 +16,11 @@ use super::kdf::{KdfPolicy, DERIVATIONS};
 use super::keys::SlotSecret;
 use super::seal::UnlockedVault;
 use super::test_alloc;
-use super::testutil::{seq, seq_array, tlv, vector_path};
-use super::{RecoveryKey, VaultError, VaultFile, VaultResult};
+use super::testutil::{seq, seq_array, tlv, unhex, vector_path};
+use super::{
+    MachineId, RecoveryKey, SlotBody, SlotId, SlotKind, SlotRecord, VaultError, VaultFile,
+    VaultHeader, VaultResult,
+};
 use crate::context::SecretString;
 
 const FAST: &KdfPolicy = &KdfPolicy::INSECURE_FAST;
@@ -310,4 +313,333 @@ fn an_authenticated_payload_that_breaks_a_rule_is_payload_invalid() {
             other => panic!("{what:?}: {:?}", other.map(|_| "opened")),
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The account-password slot (D.4b-b1; B1, B54, B77) on `os-password/vault`
+// ---------------------------------------------------------------------
+
+const ACCOUNT_PASSWORD: &str = "hunter2 is not a password";
+const MACHINE_LINUX: &[u8] = b"5f0d6a3e0c2b4f6a8d9e1b2c3d4e5f60";
+const MACHINE_MAC: &str = "3c1e9a7b2d4f4e8a9b0c1d2e3f405162";
+
+/// Byte ranges of `os-password/vault` (writer 22 bytes, store id 16; Linux's account-password
+/// slot, the Mac's, the recovery slot; labels 35, 35 and 12 bytes).
+const OS_SLOT_L: Range<usize> = 69..275;
+const OS_L_ID: Range<usize> = 71..87;
+const OS_L_KIND: usize = 87;
+const OS_L_KDF_ID: usize = 90;
+const OS_L_M_COST: Range<usize> = 91..95;
+const OS_L_T_P: Range<usize> = 95..103;
+const OS_L_SALT: Range<usize> = 103..119;
+const OS_L_ENROLLED: Range<usize> = 119..127;
+const OS_L_TAG: Range<usize> = 127..135;
+const OS_L_NONCE: Range<usize> = 135..159;
+const OS_L_CHECK: Range<usize> = 159..191;
+const OS_L_WRAPPED: Range<usize> = 191..239;
+const OS_L_LABEL: Range<usize> = 240..275;
+const OS_M_ID: Range<usize> = 277..293;
+const OS_M_KIND: usize = 293;
+const OS_M_KDF_ID: usize = 296;
+const OS_M_M_COST: Range<usize> = 297..301;
+const OS_M_T_P: Range<usize> = 301..309;
+const OS_M_SALT: Range<usize> = 309..325;
+const OS_M_ENROLLED: Range<usize> = 325..333;
+const OS_M_TAG: Range<usize> = 333..341;
+const OS_M_NONCE: Range<usize> = 341..365;
+const OS_M_CHECK: Range<usize> = 365..397;
+const OS_M_WRAPPED: Range<usize> = 397..445;
+const OS_M_LABEL: Range<usize> = 446..481;
+const OS_R_ID: Range<usize> = 483..499;
+const OS_R_KIND: usize = 499;
+const OS_R_KDF_ID: usize = 502;
+const OS_R_SALT: Range<usize> = 503..519;
+const OS_R_NONCE: Range<usize> = 519..543;
+const OS_R_CHECK: Range<usize> = 543..575;
+const OS_R_WRAPPED: Range<usize> = 575..623;
+const OS_R_LABEL: Range<usize> = 624..636;
+const OS_PAYLOAD_NONCE: Range<usize> = 636..660;
+const OS_PAYLOAD_LEN: Range<usize> = 660..664;
+const OS_PAYLOAD_CT: Range<usize> = 664..992;
+
+fn os_vector() -> Vec<u8> {
+    std::fs::read(vector_path("os-password/vault"))
+        .expect("tests/vault_vectors/v1/os-password/vault")
+}
+
+fn linux() -> MachineId {
+    MachineId::new(MACHINE_LINUX).unwrap()
+}
+
+fn mac() -> MachineId {
+    MachineId::new(&unhex(MACHINE_MAC)).unwrap()
+}
+
+fn account(machine: MachineId) -> SlotSecret {
+    SlotSecret::AccountPassword(SecretString::new(ACCOUNT_PASSWORD), machine)
+}
+
+/// The vector's payload plaintext, as its recovery key opens it.
+fn os_plaintext() -> Vec<u8> {
+    VaultFile::parse(&os_vector())
+        .unwrap()
+        .open(&recovery(), FAST)
+        .unwrap()
+        .payload()
+        .encode()
+        .unwrap()
+        .to_vec()
+}
+
+/// `header` sealed around `plain` under the vectors' data key (`40 … 5f`) and payload nonce
+/// (`e0 … f7`): a vault whose header a test changed, its payload authentic for that header.
+fn resealed(header: &VaultHeader, plain: &[u8]) -> Vec<u8> {
+    let nonce: [u8; 24] = seq_array(0xe0);
+    let mut out = header.encode_aad(&nonce, plain.len() + 16).unwrap();
+    let mut buf = plain.to_vec();
+    let key: [u8; 32] = seq_array(0x40);
+    let tag = XChaCha20Poly1305::new(Key::from_slice(&key))
+        .encrypt_in_place_detached(XNonce::from_slice(&nonce), &out, &mut buf)
+        .unwrap();
+    out.extend_from_slice(&buf);
+    out.extend_from_slice(&tag);
+    out
+}
+
+/// The same outcomes for all three secrets.
+fn all(seen: &'static [Seen]) -> [&'static [Seen]; 3] {
+    [seen; 3]
+}
+
+/// What a one-bit change at `at` of `os-password/vault` may give, opened with Linux's account
+/// password, the Mac's and the recovery key.
+fn os_allowed(at: usize) -> [&'static [Seen]; 3] {
+    use Seen::*;
+    const T: &[Seen] = &[Seen::Tampered];
+    let within = |r: &Range<usize>| r.contains(&at);
+    match at {
+        _ if within(&MAGIC) => all(&[NotAVault]),
+        _ if within(&VERSION) => all(&[Unsupported]),
+        _ if within(&FLAGS) => all(&[Malformed]),
+        // In every slot's associated data: each key check passes, each unwrap fails.
+        _ if within(&VAULT_ID) => all(&[SlotCorrupt]),
+        _ if within(&WRITER)
+            || within(&STORE_ID)
+            || within(&OS_L_LABEL)
+            || within(&OS_M_LABEL)
+            || within(&OS_R_LABEL) =>
+        {
+            all(&[Malformed, Tampered])
+        }
+        // A slot id or tag that is not this computer's for the slot: the slot is not tried.
+        _ if within(&OS_L_ID) || within(&OS_L_TAG) => [&[NoUsableSlot], T, T],
+        _ if within(&OS_M_ID) || within(&OS_M_TAG) => [T, &[NoUsableSlot], T],
+        // 0x01 / 0x02 parse strictly and refuse the length; any other kind keeps it opaque.
+        OS_L_KIND => [
+            &[Malformed, NoUsableSlot],
+            &[Malformed, Tampered],
+            &[Malformed, Tampered],
+        ],
+        OS_M_KIND => [
+            &[Malformed, Tampered],
+            &[Malformed, NoUsableSlot],
+            &[Malformed, Tampered],
+        ],
+        // Another key-derivation id: a newer layout, kept opaque (B1, newer_kind).
+        OS_L_KDF_ID => [&[NoUsableSlot], T, T],
+        OS_M_KDF_ID => [T, &[NoUsableSlot], T],
+        _ if within(&OS_L_M_COST) || within(&OS_L_T_P) => {
+            [&[WrongSecret, KdfOutOfRange, KdfTooWeak], T, T]
+        }
+        _ if within(&OS_M_M_COST) || within(&OS_M_T_P) => {
+            [T, &[WrongSecret, KdfOutOfRange, KdfTooWeak], T]
+        }
+        _ if within(&OS_L_SALT) || within(&OS_L_CHECK) => [&[WrongSecret], T, T],
+        _ if within(&OS_M_SALT) || within(&OS_M_CHECK) => [T, &[WrongSecret], T],
+        // `enrolled_at` is bound by the wrap's associated data, not by the key (B54).
+        _ if within(&OS_L_ENROLLED) || within(&OS_L_NONCE) || within(&OS_L_WRAPPED) => {
+            [&[SlotCorrupt], T, T]
+        }
+        _ if within(&OS_M_ENROLLED) || within(&OS_M_NONCE) || within(&OS_M_WRAPPED) => {
+            [T, &[SlotCorrupt], T]
+        }
+        _ if within(&OS_R_ID) => [T, T, &[SlotCorrupt]],
+        OS_R_KIND => [T, T, &[NoUsableSlot]],
+        OS_R_KDF_ID => all(&[Malformed]),
+        _ if within(&OS_R_SALT) || within(&OS_R_CHECK) => [T, T, &[WrongSecret]],
+        _ if within(&OS_R_NONCE) || within(&OS_R_WRAPPED) => [T, T, &[SlotCorrupt]],
+        _ if within(&OS_PAYLOAD_NONCE) || within(&OS_PAYLOAD_CT) => all(T),
+        _ if within(&OS_PAYLOAD_LEN) => all(&[Malformed]),
+        // Every length and count: the layout breaks.
+        _ => all(&[Malformed]),
+    }
+}
+
+#[test]
+fn every_bit_of_an_account_password_vault_flipped_is_refused_as_its_region_says() {
+    let original = os_vector();
+    assert_eq!(original.len(), OS_PAYLOAD_CT.end);
+    assert_eq!(
+        (
+            original[OS_L_KIND],
+            original[OS_M_KIND],
+            original[OS_R_KIND]
+        ),
+        (0x03, 0x03, 0x02)
+    );
+    assert_eq!(
+        &original[OS_L_LABEL],
+        b"account password of walker on box-a"
+    );
+    assert_eq!(
+        &original[OS_M_LABEL],
+        b"account password of walker on box-b"
+    );
+    assert_eq!(&original[OS_R_LABEL], b"recovery key");
+    assert_eq!(
+        &original[OS_SLOT_L.end..OS_SLOT_L.end + 2],
+        &204u16.to_le_bytes()
+    );
+    let secrets = [account(linux()), account(mac()), recovery()];
+    let file = VaultFile::parse(&original).unwrap();
+    for secret in &secrets {
+        assert!(
+            file.open(secret, FAST).is_ok(),
+            "{secret:?} opens the vector"
+        );
+    }
+    for at in 0..original.len() {
+        let allowed = os_allowed(at);
+        for bit in 0..8 {
+            let mut bytes = original.clone();
+            bytes[at] ^= 1 << bit;
+            let m_cost =
+                |r: &Range<usize>| u32::from_le_bytes(bytes[r.clone()].try_into().unwrap());
+            for (who, secret) in secrets.iter().enumerate() {
+                // A flipped high bit of a slot's m asks Argon2 for up to 2 GiB, which the
+                // policy allows: that slot's own secret skips it; the others' payload checks
+                // see every one.
+                let huge = (who == 0 && OS_L_M_COST.contains(&at) && m_cost(&OS_L_M_COST) > 4096)
+                    || (who == 1 && OS_M_M_COST.contains(&at) && m_cost(&OS_M_M_COST) > 4096);
+                if huge {
+                    continue;
+                }
+                let got = open_as(&bytes, secret, FAST);
+                assert!(
+                    allowed[who].contains(&got),
+                    "byte {at} bit {bit}, secret {who}: {got:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_truncation_of_an_account_password_vault_is_refused() {
+    let original = os_vector();
+    for len in 0..original.len() {
+        let expected = if len < MAGIC.end {
+            Seen::NotAVault
+        } else {
+            Seen::Malformed
+        };
+        assert_eq!(
+            open_as(&original[..len], &recovery(), FAST),
+            expected,
+            "length {len}"
+        );
+    }
+}
+
+/// B1: a `0x03` body this build cannot read — 148 or 150 bytes, another key-derivation id — and
+/// an unread `0x04` body are kept byte for byte, never tried, and refuse only their slot: the
+/// other computer's slot and the recovery key open the vault.
+#[test]
+fn an_unread_body_is_kept_and_refuses_only_its_slot() {
+    let original = os_vector();
+    let file = VaultFile::parse(&original).unwrap();
+    let plain = os_plaintext();
+    let mut other_kdf = original[OS_L_KDF_ID..OS_L_WRAPPED.end].to_vec();
+    other_kdf[0] = 0x02;
+    let hello = SlotRecord {
+        id: SlotId([0x44; 16]),
+        kind: SlotKind::WindowsHello,
+        body: SlotBody::Opaque(seq(0x01, 193)),
+        label: "Windows Hello on BOX-C".into(),
+    };
+    for body in [seq(0x01, 148), seq(0x01, 150), other_kdf] {
+        let mut header = file.header().clone();
+        header.slots[0].body = SlotBody::Opaque(body.clone());
+        header.slots.push(hello.clone());
+        let bytes = resealed(&header, &plain);
+        let parsed = VaultFile::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.header().slots[0].body,
+            SlotBody::Opaque(body),
+            "kept as read"
+        );
+        assert_eq!(parsed.header().slots[3], hello);
+        assert_eq!(
+            parsed.to_bytes().unwrap(),
+            bytes,
+            "written back byte for byte"
+        );
+        let derived = DERIVATIONS.with(std::cell::Cell::get);
+        assert_eq!(
+            seen(parsed.open(&account(linux()), FAST)),
+            Seen::NoUsableSlot
+        );
+        assert_eq!(
+            DERIVATIONS.with(std::cell::Cell::get),
+            derived,
+            "an unread body is never tried"
+        );
+        assert!(
+            parsed.open(&account(mac()), FAST).is_ok(),
+            "the other computer's opens"
+        );
+        assert!(
+            parsed.open(&recovery(), FAST).is_ok(),
+            "the recovery key opens"
+        );
+    }
+}
+
+/// A slot is bound to its vault: created-with's account-password slot (the same password, salt
+/// and machine) moved into os-password passes its key check and does not unwrap.
+#[test]
+fn an_account_password_slot_is_bound_to_its_vault() {
+    let os = os_vector();
+    let cw = std::fs::read(vector_path("created-with/vault")).unwrap();
+    let moved_slot = &cw[OS_SLOT_L];
+    assert_eq!(moved_slot[OS_L_KIND - OS_SLOT_L.start], 0x03);
+    let mut moved = os.clone();
+    moved[OS_SLOT_L].copy_from_slice(moved_slot);
+    let derived = DERIVATIONS.with(std::cell::Cell::get);
+    assert_eq!(open_as(&moved, &account(linux()), FAST), Seen::SlotCorrupt);
+    assert_eq!(
+        DERIVATIONS.with(std::cell::Cell::get),
+        derived + 1,
+        "its key check passed"
+    );
+    assert_eq!(open_as(&moved, &account(mac()), FAST), Seen::Tampered);
+    assert_eq!(open_as(&moved, &recovery(), FAST), Seen::Tampered);
+}
+
+/// B54: the right account password with another machine id fails the key check — a copy whose
+/// tag is rewritten for a guessed machine id tests no guess of the password.
+#[test]
+fn the_right_password_without_this_machine_id_fails_the_key_check() {
+    let file = VaultFile::parse(&os_vector()).unwrap();
+    let guess = MachineId::new(&[0x77; 16]).unwrap();
+    let mut header = file.header().clone();
+    let id = header.slots[0].id;
+    if let SlotBody::OsPassword {
+        machine_tag: tag, ..
+    } = &mut header.slots[0].body
+    {
+        *tag = super::kdf::machine_tag(&id, &guess);
+    }
+    let bytes = resealed(&header, &os_plaintext());
+    assert_eq!(open_as(&bytes, &account(guess), FAST), Seen::WrongSecret);
 }

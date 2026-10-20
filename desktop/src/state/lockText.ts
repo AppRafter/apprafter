@@ -51,6 +51,8 @@ export function protectSub(mode: SecretsMode): string {
       return 'Secrets are encrypted; unlocking opens them.';
     case 'unlocking':
       return 'Stopping protection was interrupted. Finish it to put the remaining secrets back in files.';
+    case 'rotating':
+      return 'Changing the keys was interrupted. Finish it to re-encrypt the remaining secrets.';
   }
 }
 
@@ -61,6 +63,8 @@ export const PROTECT_ACTIONS: Record<SecretsMode, readonly ProtectAction[]> = {
   locking: ['finish', 'stop'],
   locked: ['stop'],
   unlocking: ['finish'],
+  // D.4b: Finish and Stop protecting from an unfinished key change are d4b-g3b's.
+  rotating: [],
 };
 export const ACTION_LABELS: Record<ProtectAction, string> = {
   protect: 'Protect…',
@@ -103,6 +107,9 @@ export const SLOT_NAMES: Record<LockSlotKind, string> = {
 export const SLOT_REFUSALS: Record<SlotRefusalView, string> = {
   kdf_too_weak: 'refused by this build: its key derivation is weaker than a release accepts',
   kdf_out_of_range: 'refused by this build: its key derivation parameters are out of range',
+  gesture_not_here: 'opens only on the computer that made it, or not on this system',
+  newer_kind: 'made by a newer AppRafter: this one cannot open it',
+  second_of_kind: 'a second one of its kind, never tried: the vault header was damaged or forged',
 };
 export const SLOTS_LATER = 'Changing them comes in a later version.';
 
@@ -490,6 +497,8 @@ export function lockFooter(mode: SecretsMode, problem: boolean): string {
       return 'Clusters keep running. Protecting secrets was interrupted: some credentials may still be in files.';
     case 'unlocking':
       return 'Clusters keep running. Putting secrets back in files was interrupted: some credentials may be in files again.';
+    case 'rotating':
+      return 'Clusters keep running. Changing the keys was interrupted: credentials stay encrypted, and are not used until it finishes.';
   }
 }
 /**
@@ -569,6 +578,8 @@ export function secretsWord(mode: SecretsMode, problem: StoreProblem | null): st
       return 'protected';
     case 'unlocking':
       return 'stopping protection was interrupted';
+    case 'rotating':
+      return 'changing the keys was interrupted';
   }
 }
 
@@ -610,7 +621,7 @@ export function securityRowSub(
   if (problem !== null) {
     return "This target store's lock state cannot be used: the Security page says why.";
   }
-  if (mode === 'locking' || mode === 'unlocking') {
+  if (mode === 'locking' || mode === 'unlocking' || mode === 'rotating') {
     return "Changing this target store's protection was interrupted: the Security page offers to finish it.";
   }
   if (pinned) {

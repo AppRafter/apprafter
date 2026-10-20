@@ -25,5 +25,7 @@ export function secretCopy(os: Os, mode: SecretsMode, problem: StoreProblem | nu
       return "Being moved into this target store's vault: protecting was interrupted";
     case 'unlocking':
       return 'Being moved back to a file: stopping protection was interrupted';
+    case 'rotating':
+      return "Encrypted in this target store's vault: changing its keys was interrupted";
   }
 }

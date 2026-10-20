@@ -25,7 +25,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use apprafter_core::lock::{self, OpenedVault};
+use apprafter_core::lock::{self, OpenedVault, SlotFacts};
 use apprafter_core::secrets::{KeySession, StoreId, VaultAccess, VaultRequest, VaultSession};
 use apprafter_core::vault::{KdfPolicy, SlotInput};
 use apprafter_core::{CoreError, SecretString, Zeroizing};
@@ -53,6 +53,14 @@ pub(crate) fn process() -> Arc<CliVaultAccess> {
     PROCESS
         .get_or_init(|| Arc::new(CliVaultAccess::new(Box::new(Terminal), KdfPolicy::active())))
         .clone()
+}
+
+/// What this computer tells the lock (D.4b B30): the os-slots glue's facts
+/// (`crate::os_slots`) — this computer's machine id among them, so typed text also tries its
+/// account-password slot (B27) — every one unknown where APPRAFTER_SANDBOX's fence refuses the
+/// account (B82).
+pub(crate) fn slot_facts() -> Arc<dyn SlotFacts> {
+    crate::os_slots::process()
 }
 
 /// The command this process runs, as its prompt names it (`run()` records its clap path).
@@ -107,9 +115,15 @@ pub(crate) fn ask_and_open(
     if !intro.is_empty() {
         asker.tell(intro).map_err(&refused)?;
     }
+    let machine = slot_facts().machine_id().id().cloned();
     for _ in 0..ATTEMPTS {
         let input = asker.ask(prompt).map_err(&refused)?;
-        match lock::open_at(root, id, SlotInput::from_input(input), policy) {
+        match lock::open_at(
+            root,
+            id,
+            SlotInput::from_input(input, machine.clone()),
+            policy,
+        ) {
             Ok(opened) => return Ok(opened),
             Err(CoreError::Cli(CliError::UnlockFailed { .. })) => {
                 asker.tell(WRONG_SECRET).map_err(&refused)?

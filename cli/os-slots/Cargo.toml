@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "apprafter-os-slots"
+description = "The OS side of the target-store lock's everyday slots: the account-password check (PAM, loaded at run time), this computer's machine id, the back-off across runs, and the fence through which alone a real backend is made (D.4b, ADR 0069)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+# A leaf: nothing of AppRafter's, so the CLI and the desktop both link it and apprafter-core
+# never names it (ADR 0067 §2; D.4b B9).
+[features]
+# ScriptedAccountPassword (B15). Dev-dependency edges only, and no feature of this crate pulls
+# it in: apprafter-core/tests/guards.rs (G-OS2) fails otherwise.
+test-support = []
+
+[dependencies]
+# The password a check is given and the machine id, wiped when dropped.
+zeroize = "1.9"
+
+[target.'cfg(unix)'.dependencies]
+# dlopen / dlsym of libpam (never a link: B10), getpwuid_r, gethostname; on macOS gethostuuid
+# and confstr.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

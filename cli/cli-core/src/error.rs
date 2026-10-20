@@ -396,21 +396,32 @@ fn refetch(secret: &crate::secrets::CachedSecret, target: &str) -> String {
     }
 }
 
-/// `CacheUndecryptable`'s message: the shared key's file, or the store's own key in its vault.
+/// `CacheUndecryptable`'s message: the shared key's file, or the store's own key in its vault
+/// — and, for a cache whose record names a store key a key change of this store retired
+/// (D.4b B86), that key change, said as the record's: the record is no proof (critic
+/// round, finding 3).
 fn cache_undecryptable_message(
     secret: &crate::secrets::CachedSecret,
     target: &str,
     path: &str,
     detail: &str,
     key: crate::secrets::CacheKeyKind,
+    reason: crate::secrets::UndecryptableWhy,
 ) -> String {
-    match key {
-        crate::secrets::CacheKeyKind::SharedFile => format!(
+    use crate::secrets::{CacheKeyKind, UndecryptableWhy};
+    match (key, reason) {
+        (CacheKeyKind::StoreVault, UndecryptableWhy::RetiredKey) => format!(
+            "the {} cached for target `{target}` is recorded as sealed to the store key of an \
+             earlier key change, which that change retired: this target store's own key, in \
+             its vault {path}, does not decrypt it",
+            secret.noun()
+        ),
+        (CacheKeyKind::SharedFile, _) => format!(
             "the {} cached for target `{target}` cannot be decrypted with the age key at {path}: \
              {detail}",
             secret.noun()
         ),
-        crate::secrets::CacheKeyKind::StoreVault => format!(
+        (CacheKeyKind::StoreVault, _) => format!(
             "the {} cached for target `{target}` cannot be decrypted with this target store's \
              own key, in its vault {path}: {detail}",
             secret.noun()
@@ -420,21 +431,30 @@ fn cache_undecryptable_message(
 
 /// `CacheUndecryptable`'s help: the key it was cached under, or the command that fetches it
 /// again under the key there is now, for `target`, whichever target is active. On a locked
-/// store the store's own key is the only one, so only the fetch (D.4a T38; ADR 0068 §6).
+/// store the store's own key is the only one, so only the fetch (D.4a T38; ADR 0068 §6) —
+/// after the key change that retired the key it was sealed to, when that is why (B86).
 fn cache_undecryptable_help(
     secret: &crate::secrets::CachedSecret,
     target: &str,
     key: crate::secrets::CacheKeyKind,
+    reason: crate::secrets::UndecryptableWhy,
 ) -> String {
+    use crate::secrets::{CacheKeyKind, UndecryptableWhy};
     let refetch = refetch(secret, target);
-    match key {
-        crate::secrets::CacheKeyKind::SharedFile => format!(
+    match (key, reason) {
+        (CacheKeyKind::StoreVault, UndecryptableWhy::RetiredKey) => format!(
+            "A key change (`apprafter lock rekey` or `apprafter lock recovery`) replaced this \
+             target store's own key, and this copy's record names the key it replaced: it was \
+             cached before that change, or restored from a copy made before it — or the copy \
+             is damaged. {refetch} and caches it under the store's key."
+        ),
+        (CacheKeyKind::SharedFile, _) => format!(
             "It was cached under a different age key (one that was lost and replaced), or the \
              cached copy is damaged. If you still have the key it was cached under, set \
              `APPRAFTER_AGE_KEY` to it. Otherwise {refetch} and caches it under the key at that \
              path."
         ),
-        crate::secrets::CacheKeyKind::StoreVault => format!(
+        (CacheKeyKind::StoreVault, _) => format!(
             "It was not encrypted to this target store's own key — an older AppRafter wrote it \
              under the shared age key, or another program did — or the copy is damaged. \
              {refetch} and caches it under the store's key."
@@ -472,6 +492,8 @@ pub enum SecretsModeKind {
     Locking,
     Locked,
     Unlocking,
+    /// A key change did not finish (D.4b B63).
+    Rotating,
 }
 
 impl SecretsModeKind {
@@ -482,6 +504,7 @@ impl SecretsModeKind {
             SecretsModeKind::Locking => "locking",
             SecretsModeKind::Locked => "locked",
             SecretsModeKind::Unlocking => "unlocking",
+            SecretsModeKind::Rotating => "rotating",
         }
     }
 }
@@ -493,6 +516,9 @@ pub enum LockPhase {
     Locking,
     /// `secrets: unlocking`: an earlier `lock off` did not finish.
     Unlocking,
+    /// `secrets: rotating`: an earlier `lock rekey` or `lock recovery` did not finish (D.4b
+    /// B63).
+    Rotating,
 }
 
 impl LockPhase {
@@ -501,6 +527,7 @@ impl LockPhase {
         match self {
             LockPhase::Locking => "locking",
             LockPhase::Unlocking => "unlocking",
+            LockPhase::Rotating => "rotating",
         }
     }
 
@@ -509,6 +536,36 @@ impl LockPhase {
         match self {
             LockPhase::Locking => "lock on",
             LockPhase::Unlocking => "lock off",
+            LockPhase::Rotating => "lock rekey` or `lock recovery",
+        }
+    }
+}
+
+/// Where a key change that stopped on an error left its store (D.4b B84 b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyChangeLeft {
+    /// Nothing that stays was written: the store opens as before, and a recovery key shown
+    /// in the run is not valid.
+    NotWritten,
+    /// The new keys are written: the store reads as an unfinished key change, which `lock
+    /// rekey` or `lock recovery` finishes; a recovery key shown in the run opens it now.
+    Unfinished,
+    /// Not written, and `store.yaml` could not be put back: the store may read as an
+    /// unfinished key change, which the same commands finish with its earlier secrets.
+    BackOutFailed,
+    /// Whether the new vault was written could not be told, and the old one could not be
+    /// put back (critic round, finding 3): keep every secret of the store, earlier and new.
+    Unknown,
+}
+
+impl KeyChangeLeft {
+    /// Its name on the wire (`fields.left`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyChangeLeft::NotWritten => "not_written",
+            KeyChangeLeft::Unfinished => "unfinished",
+            KeyChangeLeft::BackOutFailed => "back_out_failed",
+            KeyChangeLeft::Unknown => "unknown",
         }
     }
 }
@@ -640,6 +697,12 @@ pub enum SlotRefusal {
     /// Removing it would leave no slot this build's policy can open (T63's second rule, c1's
     /// `NoUsableSlotLeft`).
     NoUsableSlotLeft,
+    /// A second lock password (D.4b B18): a store has at most one; `lock rekey` changes it.
+    AlreadyHasPassword,
+    /// An account-password slot where there is none: Windows (S3: Linux and macOS only).
+    NotOnThisOs,
+    /// A vault already holding 16 slots, the most its format allows.
+    SlotsFull,
 }
 
 impl SlotRefusal {
@@ -651,6 +714,105 @@ impl SlotRefusal {
             SlotRefusal::NoUsableSlot => "no_usable_slot",
             SlotRefusal::LastRecoverySlot => "last_recovery_slot",
             SlotRefusal::NoUsableSlotLeft => "no_usable_slot_left",
+            SlotRefusal::AlreadyHasPassword => "already_has_password",
+            SlotRefusal::NotOnThisOs => "not_on_this_os",
+            SlotRefusal::SlotsFull => "slots_full",
+        }
+    }
+}
+
+/// Why the account password was not taken for a slot (D.4b B29, B74, B75, B88). Nothing was
+/// written in any case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountPasswordRefusal {
+    /// The system checked it and refused it: a wrong password, or a locked account.
+    Wrong,
+    /// The system answered without checking what was typed — a fingerprint reader, a module
+    /// that lets everyone in, a second prompt (B11). d4b-d counts it toward the back-off when
+    /// PAM reported a failure (a second prompt refused), not when PAM let it pass (F1).
+    NotChecked,
+    /// The account has no password the system can check (B75).
+    NoPassword,
+    /// This computer cannot check it, or cannot bind a slot to itself.
+    Unavailable { what: AccountCheckUnavailable },
+    /// A check failed recently and the back-off across runs holds the next one back for
+    /// `wait_secs` seconds; `None`: another AppRafter process is checking now (B12, B74).
+    Backoff { wait_secs: Option<u64> },
+    /// One a prompt could never read as a password (O2's rules, d4b-b1).
+    Unusable { why: AccountPasswordUnusable },
+}
+
+impl AccountPasswordRefusal {
+    /// Its name on the wire (`fields.reason`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccountPasswordRefusal::Wrong => "wrong",
+            AccountPasswordRefusal::NotChecked => "not_checked",
+            AccountPasswordRefusal::NoPassword => "no_password",
+            AccountPasswordRefusal::Unavailable { .. } => "unavailable",
+            AccountPasswordRefusal::Backoff { .. } => "backoff",
+            AccountPasswordRefusal::Unusable { .. } => "unusable",
+        }
+    }
+}
+
+/// Why this computer cannot check the account password, or cannot bind a slot to itself
+/// (B88's reasons, and d4b-d's outcome table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCheckUnavailable {
+    NoLibpam,
+    NoService,
+    NoCheckRoute,
+    NoAccount,
+    /// Linux: AppRafter runs with no_new_privs, under which the system may refuse even the
+    /// right password (WI-545).
+    NoNewPrivs,
+    NoMachineId,
+    NoBackoffRecord,
+    /// The system's check failed with `name` (its PAM constant, `PAM_SYSTEM_ERR`), giving
+    /// no verdict: d4b-d's `CheckOutcome::SystemError`. Its wire name is `system_error`,
+    /// never a string literal `pam_…`, which d4b-d's G-OS4 refuses outside the OS crates
+    /// (critic round, finding 1).
+    SystemError {
+        name: String,
+    },
+}
+
+impl AccountCheckUnavailable {
+    /// Its name on the wire (`fields.unavailable`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccountCheckUnavailable::NoLibpam => "no_libpam",
+            AccountCheckUnavailable::NoService => "no_service",
+            AccountCheckUnavailable::NoCheckRoute => "no_check_route",
+            AccountCheckUnavailable::NoAccount => "no_account",
+            AccountCheckUnavailable::NoNewPrivs => "no_new_privs",
+            AccountCheckUnavailable::NoMachineId => "no_machine_id",
+            AccountCheckUnavailable::NoBackoffRecord => "no_backoff_record",
+            AccountCheckUnavailable::SystemError { .. } => "system_error",
+        }
+    }
+}
+
+/// An account password a prompt could never read as one (O2's rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountPasswordUnusable {
+    TooLong {
+        max: usize,
+    },
+    RecoveryKeyShape,
+    /// It holds a NUL character, which no system check takes: d4b-d's
+    /// `InputRefused::ContainsNul`, refused before PAM (critic round, finding 9).
+    ContainsNul,
+}
+
+impl AccountPasswordUnusable {
+    /// Its name on the wire (`fields.why`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountPasswordUnusable::TooLong { .. } => "too_long",
+            AccountPasswordUnusable::RecoveryKeyShape => "recovery_key_shape",
+            AccountPasswordUnusable::ContainsNul => "contains_nul",
         }
     }
 }
@@ -908,15 +1070,75 @@ pub fn vault_unreadable_help(path: &Path, problem: &VaultProblem) -> String {
 
 fn lock_incomplete_help(phase: LockPhase) -> String {
     match phase {
-        LockPhase::Locking => "Run `apprafter lock on` again: it asks for the lock password \
-             and the recovery key and finishes. Without one of them, `apprafter lock off` backs \
-             out of it with the other, and a new `apprafter lock on` makes a new recovery key. \
-             Until then commands that need the store's secrets refuse, because some may be only \
-             in the vault."
+        // D.4b-e1a: the everyday secret is the lock password or, by default, the account
+        // password; and a run this AppRafter cannot finish (d4b-c3's Deviation 10) has one way
+        // out, `lock off` with the recovery key.
+        LockPhase::Locking => "Run `apprafter lock on` again: it asks for the store's everyday \
+             secret — its lock password or your account password — and the recovery key, and \
+             finishes. Without one of them, `apprafter lock off` backs out of it with the other; \
+             where `apprafter lock on` says this AppRafter cannot finish the run, `apprafter lock \
+             off` backs it out with the recovery key. A new `apprafter lock on` then makes a new \
+             recovery key. Until then commands that need the store's secrets refuse, because some \
+             may be only in the vault."
             .to_string(),
         LockPhase::Unlocking => "Run `apprafter lock off` again: it asks for the lock password \
              or the recovery key and finishes. Until then commands that need the store's \
              secrets refuse, because some may be only in the vault."
+            .to_string(),
+        LockPhase::Rotating => "Run `apprafter lock rekey` or `apprafter lock recovery` again: \
+             either asks for one of the store's secrets and finishes the key change: an earlier \
+             one if its new vault was not written yet, else a new one or a way in it kept. \
+             `apprafter lock off` returns the secrets to files instead. Until then commands that \
+             need the store's secrets refuse, because some may be sealed to the new store key and \
+             some to the old one."
+            .to_string(),
+    }
+}
+
+fn key_change_stopped_message(store: &Path, left: KeyChangeLeft, cause: &str) -> String {
+    let s = store.display();
+    match left {
+        KeyChangeLeft::NotWritten => format!(
+            "{cause}: the key change of the target store at {s} was not written — it opens as \
+             before, with its earlier secrets, and a recovery key shown in this run is not valid"
+        ),
+        KeyChangeLeft::Unfinished => format!(
+            "{cause}: the key change of the target store at {s} did not finish — its new keys \
+             are written: a recovery key shown in this run opens it now, and the one it \
+             replaced no longer does"
+        ),
+        KeyChangeLeft::BackOutFailed => format!(
+            "{cause}: the key change of the target store at {s} was not written, and its lock \
+             state could not be put back — it may read as an interrupted key change"
+        ),
+        KeyChangeLeft::Unknown => format!(
+            "{cause}: the key change of the target store at {s} stopped, and whether its new \
+             vault was written could not be told — it reads as an interrupted key change"
+        ),
+    }
+}
+
+fn key_change_stopped_help(left: KeyChangeLeft) -> String {
+    match left {
+        KeyChangeLeft::NotWritten => "Keep your current recovery key. Fix what failed, then run \
+             the command again."
+            .to_string(),
+        KeyChangeLeft::Unfinished => "Keep the recovery key shown in this run: the store opens \
+             with it now, or with a way in the key change kept. Run `apprafter lock rekey` or \
+             `apprafter lock recovery` again with one of those secrets to finish it, or \
+             `apprafter lock off` to return the secrets to files. Until then commands that need \
+             the store's secrets refuse."
+            .to_string(),
+        KeyChangeLeft::BackOutFailed => "Run `apprafter lock rekey` or `apprafter lock recovery` \
+             again with one of the store's earlier secrets: it finds the key change not written \
+             and puts the store back as it was. `apprafter lock off` returns the secrets to \
+             files instead. Until then commands that need the store's secrets refuse."
+            .to_string(),
+        KeyChangeLeft::Unknown => "Keep both your current recovery key and any recovery key shown \
+             in this run, and every other secret of the store. Run `apprafter lock rekey` or \
+             `apprafter lock recovery` again with one of them, earlier or new: it opens the vault \
+             on disk and finishes the key change or puts it back. `apprafter lock off` returns the \
+             secrets to files instead. Until then commands that need the store's secrets refuse."
             .to_string(),
     }
 }
@@ -942,26 +1164,167 @@ fn slot_refused_message(store: &Path, reason: SlotRefusal) -> String {
             "removing that slot would leave the target store at {s} with no slot this \
              AppRafter can open"
         ),
+        SlotRefusal::AlreadyHasPassword => {
+            format!("the target store at {s} has a lock password already")
+        }
+        SlotRefusal::NotOnThisOs => format!(
+            "an account-password slot opens a target store only on Linux and macOS, and this \
+             computer runs Windows (the target store at {s})"
+        ),
+        SlotRefusal::SlotsFull => format!(
+            "the vault of the target store at {s} holds 16 ways to open it, the most a vault may"
+        ),
     }
 }
 
 fn slot_refused_help(reason: SlotRefusal) -> String {
     match reason {
-        SlotRefusal::KdfTooWeak | SlotRefusal::KdfOutOfRange => "Open the store with its \
-             recovery key (every prompt takes it), then run `apprafter lock off` and \
-             `apprafter lock on`, which sets a new lock password."
+        // D.4b B24 (T22): `lock rekey` asks for one of the store's secrets first — the
+        // recovery key opens the store — and sets a new lock password under this build's
+        // settings.
+        SlotRefusal::KdfTooWeak | SlotRefusal::KdfOutOfRange => "Run `apprafter lock rekey` \
+             and give the recovery key when it asks; it sets a new lock password."
             .to_string(),
-        SlotRefusal::NoUsableSlot => {
-            "Its slots were made by a newer AppRafter: upgrade AppRafter, or use the recovery \
-             key."
-                .to_string()
-        }
-        SlotRefusal::LastRecoverySlot => "A locked store always keeps a recovery key: add the \
-             new one before removing the old one."
+        // B29, with the account-password slot's binding to its computer (B54).
+        SlotRefusal::NoUsableSlot => "This AppRafter cannot open this store's other slots \
+             here: a Windows Hello slot opens only on the computer that made it, an \
+             account-password slot only on Linux and macOS and on the computer that made it, a \
+             slot of a newer AppRafter only after an upgrade. Use the lock password or the \
+             recovery key."
+            .to_string(),
+        SlotRefusal::LastRecoverySlot => "A locked store always keeps its recovery key: \
+             `apprafter lock recovery` replaces it with a new one."
             .to_string(),
         SlotRefusal::NoUsableSlotLeft => "A locked store always keeps a slot this AppRafter \
              opens: add one before removing this one."
             .to_string(),
+        SlotRefusal::AlreadyHasPassword => "A store has at most one lock password: `apprafter \
+             lock rekey` changes it."
+            .to_string(),
+        SlotRefusal::NotOnThisOs => "On Windows, add a separate lock password instead: \
+             `apprafter lock slot add password`."
+            .to_string(),
+        SlotRefusal::SlotsFull => "Remove a way to open it that it no longer needs first: \
+             `apprafter lock slot list` shows them with their ids, and `apprafter lock slot \
+             remove <id>` removes one."
+            .to_string(),
+    }
+}
+
+/// `slot_not_found`'s message: no slot, or the slots `given` could mean, by their short ids.
+fn slot_not_found_message(store: &Path, given: &str, matches: &[String]) -> String {
+    let s = store.display();
+    if matches.is_empty() {
+        return format!("the target store at {s} has no slot `{given}`");
+    }
+    let shown: Vec<&str> = matches.iter().map(|m| m.get(..8).unwrap_or(m)).collect();
+    format!(
+        "`{given}` could mean more than one slot of the target store at {s}: {}",
+        shown.join(", ")
+    )
+}
+
+/// `account_password_refused`'s message, then the system's own words when it gave any.
+fn account_password_refused_message(
+    reason: &AccountPasswordRefusal,
+    messages: &[String],
+) -> String {
+    let base = match reason {
+        AccountPasswordRefusal::Wrong => {
+            "the system did not accept that account password".to_string()
+        }
+        AccountPasswordRefusal::NotChecked => {
+            "the system did not check the password that was typed: a \
+             fingerprint reader, another sign-in module or a second question took its place"
+                .to_string()
+        }
+        AccountPasswordRefusal::NoPassword => {
+            "this account has no password the system can check".to_string()
+        }
+        AccountPasswordRefusal::Unavailable { what } => match what {
+            AccountCheckUnavailable::NoLibpam => {
+                "this computer cannot check your account password: libpam is not installed"
+                    .to_string()
+            }
+            AccountCheckUnavailable::NoService => "this computer cannot check your account \
+                 password: none of the sign-in services AppRafter uses (common-auth, \
+                 system-auth, login) is set up"
+                .to_string(),
+            AccountCheckUnavailable::NoCheckRoute => "this computer cannot check your account \
+                 password: the system offers no check that sees what was typed"
+                .to_string(),
+            AccountCheckUnavailable::NoAccount => "this computer cannot check your account \
+                 password: the user running AppRafter has no account entry"
+                .to_string(),
+            AccountCheckUnavailable::NoNewPrivs => "AppRafter cannot check your account \
+                 password safely while it runs with no_new_privs (a sandbox such as Flatpak or \
+                 bubblewrap, or a service started with NoNewPrivileges=): the system may refuse \
+                 even the right password and count it as a failed login"
+                .to_string(),
+            AccountCheckUnavailable::NoMachineId => "this computer's machine id cannot be \
+                 read, and an account-password slot is bound to it"
+                .to_string(),
+            AccountCheckUnavailable::NoBackoffRecord => "this computer cannot check your \
+                 account password safely: there is no place for the record of failed checks \
+                 (the per-user runtime folder is missing)"
+                .to_string(),
+            AccountCheckUnavailable::SystemError { name } => {
+                format!("the system's password check failed ({name}) without a verdict")
+            }
+        },
+        AccountPasswordRefusal::Backoff {
+            wait_secs: Some(secs),
+        } => format!(
+            "an account-password check failed recently: the next is allowed in {} min",
+            secs.div_ceil(60)
+        ),
+        AccountPasswordRefusal::Backoff { wait_secs: None } => {
+            "another AppRafter process is checking an account password right now".to_string()
+        }
+        AccountPasswordRefusal::Unusable { why } => match why {
+            AccountPasswordUnusable::TooLong { max } => {
+                format!("that account password is longer than {max} bytes, which no slot holds")
+            }
+            AccountPasswordUnusable::RecoveryKeyShape => "that account password has the shape \
+                 of a recovery key, and a prompt reads such text as a recovery key"
+                .to_string(),
+            AccountPasswordUnusable::ContainsNul => "that account password holds a NUL \
+                 character, which the system's password check cannot take"
+                .to_string(),
+        },
+    };
+    if messages.is_empty() {
+        base
+    } else {
+        format!("{base}; the system said: {}", messages.join("; "))
+    }
+}
+
+/// The way out every account-password refusal shares: a separate lock password, which only
+/// AppRafter's prompt sees.
+const LOCK_PASSWORD_INSTEAD: &str = "a separate lock password: `apprafter lock on \
+     --lock-password` for a new lock, `apprafter lock slot add password` on a locked store";
+
+fn account_password_refused_help(reason: &AccountPasswordRefusal) -> String {
+    match reason {
+        AccountPasswordRefusal::Wrong => format!(
+            "Nothing was written. A failed check may count as a failed login on systems that \
+             lock accounts after failures, so AppRafter waits before it checks again: run the \
+             command again later, or use {LOCK_PASSWORD_INSTEAD}. If this account has no \
+             usable password — a locked one, a key-only login — use a lock password."
+        ),
+        AccountPasswordRefusal::NotChecked => format!(
+            "Nothing was written. Type the password when the system asks for it — not a \
+             fingerprint — or use {LOCK_PASSWORD_INSTEAD}."
+        ),
+        AccountPasswordRefusal::Backoff { .. } => format!(
+            "AppRafter spaces out account-password checks after a failed one, so that typos \
+             cannot lock your account: run the command again then, or use \
+             {LOCK_PASSWORD_INSTEAD}."
+        ),
+        AccountPasswordRefusal::NoPassword
+        | AccountPasswordRefusal::Unavailable { .. }
+        | AccountPasswordRefusal::Unusable { .. } => format!("Use {LOCK_PASSWORD_INSTEAD}."),
     }
 }
 
@@ -1536,10 +1899,10 @@ pub enum CliError {
     /// or the ciphertext is damaged. `detail` is the age library's own account; `key` says which
     /// key (the shared file at `path`, or the store's own, in its vault at `path`) and `reason`
     /// which failure (D.4a §3.12).
-    #[error("{}", cache_undecryptable_message(secret, target, path, detail, *key))]
+    #[error("{}", cache_undecryptable_message(secret, target, path, detail, *key, *reason))]
     #[diagnostic(
         code(apprafter::secrets::cache_undecryptable),
-        help("{}", cache_undecryptable_help(secret, target, *key))
+        help("{}", cache_undecryptable_help(secret, target, *key, *reason))
     )]
     CacheUndecryptable {
         secret: crate::secrets::CachedSecret,
@@ -1740,6 +2103,20 @@ pub enum CliError {
     )]
     LockIncomplete { store: PathBuf, phase: LockPhase },
 
+    /// A key change that stopped on an error (D.4b B84 b): what failed, and where it left
+    /// the store — put back as it was while its new vault was not yet durable, else an
+    /// unfinished key change for `lock rekey` / `lock recovery` to finish.
+    #[error("{}", key_change_stopped_message(store, *left, cause))]
+    #[diagnostic(
+        code(apprafter::secrets::key_change_stopped),
+        help("{}", key_change_stopped_help(*left))
+    )]
+    KeyChangeStopped {
+        store: PathBuf,
+        left: KeyChangeLeft,
+        cause: String,
+    },
+
     /// A slot refused before any key was derived (D.4a T22, T63).
     #[error("{}", slot_refused_message(store, *reason))]
     #[diagnostic(
@@ -1747,6 +2124,36 @@ pub enum CliError {
         help("{}", slot_refused_help(*reason))
     )]
     SlotRefused { store: PathBuf, reason: SlotRefusal },
+
+    /// `lock slot remove`'s slot matches no slot of the store, or more than one (D.4b B21,
+    /// B29): `matches` are the ids of the slots it could mean, empty for none. Nothing was
+    /// written.
+    #[error("{}", slot_not_found_message(store, given, matches))]
+    #[diagnostic(
+        code(apprafter::secrets::slot_not_found),
+        help(
+            "`apprafter lock slot list` shows each slot's id: give 4 or more of its characters, \
+             or a kind the store has exactly one slot of (`password`, `os-password`)."
+        )
+    )]
+    SlotNotFound {
+        store: PathBuf,
+        given: String,
+        matches: Vec<String>,
+    },
+
+    /// The account password was not taken for a slot (D.4b B29, B74, B75, B88); `messages`
+    /// are the system's own words, when it gave any (a locked account says why). Nothing was
+    /// written.
+    #[error("{}", account_password_refused_message(reason, messages))]
+    #[diagnostic(
+        code(apprafter::secrets::account_password_refused),
+        help("{}", account_password_refused_help(reason))
+    )]
+    AccountPasswordRefused {
+        reason: AccountPasswordRefusal,
+        messages: Vec<String>,
+    },
 
     /// A plaintext cached secret in a locked store's state (D.4a T38): an older AppRafter's
     /// write, or a forgery; never used, never sealed later.
@@ -3035,6 +3442,47 @@ mod tests {
         assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
     }
 
+    /// D.4b B86: a cache whose record names a store key a key change of this store retired
+    /// says so — what the record says, that the copy may be damaged (critic round, finding 3),
+    /// and the refresh — and its reason reads `retired_key` on the wire.
+    #[test]
+    fn a_cache_sealed_to_a_retired_store_key_names_the_key_change_and_the_refresh() {
+        use crate::secrets::{CacheKeyKind, CachedSecret, UndecryptableWhy};
+        let err = CliError::CacheUndecryptable {
+            secret: CachedSecret::Kubeconfig,
+            target: "prod".into(),
+            path: "/s/vault".into(),
+            detail: "age decrypt: No matching keys found".into(),
+            key: CacheKeyKind::StoreVault,
+            reason: UndecryptableWhy::RetiredKey,
+        };
+        assert_eq!(code_of(&err), "apprafter::secrets::cache_undecryptable");
+        assert_eq!(
+            err.to_string(),
+            "the kubeconfig cached for target `prod` is recorded as sealed to the store key of \
+             an earlier key change, which that change retired: this target store's own key, \
+             in its vault /s/vault, does not decrypt it"
+        );
+        let help = help_of(&err);
+        assert!(
+            help.starts_with(
+                "A key change (`apprafter lock rekey` or `apprafter lock recovery`) replaced \
+                 this target store's own key"
+            ),
+            "{help}"
+        );
+        assert!(help.contains("— or the copy is damaged."), "{help}");
+        assert!(
+            help.ends_with(
+                "`apprafter kubeconfig --refresh --target prod` fetches it from the node again \
+                 and caches it under the store's key."
+            ),
+            "{help}"
+        );
+        assert!(!help.contains("APPRAFTER_AGE_KEY"), "{help}");
+        assert_eq!(UndecryptableWhy::RetiredKey.as_str(), "retired_key");
+    }
+
     /// D.4a §3.12: every lock refusal has its code, a message that names the store or the target
     /// (never a secret), and a help that says what to do — no catch-all "file an issue".
     #[test]
@@ -3134,26 +3582,102 @@ mod tests {
              "apprafter::secrets::lock_incomplete",
              "an earlier `lock off` on the target store at /s did not finish",
              "Run `apprafter lock off` again"),
+            (CliError::LockIncomplete { store: s(), phase: LockPhase::Rotating },
+             "apprafter::secrets::lock_incomplete",
+             "an earlier `lock rekey` or `lock recovery` on the target store at /s did not finish",
+             "`apprafter lock off` returns the secrets to files"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::NotWritten, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s was not written — it opens as before, with its earlier secrets, and a recovery key shown in this run is not valid",
+             "Keep your current recovery key"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::Unfinished, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s did not finish — its new keys are written: a recovery key shown in this run opens it now, and the one it replaced no longer does",
+             "or `apprafter lock off` to return the secrets to files"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::BackOutFailed, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s was not written, and its lock state could not be put back — it may read as an interrupted key change",
+             "with one of the store's earlier secrets"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::Unknown, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s stopped, and whether its new vault was written could not be told — it reads as an interrupted key change",
+             "Keep both your current recovery key and any recovery key shown in this run"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfTooWeak },
              "apprafter::secrets::slot_refused",
              "the lock password of the target store at /s is kept with key-derivation settings weaker than this AppRafter accepts",
-             "with its recovery key"),
+             "`apprafter lock rekey`"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfOutOfRange },
              "apprafter::secrets::slot_refused",
              "the lock password of the target store at /s is kept with key-derivation settings beyond what this AppRafter computes",
-             "with its recovery key"),
+             "`apprafter lock rekey`"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::NoUsableSlot },
              "apprafter::secrets::slot_refused",
              "the target store at /s has no slot this AppRafter can open with that secret",
-             "upgrade AppRafter"),
+             "only after an upgrade"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::LastRecoverySlot },
              "apprafter::secrets::slot_refused",
              "the recovery key slot of the target store at /s is its last one",
-             "add the new one before removing the old one"),
+             "`apprafter lock recovery` replaces it"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::NoUsableSlotLeft },
              "apprafter::secrets::slot_refused",
              "removing that slot would leave the target store at /s with no slot this AppRafter can open",
              "add one before removing this one"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::AlreadyHasPassword },
+             "apprafter::secrets::slot_refused",
+             "the target store at /s has a lock password already",
+             "`apprafter lock rekey` changes it"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::NotOnThisOs },
+             "apprafter::secrets::slot_refused",
+             "an account-password slot opens a target store only on Linux and macOS, and this computer runs Windows (the target store at /s)",
+             "`apprafter lock slot add password`"),
+            (CliError::SlotRefused { store: s(), reason: SlotRefusal::SlotsFull },
+             "apprafter::secrets::slot_refused",
+             "the vault of the target store at /s holds 16 ways to open it, the most a vault may",
+             "`apprafter lock slot remove <id>`"),
+            (CliError::SlotNotFound { store: s(), given: "ffff".into(), matches: Vec::new() },
+             "apprafter::secrets::slot_not_found",
+             "the target store at /s has no slot `ffff`",
+             "`apprafter lock slot list` shows each slot's id"),
+            (CliError::SlotNotFound { store: s(), given: "os-password".into(), matches: vec!["3a4b5c6d00000000000000000000000a".into(), "9c0d1e2f00000000000000000000000b".into()] },
+             "apprafter::secrets::slot_not_found",
+             "`os-password` could mean more than one slot of the target store at /s: 3a4b5c6d, 9c0d1e2f",
+             "a kind the store has exactly one slot of"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Wrong, messages: vec!["The account is locked due to 3 failed logins.".into()] },
+             "apprafter::secrets::account_password_refused",
+             "the system did not accept that account password; the system said: The account is locked due to 3 failed logins.",
+             "If this account has no usable password"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::NotChecked, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "the system did not check the password that was typed: a fingerprint reader, another sign-in module or a second question took its place",
+             "not a fingerprint"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::NoPassword, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "this account has no password the system can check",
+             "`apprafter lock slot add password`"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unavailable { what: AccountCheckUnavailable::NoLibpam }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "this computer cannot check your account password: libpam is not installed",
+             "`apprafter lock on --lock-password`"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unavailable { what: AccountCheckUnavailable::NoNewPrivs }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "AppRafter cannot check your account password safely while it runs with no_new_privs (a sandbox such as Flatpak or bubblewrap, or a service started with NoNewPrivileges=): the system may refuse even the right password and count it as a failed login",
+             "`apprafter lock on --lock-password`"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unavailable { what: AccountCheckUnavailable::SystemError { name: "PAM_SYSTEM_ERR".into() } }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "the system's password check failed (PAM_SYSTEM_ERR) without a verdict",
+             "a separate lock password"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Backoff { wait_secs: Some(540) }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "an account-password check failed recently: the next is allowed in 9 min",
+             "so that typos cannot lock your account"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Backoff { wait_secs: None }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "another AppRafter process is checking an account password right now",
+             "run the command again then"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unusable { why: AccountPasswordUnusable::RecoveryKeyShape }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "that account password has the shape of a recovery key, and a prompt reads such text as a recovery key",
+             "a separate lock password"),
             (CliError::CacheNotSealed { secret: CachedSecret::Kubeconfig, target: "prod".into() },
              "apprafter::secrets::cache_not_sealed",
              "the kubeconfig cached for target `prod` is not encrypted, but this target store is locked: it is not used",
@@ -3194,6 +3718,75 @@ mod tests {
             assert!(h.contains(help), "{code}: {h}");
             assert!(!h.contains("file an issue"), "{code}: {h}");
         }
+    }
+
+    /// WI-545: each reason this computer cannot check the account password has its name on the
+    /// wire (`fields.unavailable`), the desktop's to read; `no_new_privs` is the kernel's own.
+    #[test]
+    fn each_unavailable_check_has_its_wire_name() {
+        for (what, name) in [
+            (AccountCheckUnavailable::NoLibpam, "no_libpam"),
+            (AccountCheckUnavailable::NoService, "no_service"),
+            (AccountCheckUnavailable::NoCheckRoute, "no_check_route"),
+            (AccountCheckUnavailable::NoAccount, "no_account"),
+            (AccountCheckUnavailable::NoNewPrivs, "no_new_privs"),
+            (AccountCheckUnavailable::NoMachineId, "no_machine_id"),
+            (
+                AccountCheckUnavailable::NoBackoffRecord,
+                "no_backoff_record",
+            ),
+            (
+                AccountCheckUnavailable::SystemError {
+                    name: "PAM_SYSTEM_ERR".into(),
+                },
+                "system_error",
+            ),
+        ] {
+            assert_eq!(what.as_str(), name, "{what:?}");
+        }
+    }
+
+    /// D.4b-c3 (B75 (3), d4b-d's `pam::decide`): a stack that did not check the typed text is
+    /// counted toward the back-off when PAM reported a failure — a second prompt refused —
+    /// and not when it let the check pass. The words claim neither, nor that it passed.
+    #[test]
+    fn not_checked_claims_no_count_and_no_pass() {
+        let err = CliError::AccountPasswordRefused {
+            reason: AccountPasswordRefusal::NotChecked,
+            messages: Vec::new(),
+        };
+        let (message, help) = (err.to_string(), help_of(&err));
+        for words in [&message, &help] {
+            assert!(!words.contains("counted"), "{words}");
+            assert!(!words.contains("let the check pass"), "{words}");
+        }
+        assert!(help.contains("not a fingerprint"), "{help}");
+        assert!(
+            help.contains("`apprafter lock on --lock-password`"),
+            "{help}"
+        );
+    }
+
+    /// D.4b-e1a (d4b-c3's Deviation 10): an interrupted `lock on` is finished with the store's
+    /// everyday secret — its lock password or, by default, the account password — and the
+    /// recovery key; where `lock on` cannot finish it, `lock off` backs it out with the key.
+    #[test]
+    fn an_interrupted_lock_on_names_both_everyday_secrets_and_lock_off_where_it_cannot_finish() {
+        let help = help_of(&CliError::LockIncomplete {
+            store: PathBuf::from("/s"),
+            phase: LockPhase::Locking,
+        });
+        assert!(
+            help.contains("its lock password or your account password"),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "where `apprafter lock on` says this AppRafter cannot finish the run, \
+                 `apprafter lock off` backs it out with the recovery key"
+            ),
+            "{help}"
+        );
     }
 
     /// WI-475: the fix for a store folder another account owns or can write is in this

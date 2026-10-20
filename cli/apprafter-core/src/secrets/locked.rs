@@ -6,6 +6,7 @@
 //! before a marker or the caller's directory move relies on it. Only [`super::SecretStore`]
 //! calls in.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,7 +23,8 @@ use super::marker::{classify, write_marker, Marker};
 use super::store_file::{read_store_file, write_store_file, StoreId};
 use crate::context::SecretString;
 use crate::vault::{
-    self, OsRandom, PayloadWhat, UnlockedVault, VaultError, VaultFile, FORMAT_V1, VAULT_FILE,
+    self, vault_id_of_prefix, OsRandom, PayloadWhat, UnlockedVault, VaultError, VaultFile, VaultId,
+    FORMAT_V1, VAULT_FILE, VAULT_ID_PREFIX_MAX,
 };
 
 /// The core's `writer` (§3.7): `apprafter <version>`, the default of
@@ -33,7 +35,7 @@ pub(crate) const VAULT_WRITER: &str = concat!("apprafter ", env!("CARGO_PKG_VERS
 #[cfg(all(test, unix))]
 thread_local! {
     /// Tests: the next fsync of the store root fails.
-    pub(super) static ROOT_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static ROOT_SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Where a locked store's `credentials.yaml` puts a target's token.
@@ -102,6 +104,49 @@ pub(crate) fn read_vault(store: &TargetStorePaths, id: &StoreId) -> Result<Arc<[
     Ok(Arc::from(bytes))
 }
 
+/// The vault id `<root>/vault` names, from the file's first bytes alone (D.4b B8): magic,
+/// version, writer, flags and the id — at most `VAULT_ID_PREFIX_MAX` bytes — checked as a full
+/// read checks them, and **not authenticated**: a holder's watch (B38) and the desktop's
+/// re-read (B35) compare it with the id their key opens, and a forged one can only end a
+/// window or lock the app. `None` when there is no vault file. A prefix that is not a vault's
+/// is `vault_unreadable`; any other failure is an I/O error, which a watch retries. Opened
+/// read-only with `File::open`, never through `owner_only::open_secret`, whose Windows path
+/// asks for `WRITE_DAC` and may rewrite a DACL. Every vault door stays in the core (the guard's
+/// `VAULT_DOORS`): this is the one way a client reads anything of the vault file.
+pub fn vault_id_on_disk(root: &Path) -> Result<Option<VaultId>> {
+    let path = vault_path(root);
+    under_temp(&path);
+    let failed = |e: std::io::Error| {
+        vault_error(
+            root,
+            VaultError::Io {
+                path: path.clone(),
+                source: e,
+            },
+        )
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(failed(e)),
+    };
+    let mut prefix = Vec::with_capacity(VAULT_ID_PREFIX_MAX);
+    file.take(VAULT_ID_PREFIX_MAX as u64)
+        .read_to_end(&mut prefix)
+        .map_err(failed)?;
+    #[cfg(test)]
+    PREFIX_READ.with(|read| read.set(prefix.len()));
+    vault_id_of_prefix(&prefix)
+        .map(Some)
+        .map_err(|e| vault_error(root, e))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: how many bytes this thread's last [`vault_id_on_disk`] read (B8's bound).
+    static PREFIX_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A vault failure as the secret store's error (D.4a T69, §3.12: one namespace,
 /// `apprafter::secrets::*`), for the store's sessions and writes — the boundary d4a-d's
 /// prompt reuses. `root` is the store root. A failed authentication is never "no such
@@ -160,6 +205,11 @@ pub(crate) fn vault_error(root: &Path, e: VaultError) -> CliError {
             now: SecretsModeKind::Locked,
         },
         VaultError::RandomUnavailable { detail } => CliError::RandomUnavailable { detail },
+        // D.4b: a seventeenth slot is no vault of too many bytes.
+        VaultError::TooLarge {
+            what: vault::SizeWhat::Slots,
+            ..
+        } => slot(SlotRefusal::SlotsFull),
         VaultError::TooLarge { limit, .. } => CliError::VaultUnwritable {
             path: path.clone(),
             problem: VaultWriteProblem::TooLarge { limit },
@@ -177,12 +227,14 @@ pub(crate) fn vault_error(root: &Path, e: VaultError) -> CliError {
         // new password and no slot id: d4a-d's `lock::open` maps a typed recovery key's
         // refusal to `CoreError::RecoveryKeyInvalid` (T62: with its group) and
         // `lock::check_password` a password's to `CoreError::LockPasswordRefused` before the
-        // vault sees either, and `InvalidInput` / `SlotNotFound` are a caller's bug (c1's
-        // hand-off). Kept in c1's words, never as an unlock or a damage the person must act on.
+        // vault sees either, and `InvalidInput` / `SlotNotFound` / `SlotIdTaken` (one id given
+        // to two new slots, D.4b-b1) are a caller's bug (c1's hand-off). Kept in c1's words,
+        // never as an unlock or a damage the person must act on.
         VaultError::RecoveryKey(_)
         | VaultError::PasswordRefused(_)
         | VaultError::InvalidInput(_)
-        | VaultError::SlotNotFound { .. } => CliError::Other(detail.clone()),
+        | VaultError::SlotNotFound { .. }
+        | VaultError::SlotIdTaken { .. } => CliError::Other(detail.clone()),
         VaultError::Io { path: at, source } => CliError::Io(std::io::Error::new(
             source.kind(),
             format!("{}: {source}", at.display()),
@@ -212,10 +264,12 @@ pub(crate) fn vault_write_error(root: &Path, e: VaultError) -> CliError {
     }
 }
 
-/// The store root's directory entries — the vault's rename among them — on disk before a
-/// marker or the caller's directory move relies on them (overview §8 risk 10): c1's `replace`
-/// syncs the directory best effort only. A failure is an error, and nothing that relies on the
-/// vault is written. Unix; Windows has no directory fsync (c1's Risks 5).
+/// The store root's directory entries on disk before a marker or the caller's directory move
+/// relies on them (overview §8 risk 10). Since D.4b-b1 the vault's own `replace` is durable
+/// before it returns (B78); this stays every write's last step before its outcome (B51),
+/// for the store's other entries. A failure is an error, and nothing that relies on the vault
+/// is written. Unix; Windows has no directory fsync (c1's Risks 5): there the vault's move is
+/// write-through instead.
 pub(crate) fn sync_root(store: &TargetStorePaths) -> Result<()> {
     #[cfg(unix)]
     {
@@ -431,4 +485,186 @@ pub(super) fn set_unlock_timeout(
         write_store_file(store.root(), &file, held)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod vault_id_on_disk_tests {
+    use super::*;
+    use crate::vault::VAULT_FILE_MAX;
+
+    const VECTORS: &[&str] = &[
+        "fast-params/vault",
+        "password-recovery/vault",
+        "unknown-slot/vault",
+        "unknown-entry/vault",
+        "os-password/vault",
+        "created-with/vault",
+    ];
+
+    fn v1(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/vault_vectors/v1")
+            .join(rel)
+    }
+
+    /// A store root holding `bytes` as its vault.
+    fn store_with(bytes: &[u8]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(VAULT_FILE), bytes).unwrap();
+        dir
+    }
+
+    /// Every v1 vector's id, from its prefix alone: a file cut right after the id names it, and
+    /// so does one whose rest is no vault and longer than any vault, of which exactly
+    /// `VAULT_ID_PREFIX_MAX` bytes are read (B8's bound, pinned by `PREFIX_READ`: critic
+    /// round, finding 5).
+    #[test]
+    fn the_id_of_every_v1_vector_is_read_from_its_prefix() {
+        for rel in VECTORS {
+            let bytes = std::fs::read(v1(rel)).unwrap();
+            let id = VaultFile::parse(&bytes).unwrap().header().vault_id;
+            let whole = store_with(&bytes);
+            assert_eq!(vault_id_on_disk(whole.path()).unwrap(), Some(id), "{rel}");
+            let end = 8 + 2 + 1 + usize::from(bytes[10]) + 2 + 16;
+            let cut = store_with(&bytes[..end]);
+            assert_eq!(
+                vault_id_on_disk(cut.path()).unwrap(),
+                Some(id),
+                "{rel}, cut"
+            );
+        }
+        let bytes = std::fs::read(v1("fast-params/vault")).unwrap();
+        let id = VaultFile::parse(&bytes).unwrap().header().vault_id;
+        let mut junk = bytes[..51].to_vec();
+        junk.resize(VAULT_FILE_MAX + 1024, 0xa5);
+        let dir = store_with(&junk);
+        assert_eq!(vault_id_on_disk(dir.path()).unwrap(), Some(id));
+        assert_eq!(
+            PREFIX_READ.with(std::cell::Cell::get),
+            VAULT_ID_PREFIX_MAX,
+            "only the prefix is read (B8)"
+        );
+    }
+
+    /// No vault is `None`; a prefix that is not a vault's (too short, another format, a set
+    /// flag) is `vault_unreadable`, never `None` (B38 ends a holder on it).
+    #[test]
+    fn a_short_or_foreign_prefix_is_refused_and_no_file_is_none() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(vault_id_on_disk(empty.path()).unwrap(), None);
+        let bytes = std::fs::read(v1("fast-params/vault")).unwrap();
+        for len in 0..51 {
+            let dir = store_with(&bytes[..len]);
+            match vault_id_on_disk(dir.path()) {
+                Err(CliError::VaultUnreadable {
+                    problem: VaultProblem::NotAVault,
+                    ..
+                }) => assert!(len < 8, "length {len}"),
+                Err(CliError::VaultUnreadable {
+                    problem:
+                        VaultProblem::Damaged {
+                            what: DamageKind::Malformed,
+                        },
+                    ..
+                }) => assert!(len >= 8, "length {len}"),
+                other => panic!("length {len}: {other:?}"),
+            }
+        }
+        let mut newer = bytes.clone();
+        newer[8..10].copy_from_slice(&2u16.to_le_bytes());
+        let dir = store_with(&newer);
+        assert!(matches!(
+            vault_id_on_disk(dir.path()),
+            Err(CliError::VaultUnreadable {
+                problem: VaultProblem::NewerFormat { version: 2 },
+                ..
+            })
+        ));
+        let mut flagged = bytes;
+        flagged[33] = 1;
+        let dir = store_with(&flagged);
+        assert!(matches!(
+            vault_id_on_disk(dir.path()),
+            Err(CliError::VaultUnreadable {
+                problem: VaultProblem::Damaged {
+                    what: DamageKind::Malformed
+                },
+                ..
+            })
+        ));
+    }
+
+    /// B38: a vault this account cannot read is an I/O error (the holder retries), never
+    /// `None` (the holder would end). Fails, never skips, where a file mode binds nothing (root).
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_this_account_cannot_read_is_an_error_never_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = store_with(&std::fs::read(v1("fast-params/vault")).unwrap());
+        let path = dir.path().join(VAULT_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::File::open(&path).is_err(),
+            "a 0000 file was readable: run the tests as a user a file mode binds"
+        );
+        assert!(matches!(
+            vault_id_on_disk(dir.path()),
+            Err(CliError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    /// B8: a look never rewrites the vault's DACL (`open_secret` would tighten a wide one).
+    #[cfg(windows)]
+    #[test]
+    fn reading_the_id_leaves_the_vaults_dacl_as_it_is() {
+        use cli_core::owner_only::testing;
+        let dir = store_with(&std::fs::read(v1("fast-params/vault")).unwrap());
+        let path = dir.path().join(VAULT_FILE);
+        testing::widen(&path).unwrap();
+        assert!(
+            !testing::of_path(&path).unwrap().is_owner_only(),
+            "the test's premise"
+        );
+        assert!(vault_id_on_disk(dir.path()).unwrap().is_some());
+        assert!(
+            !testing::of_path(&path).unwrap().is_owner_only(),
+            "the DACL was rewritten"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vault_error_tests {
+    use super::*;
+    use crate::vault::SizeWhat;
+
+    /// D.4b: a vault already holding its 16 slots refuses a seventeenth as `slot_refused`
+    /// (`slots_full`) — never as a vault of more bytes than it may hold.
+    #[test]
+    fn a_seventeenth_slot_is_slots_full_never_too_many_bytes() {
+        let root = Path::new("/s");
+        assert!(matches!(
+            vault_error(
+                root,
+                VaultError::TooLarge {
+                    what: SizeWhat::Slots,
+                    limit: 16
+                }
+            ),
+            CliError::SlotRefused {
+                reason: SlotRefusal::SlotsFull,
+                ..
+            }
+        ));
+        assert!(matches!(
+            vault_error(
+                root,
+                VaultError::TooLarge {
+                    what: SizeWhat::File,
+                    limit: 2_097_152
+                }
+            ),
+            CliError::VaultUnwritable { .. }
+        ));
+    }
 }

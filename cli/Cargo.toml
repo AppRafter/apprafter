@@ -10,6 +10,7 @@ members = [
     "apprafter-core",
     "backup-core",
     "apprafter-backup",
+    "os-slots",
 ]
 
 [workspace.package]

@@ -123,8 +123,8 @@ export function mockLock(
     mode,
     slots: protectedNow()
       ? [
-          { kind: 'password', label: 'lock password', refused: null },
-          { kind: 'recovery_key', label: 'recovery key', refused: null },
+          { id: null, kind: 'password', label: 'lock password', refused: null, notes: [] },
+          { id: null, kind: 'recovery_key', label: 'recovery key', refused: null, notes: [] },
         ]
       : [],
     windowMinutes: 5,

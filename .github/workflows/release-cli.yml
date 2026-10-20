@@ -102,6 +102,10 @@ on:
       - 'scripts/check-windows-static-crt.sh'
       - 'scripts/check-codesign-runtime.sh'
       - 'scripts/check-kdf-policy.sh'
+      - 'scripts/check-os-slots-fence.sh'
+      - 'cli/platform-cli/Cargo.toml'
+      - 'cli/platform-cli/src/os_slots.rs'
+      - 'cli/os-slots/**'
       - 'cli/Cargo.toml'
       - 'cli/Cargo.lock'
       - 'cli/rust-toolchain.toml'
@@ -376,6 +380,32 @@ jobs:
           APPRAFTER_SKIP_STARTUP_CHECKS=1 APPRAFTER_CONFIG_DIR="$scratch/store" \
             HOME="$scratch/home" XDG_RUNTIME_DIR="$scratch/run" KUBECONFIG=/nonexistent \
             "$bin" lock status 2>&1 | bash scripts/check-kdf-policy.sh
+
+      # D.4b G-OS3 (B16, B43): the shipped binary carries no account-password stand-in. Its
+      # `lock on`, under APPRAFTER_SANDBOX and with APPRAFTER_TEST_OS_SLOTS naming a script that
+      # would say "Verified", must leave the account password unchecked and take a lock
+      # password, naming the fence; a binary built with the dev-only feature test-os-slots
+      # would read the script. Neither the variable nor the stand-in's mark may be in its
+      # bytes (symbols are stripped, so the check is on behaviour first). A scratch store,
+      # home and runtime dir, no startup checks, no kubeconfig, no terminal.
+      - name: Check the binary has no account-password stand-in
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          bin="cli/target/${TARGET}/release/apprafter${EXE}"
+          # lock on refuses a store other accounts can change before the fence matters
+          # (WI-475). On Windows RUNNER_TEMP (D:) inherits the drive root's grants to Users,
+          # so the scratch goes under this account's own temporary folder there, where the
+          # test suite's stores live; RUNNER_TEMP elsewhere.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            scratch="$(cygpath -m "$(mktemp -d)")/apprafter-os-slots"
+          else
+            scratch="$RUNNER_TEMP/apprafter-os-slots"
+          fi
+          bash scripts/check-os-slots-fence.sh --self-test
+          bash scripts/check-os-slots-fence.sh run "$bin" "$scratch"
+          bash scripts/check-os-slots-fence.sh strings "$bin"
 
       - name: Package the archive
         env:

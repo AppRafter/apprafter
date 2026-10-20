@@ -42,6 +42,9 @@ pub const VAULT_FILE_MAX: usize = 2 * 1024 * 1024;
 pub const PAYLOAD_MAX: usize = 1024 * 1024;
 /// The writer field: `apprafter <version>` or `apprafter-desktop <version>`, at most 64 bytes.
 pub const WRITER_MAX: usize = 64;
+/// The bytes before a vault's id ends, at most (D.4b B8): the magic, the version, the
+/// writer's length and a writer of [`WRITER_MAX`] bytes, the flags, the id.
+pub(crate) const VAULT_ID_PREFIX_MAX: usize = MAGIC.len() + 2 + 1 + WRITER_MAX + 2 + 16;
 /// The store id field: `store.yaml`'s `id`, at most 64 bytes.
 pub const STORE_ID_MAX: usize = 64;
 /// At most 16 slots.
@@ -59,6 +62,10 @@ pub(crate) const KEY_CHECK_LEN: usize = 32;
 pub(crate) const WRAPPED_DK_LEN: usize = 48;
 pub(crate) const PASSWORD_BODY_LEN: usize = 133;
 pub(crate) const RECOVERY_BODY_LEN: usize = 121;
+/// Kind `0x03`'s body (D.4b B54).
+pub(crate) const OS_PASSWORD_BODY_LEN: usize = 149;
+/// An account-password slot's machine tag: the first 8 bytes of a SHA-256 (B54).
+pub(crate) const MACHINE_TAG_LEN: usize = 8;
 const KDF_NONE: u8 = 0x00;
 const KDF_ARGON2ID: u8 = 0x01;
 
@@ -98,9 +105,11 @@ impl fmt::Debug for SlotId {
     }
 }
 
-/// A slot's kind byte. D.4a creates and opens `Password` (`0x01`) and `RecoveryKey` (`0x02`);
-/// `0x03` to `0x05` are reserved for D.4b and later; every other byte is unknown. A reserved
-/// or unknown slot is kept byte for byte and never opened.
+/// A slot's kind byte. `Password` (`0x01`), `RecoveryKey` (`0x02`) and, from D.4b,
+/// `OsPassword` (`0x03`, the account password bound to this computer: B54) are opened;
+/// `0x04` (Windows Hello, D.4b-w1) and `0x05` (Touch ID) are reserved; every other byte is
+/// unknown. A reserved or unknown slot, and a `0x03` body this build cannot read, is kept
+/// byte for byte and never opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlotKind {
     Password,
@@ -140,7 +149,7 @@ impl fmt::Display for SlotKind {
         match self {
             SlotKind::Password => f.write_str("lock password"),
             SlotKind::RecoveryKey => f.write_str("recovery key"),
-            SlotKind::OsPassword => f.write_str("OS password"),
+            SlotKind::OsPassword => f.write_str("account password"),
             SlotKind::WindowsHello => f.write_str("Windows Hello"),
             SlotKind::TouchId => f.write_str("Touch ID"),
             SlotKind::Unknown(byte) => write!(f, "slot of kind {byte:#04x}"),
@@ -167,13 +176,28 @@ pub enum SlotBody {
         key_check: [u8; KEY_CHECK_LEN],
         wrapped_dk: [u8; WRAPPED_DK_LEN],
     },
-    /// A reserved or unknown kind's body, kept byte for byte.
+    /// 149 bytes (B54): `0x01` (Argon2id v0x13) ‖ m u32 ‖ t u32 ‖ p u32 ‖ salt ‖ enrolled_at
+    /// u64 ‖ machine_tag (8) ‖ wrap_nonce ‖ key_check ‖ wrapped_dk. `enrolled_at` is when the
+    /// slot was added (Unix seconds); `machine_tag` says which computer's machine id the key
+    /// took, without revealing it or linking two slots.
+    OsPassword {
+        kdf: Argon2idParams,
+        salt: [u8; SALT_LEN],
+        enrolled_at: u64,
+        machine_tag: [u8; MACHINE_TAG_LEN],
+        wrap_nonce: [u8; NONCE_LEN],
+        key_check: [u8; KEY_CHECK_LEN],
+        wrapped_dk: [u8; WRAPPED_DK_LEN],
+    },
+    /// A reserved or unknown kind's body, or a `0x03` body this build cannot read (another
+    /// layout: B1), kept byte for byte.
     Opaque(Vec<u8>),
 }
 
 impl SlotBody {
-    /// The body up to the end of its salt: what a slot's wrap associated data binds (§3.7).
-    /// Empty for an opaque body, which is never wrapped or opened here.
+    /// The body before its wrap nonce: what a slot's wrap associated data binds (§3.7; for
+    /// `0x03` also `enrolled_at` and the machine tag, B54). Empty for an opaque body, which
+    /// is never wrapped or opened here.
     pub(crate) fn kdf_block(&self) -> Vec<u8> {
         match self {
             SlotBody::Password { kdf, salt, .. } => {
@@ -183,6 +207,25 @@ impl SlotBody {
                 out.extend_from_slice(&kdf.t_cost.to_le_bytes());
                 out.extend_from_slice(&kdf.p_cost.to_le_bytes());
                 out.extend_from_slice(salt);
+                out
+            }
+            SlotBody::OsPassword {
+                kdf,
+                salt,
+                enrolled_at,
+                machine_tag,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(
+                    OS_PASSWORD_BODY_LEN - NONCE_LEN - KEY_CHECK_LEN - WRAPPED_DK_LEN,
+                );
+                out.push(KDF_ARGON2ID);
+                out.extend_from_slice(&kdf.m_cost_kib.to_le_bytes());
+                out.extend_from_slice(&kdf.t_cost.to_le_bytes());
+                out.extend_from_slice(&kdf.p_cost.to_le_bytes());
+                out.extend_from_slice(salt);
+                out.extend_from_slice(&enrolled_at.to_le_bytes());
+                out.extend_from_slice(machine_tag);
                 out
             }
             SlotBody::RecoveryKey { salt, .. } => {
@@ -198,6 +241,12 @@ impl SlotBody {
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             SlotBody::Password {
+                wrap_nonce,
+                key_check,
+                wrapped_dk,
+                ..
+            }
+            | SlotBody::OsPassword {
                 wrap_nonce,
                 key_check,
                 wrapped_dk,
@@ -222,6 +271,7 @@ impl SlotBody {
         match self {
             SlotBody::Password { .. } => PASSWORD_BODY_LEN,
             SlotBody::RecoveryKey { .. } => RECOVERY_BODY_LEN,
+            SlotBody::OsPassword { .. } => OS_PASSWORD_BODY_LEN,
             SlotBody::Opaque(bytes) => bytes.len(),
         }
     }
@@ -317,6 +367,10 @@ fn encode_slot(slot: &SlotRecord, out: &mut Vec<u8>) -> VaultResult<()> {
     let body_matches_kind = match (&slot.kind, &slot.body) {
         (SlotKind::Password, SlotBody::Password { .. }) => true,
         (SlotKind::RecoveryKey, SlotBody::RecoveryKey { .. }) => true,
+        (SlotKind::OsPassword, SlotBody::OsPassword { .. }) => true,
+        // An opaque `0x03` body this build would read back as an account-password slot: read
+        // back, the vault would hold another slot than the one encoded (B1).
+        (SlotKind::OsPassword, SlotBody::Opaque(bytes)) => !reads_as_os_password(bytes),
         (SlotKind::Password | SlotKind::RecoveryKey, _) => false,
         (_, body) => matches!(body, SlotBody::Opaque(_)),
     };
@@ -370,26 +424,7 @@ impl VaultFile {
         if bytes.len() > VAULT_FILE_MAX {
             return Err(malformed(MalformedWhat::TooLarge, VAULT_FILE_MAX));
         }
-        if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC[..] {
-            return Err(VaultError::NotAVault);
-        }
-        let mut r = Reader::new(bytes, MAGIC.len());
-        let format_version = r.u16()?;
-        let writer_at = r.pos;
-        let writer_len = usize::from(r.u8()?);
-        let writer =
-            check_writer(r.take(writer_len)?).map_err(|what| malformed(what, writer_at))?;
-        if format_version != FORMAT_V1 {
-            return Err(VaultError::UnsupportedVersion {
-                found: format_version,
-                writer,
-            });
-        }
-        let flags_at = r.pos;
-        if r.u16()? != 0 {
-            return Err(malformed(MalformedWhat::Flags, flags_at));
-        }
-        let vault_id = VaultId(r.array()?);
+        let (mut r, format_version, writer, vault_id) = read_prefix(bytes)?;
         let store_at = r.pos;
         let store_len = usize::from(r.u8()?);
         let store_id =
@@ -451,6 +486,38 @@ impl VaultFile {
     }
 }
 
+/// The frozen prefix as far as the vault id — magic, version, writer, flags, id — each checked
+/// as [`VaultFile::parse`] checks it, in its order; the reader is left after the id. What a
+/// reader of the id alone needs (B8): at most [`VAULT_ID_PREFIX_MAX`] bytes.
+fn read_prefix(bytes: &[u8]) -> VaultResult<(Reader<'_>, u16, String, VaultId)> {
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC[..] {
+        return Err(VaultError::NotAVault);
+    }
+    let mut r = Reader::new(bytes, MAGIC.len());
+    let format_version = r.u16()?;
+    let writer_at = r.pos;
+    let writer_len = usize::from(r.u8()?);
+    let writer = check_writer(r.take(writer_len)?).map_err(|what| malformed(what, writer_at))?;
+    if format_version != FORMAT_V1 {
+        return Err(VaultError::UnsupportedVersion {
+            found: format_version,
+            writer,
+        });
+    }
+    let flags_at = r.pos;
+    if r.u16()? != 0 {
+        return Err(malformed(MalformedWhat::Flags, flags_at));
+    }
+    let vault_id = VaultId(r.array()?);
+    Ok((r, format_version, writer, vault_id))
+}
+
+/// The vault id of a file's first bytes, read and checked as far as the id and no further
+/// (B8): **not authenticated** — a forged one can only end a window or lock the app.
+pub(crate) fn vault_id_of_prefix(bytes: &[u8]) -> VaultResult<VaultId> {
+    read_prefix(bytes).map(|(_, _, _, vault_id)| vault_id)
+}
+
 fn malformed(what: MalformedWhat, offset: usize) -> VaultError {
     VaultError::Malformed { what, offset }
 }
@@ -491,6 +558,10 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    fn u64(&mut self) -> VaultResult<u64> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
     fn array<const N: usize>(&mut self) -> VaultResult<[u8; N]> {
         let mut out = [0u8; N];
         out.copy_from_slice(self.take(N)?);
@@ -521,6 +592,7 @@ fn parse_slot(r: &mut Reader<'_>) -> VaultResult<SlotRecord> {
     let body = match kind {
         SlotKind::Password => parse_password_body(body, body_at)?,
         SlotKind::RecoveryKey => parse_recovery_body(body, body_at)?,
+        SlotKind::OsPassword => parse_os_password_body(body)?,
         _ => SlotBody::Opaque(body.to_vec()),
     };
     Ok(SlotRecord {
@@ -563,6 +635,36 @@ fn parse_recovery_body(body: &[u8], at: usize) -> VaultResult<SlotBody> {
     }
     Ok(SlotBody::RecoveryKey {
         salt: b.array()?,
+        wrap_nonce: b.array()?,
+        key_check: b.array()?,
+        wrapped_dk: b.array()?,
+    })
+}
+
+/// Whether a `0x03` body is one this build reads (B54): 149 bytes, Argon2id's id first.
+fn reads_as_os_password(body: &[u8]) -> bool {
+    body.len() == OS_PASSWORD_BODY_LEN && body[0] == KDF_ARGON2ID
+}
+
+/// Kind `0x03`'s body (B54) when this build reads it. Any other body — another length or
+/// key-derivation id, a layout of a newer AppRafter — is kept byte for byte, and only that slot
+/// is refused (`newer_kind`), never the vault (B1); `0x01` and `0x02` stay strict.
+fn parse_os_password_body(body: &[u8]) -> VaultResult<SlotBody> {
+    if !reads_as_os_password(body) {
+        return Ok(SlotBody::Opaque(body.to_vec()));
+    }
+    let mut b = Reader::new(body, 0);
+    b.u8()?; // Argon2id's id, checked above
+    let kdf = Argon2idParams {
+        m_cost_kib: b.u32()?,
+        t_cost: b.u32()?,
+        p_cost: b.u32()?,
+    };
+    Ok(SlotBody::OsPassword {
+        kdf,
+        salt: b.array()?,
+        enrolled_at: b.u64()?,
+        machine_tag: b.array()?,
         wrap_nonce: b.array()?,
         key_check: b.array()?,
         wrapped_dk: b.array()?,
@@ -972,6 +1074,131 @@ mod tests {
                 what: SizeWhat::Payload,
                 ..
             })
+        ));
+    }
+
+    /// An account-password slot (B54) with every field distinct.
+    fn os_slot() -> SlotRecord {
+        SlotRecord {
+            id: SlotId(seq_array(0x50)),
+            kind: SlotKind::OsPassword,
+            body: SlotBody::OsPassword {
+                kdf: Argon2idParams {
+                    m_cost_kib: 32,
+                    t_cost: 1,
+                    p_cost: 1,
+                },
+                salt: seq_array(0x30),
+                enrolled_at: 1_760_000_000,
+                machine_tag: seq_array(0x90),
+                wrap_nonce: seq_array(0xf0),
+                key_check: seq_array(0x10),
+                wrapped_dk: seq_array(0x60),
+            },
+            label: "account password of walker on box-a".into(),
+        }
+    }
+
+    /// B54: 149 bytes, round-tripped; the wrap's associated data binds everything before the
+    /// wrap nonce — the costs, the salt, `enrolled_at` and the machine tag.
+    #[test]
+    fn an_account_password_body_round_trips_byte_for_byte() {
+        let mut header = three_slot_header();
+        header.slots.push(os_slot());
+        let bytes = file(&header);
+        let parsed = VaultFile::parse(&bytes).unwrap();
+        assert_eq!(parsed.header(), &header);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes);
+        let body = &header.slots[3].body;
+        let mut encoded = Vec::new();
+        body.encode_into(&mut encoded);
+        assert_eq!(encoded.len(), OS_PASSWORD_BODY_LEN);
+        assert_eq!(body.kdf_block(), encoded[..45].to_vec());
+        assert_eq!(encoded[0], 0x01);
+        assert_eq!(&encoded[29..37], &1_760_000_000u64.to_le_bytes());
+        assert_eq!(&encoded[37..45], &seq(0x90, 8)[..]);
+    }
+
+    /// B1: a `0x03` body this build cannot read — another length, another key-derivation id,
+    /// none at all — is kept byte for byte, and the vault parses (`tamper.rs`: its other slots
+    /// open). The 148- and 150-byte bodies start with Argon2id's id, so only the length rule
+    /// keeps them opaque (critic round, finding 3).
+    #[test]
+    fn an_unreadable_account_password_body_is_kept_opaque() {
+        let mut readable = Vec::new();
+        os_slot().body.encode_into(&mut readable);
+        let shorter = readable[..148].to_vec();
+        let longer = [&readable[..], &[0u8][..]].concat();
+        let mut other_kdf = readable;
+        other_kdf[0] = 0x02;
+        for body in [shorter, longer, other_kdf, Vec::new()] {
+            let len = body.len();
+            let mut header = three_slot_header();
+            let mut slot = os_slot();
+            slot.body = SlotBody::Opaque(body.clone());
+            header.slots.push(slot);
+            let bytes = file(&header);
+            let parsed = VaultFile::parse(&bytes).unwrap();
+            assert_eq!(
+                parsed.header().slots[3].body,
+                SlotBody::Opaque(body),
+                "a {len}-byte body"
+            );
+            assert_eq!(parsed.to_bytes().unwrap(), bytes);
+        }
+    }
+
+    /// An opaque `0x03` body this build would read back as an account-password slot is never
+    /// written (read back, it would be another slot), nor an account-password body under
+    /// another kind byte.
+    #[test]
+    fn an_opaque_body_that_reads_as_an_account_password_is_not_written() {
+        let mut readable = Vec::new();
+        os_slot().body.encode_into(&mut readable);
+        let mut header = three_slot_header();
+        let mut slot = os_slot();
+        slot.body = SlotBody::Opaque(readable);
+        header.slots.push(slot);
+        assert!(matches!(
+            header.encode_aad(&[0; 24], 40),
+            Err(VaultError::Malformed {
+                what: MalformedWhat::BodyLength,
+                ..
+            })
+        ));
+        let mut header = three_slot_header();
+        let mut slot = os_slot();
+        slot.kind = SlotKind::Unknown(0x7f);
+        header.slots.push(slot);
+        assert!(matches!(
+            header.encode_aad(&[0; 24], 40),
+            Err(VaultError::Malformed {
+                what: MalformedWhat::BodyLength,
+                ..
+            })
+        ));
+    }
+
+    /// B8: the vault id ends at most 93 bytes in; the prefix alone names it.
+    #[test]
+    fn the_vault_id_is_read_from_the_prefix_alone() {
+        assert_eq!(VAULT_ID_PREFIX_MAX, 93);
+        let mut header = three_slot_header();
+        header.writer = "w".repeat(WRITER_MAX);
+        let bytes = file(&header);
+        let end = 8 + 2 + 1 + WRITER_MAX + 2 + 16;
+        assert_eq!(vault_id_of_prefix(&bytes[..end]).unwrap(), header.vault_id);
+        assert_eq!(vault_id_of_prefix(&bytes).unwrap(), header.vault_id);
+        assert!(matches!(
+            vault_id_of_prefix(&bytes[..end - 1]),
+            Err(VaultError::Malformed {
+                what: MalformedWhat::Truncated,
+                ..
+            })
+        ));
+        assert!(matches!(
+            vault_id_of_prefix(&bytes[..7]),
+            Err(VaultError::NotAVault)
         ));
     }
 

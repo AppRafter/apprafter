@@ -84,7 +84,13 @@ fn what_needs_no_secret_asks_the_client_for_nothing() {
         crate::target::list(&ctx).unwrap();
         crate::target::show(&ctx, &TargetRef::named(&ctx, "prod").unwrap()).unwrap();
         crate::session::whoami(&ctx, &CancellationToken::new()).unwrap();
-        crate::lock::status(&ctx, UnlockWindow::Closed, &client).unwrap();
+        crate::lock::status(
+            &ctx,
+            UnlockWindow::Closed,
+            &client,
+            &crate::lock::UnknownFacts,
+        )
+        .unwrap();
         assert_eq!(
             counting.asked.load(Ordering::SeqCst),
             0,

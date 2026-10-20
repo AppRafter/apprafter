@@ -349,7 +349,7 @@ fn a_change_inside_the_window_asks_and_leaves_the_window_alone() {
     let mut t = Terminal::start(
         &sp,
         r#""$1" unlock; echo "step: unlock $?"
-"$1" lock on --timeout 15; echo "step: on $?"
+"$1" lock on --lock-password --timeout 15; echo "step: on $?"
 "$1" lock status </dev/null; echo "step: status $?"
 "$1" target ip </dev/null; echo "step: ip $?"
 "$1" lock now; echo "step: now $?""#,

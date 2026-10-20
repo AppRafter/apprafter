@@ -24,6 +24,7 @@ pub(crate) mod examples;
 pub mod holder;
 mod holder_window;
 mod limits_client;
+mod os_slots;
 mod prompt;
 mod render;
 mod sandbox;

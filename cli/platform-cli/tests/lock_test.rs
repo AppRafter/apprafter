@@ -67,6 +67,14 @@ fn store_yaml(sp: &Spawn) -> Option<String> {
     std::fs::read_to_string(sp.store().join("store.yaml")).ok()
 }
 
+/// D.4b B55, B88 (1): what a plain `lock on` says first where APPRAFTER_SANDBOX fences this
+/// account on Linux and macOS — every spawned test's (`src/commands/lock.rs`'s
+/// `fallback_head`).
+const SANDBOX_HEAD_UNIX: &str = "AppRafter does not check your account password while \
+                                 APPRAFTER_SANDBOX is set: the variable fences tests and \
+                                 agents away from it.\nThe store gets a separate lock \
+                                 password instead.\n";
+
 /// Every file under `dir` holding `needle`.
 #[cfg(unix)]
 fn holding(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
@@ -87,7 +95,7 @@ fn holding(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
 fn lock_on_without_a_terminal_is_refused() {
     let sp = Spawn::new();
     seeded(&sp);
-    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("apprafter::cli::usage_refused"), "{stderr}");
     assert!(
@@ -95,6 +103,96 @@ fn lock_on_without_a_terminal_is_refused() {
         "{stderr}"
     );
     assert_eq!(store_yaml(&sp), None);
+}
+
+/// D.4b B55, F4 (d4b-e1a): a plain `lock on` with no terminal, where APPRAFTER_SANDBOX fences
+/// this account, says why it would take a lock password — the fence's two lines, naming
+/// Windows Hello on Windows (`lock_on_fallback_sandbox_windows`) — then refuses as D.4a did;
+/// nothing is written.
+#[test]
+fn a_plain_lock_on_without_a_terminal_says_why_it_takes_a_lock_password() {
+    let sp = Spawn::new();
+    seeded(&sp);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let head = if cfg!(windows) {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/lock/lock_on_fallback_sandbox_windows.golden"),
+        )
+        .unwrap()
+    } else {
+        SANDBOX_HEAD_UNIX.to_string()
+    };
+    let stderr = stderr.replace("\r\n", "\n");
+    assert!(stderr.contains(&head), "{stderr}");
+    assert!(
+        stderr.contains("apprafter::cli::usage_refused")
+            && stderr.contains("asks for a new lock password"),
+        "{stderr}"
+    );
+    assert_eq!(store_yaml(&sp), None);
+}
+
+/// `sp`'s locked store as an interrupted `lock on` (`locking`) or `lock off` (`unlocking`)
+/// leaves it, its vault on disk.
+fn interrupted_as(sp: &Spawn, mode: apprafter_core::secrets::SecretsMode) {
+    let root = sp.store();
+    let held = cli_core::StoreLock::exclusive(&cli_core::TargetStorePaths::for_root(root.clone()))
+        .unwrap();
+    let mut file = apprafter_core::secrets::read_store_file(&root)
+        .unwrap()
+        .unwrap();
+    file.secrets = mode;
+    apprafter_core::secrets::write_store_file(&root, &file, &held).unwrap();
+}
+
+/// D.4b (d4b-c3's Deviation 10, d4b-e1a): an interrupted `lock on` whose vault this AppRafter
+/// cannot finish — here the recovery key is its only slot — is refused when it is planned,
+/// and its help names `lock off` alone, never `lock on` again, which would refuse it the same
+/// way; nothing is asked or written.
+#[test]
+fn an_interrupted_lock_on_this_build_cannot_finish_names_lock_off() {
+    let sp = Spawn::new();
+    locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
+    interrupted_as(&sp, apprafter_core::secrets::SecretsMode::Locking);
+    let before = store_yaml(&sp);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let flat = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("apprafter::secrets::lock_incomplete"),
+        "{stderr}"
+    );
+    assert!(
+        flat.contains("This AppRafter cannot finish that run")
+            && flat.contains("`apprafter lock off` backs it out with the recovery key"),
+        "{stderr}"
+    );
+    assert!(!flat.contains("Run `apprafter lock on` again"), "{stderr}");
+    assert_eq!(store_yaml(&sp), before, "nothing was written");
+    assert!(sp.store().join("vault").exists());
+}
+
+/// The same refusal for an interrupted `lock off` keeps its own help: `lock off` again
+/// finishes it (D.4a T37).
+#[test]
+fn lock_on_over_an_interrupted_lock_off_names_lock_off_again() {
+    let sp = Spawn::new();
+    locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
+    interrupted_as(&sp, apprafter_core::secrets::SecretsMode::Unlocking);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let flat = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("apprafter::secrets::lock_incomplete"),
+        "{stderr}"
+    );
+    assert!(flat.contains("Run `apprafter lock off` again"), "{stderr}");
+    assert!(
+        !flat.contains("This AppRafter cannot finish that run"),
+        "{stderr}"
+    );
 }
 
 /// C26: on a store in files `lock off` has nothing to do.
@@ -131,7 +229,7 @@ fn lock_off_without_a_terminal_is_store_locked() {
 fn lock_on_on_a_locked_store_says_so() {
     let sp = Spawn::new();
     locked_store(&sp.store(), &[("prod", Some(TOKEN))]);
-    let (code, stdout, stderr) = run(&sp, &["lock", "on"]);
+    let (code, stdout, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stdout.contains("is already locked."), "{stdout}");
 }
@@ -139,7 +237,7 @@ fn lock_on_on_a_locked_store_says_so() {
 #[test]
 fn a_window_longer_than_a_day_is_a_usage_error() {
     let sp = Spawn::new();
-    let (code, _, stderr) = run(&sp, &["lock", "on", "--timeout", "1441"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password", "--timeout", "1441"]);
     assert_eq!(code, Some(2), "{stderr}");
 }
 
@@ -165,7 +263,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
     const NOTE: &str = "INSECURE-FAST-KDF: this test build derives keys with weak parameters\n";
     let sp = Spawn::new().without_env("APPRAFTER_SANDBOX");
     seeded(&sp);
-    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    let (code, _, stderr) = run(&sp, &["lock", "on", "--lock-password"]);
     assert_eq!(code, Some(1), "{stderr}");
     if KdfPolicy::active().is_release() {
         assert!(stderr.contains("apprafter::cli::usage_refused"), "{stderr}");
@@ -185,6 +283,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
 mod at_a_terminal {
     use super::*;
     use common::terminal::{converse, line, shown_recovery_key, Ended, Step};
+    use common::transcript::{check_transcript, normalize, shown_slot_id, transcript};
 
     const NEW: &str = "New lock password for ";
     const REPEAT: &str = "Repeat the lock password: ";
@@ -195,21 +294,22 @@ mod at_a_terminal {
         format!("{}\r", shown_recovery_key(terminal)).into_bytes()
     }
 
-    /// `lock on` with PASSWORD and the key typed back.
+    /// `lock on`'s dialogue with PASSWORD and the key typed back (D.4a's).
+    fn lock_steps() -> Vec<Step> {
+        vec![
+            Step::Expect("Lock the secrets of the target store at "),
+            Step::Expect(NEW),
+            line(PASSWORD),
+            Step::Expect(REPEAT),
+            line(PASSWORD),
+            Step::Expect(CONFIRM),
+            Step::TypeFrom(type_key),
+        ]
+    }
+
+    /// `lock on --lock-password` with PASSWORD and the key typed back (G-LOCKON-D4A: D.4b B58).
     fn lock_at_terminal(sp: &Spawn) -> Ended {
-        converse(
-            sp,
-            &["lock", "on"],
-            &[
-                Step::Expect("Lock the secrets of the target store at "),
-                Step::Expect(NEW),
-                line(PASSWORD),
-                Step::Expect(REPEAT),
-                line(PASSWORD),
-                Step::Expect(CONFIRM),
-                Step::TypeFrom(type_key),
-            ],
-        )
+        converse(sp, &["lock", "on", "--lock-password"], &lock_steps())
     }
 
     const YAML: &str = "apiVersion: v1\nkind: Config\nclusters: []\n";
@@ -256,6 +356,8 @@ mod at_a_terminal {
             holding(&sp.store(), TOKEN).is_empty(),
             "the token stayed in clear"
         );
+        // G-LOCKON-D4A (D.4b B58, B71, B93): the whole dialogue, byte for byte.
+        check_transcript("lock/lock_on_lock_password", &sp, &end);
     }
 
     /// O2 (overview §5 d): a 14-character password shows C13 and `Use it anyway? [y/N]`;
@@ -268,7 +370,7 @@ mod at_a_terminal {
         seeded(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(SHORT),
@@ -304,7 +406,7 @@ mod at_a_terminal {
         seeded(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(""),
@@ -345,7 +447,7 @@ mod at_a_terminal {
                 .replace('\n', " ");
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(NEW),
                 line(PASSWORD),
@@ -477,7 +579,7 @@ mod at_a_terminal {
         interrupted(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect("did not finish; finishing it."),
                 Step::Expect(RESUME_PASSWORD),
@@ -493,6 +595,8 @@ mod at_a_terminal {
             holding(&sp.store(), TOKEN).is_empty(),
             "the token stayed in clear"
         );
+        // G-LOCKON-D4A: the resume's dialogue, byte for byte.
+        check_transcript("lock/lock_on_lock_password_resume", &sp, &end);
     }
 
     /// Rule 4 (team decision 2026-10-13): without the recovery key a resume finishes nothing.
@@ -508,7 +612,7 @@ mod at_a_terminal {
         let before = store_yaml(&sp);
         let end = converse(
             &sp,
-            &["lock", "on"],
+            &["lock", "on", "--lock-password"],
             &[
                 Step::Expect(RESUME_PASSWORD),
                 line(PASSWORD),
@@ -560,5 +664,121 @@ mod at_a_terminal {
         assert!(!end.terminal.contains("shared age key"), "{}", end.terminal);
         assert!(!end.terminal.contains(&shown) && !end.stdout.contains(&shown));
         assert!(!dest.exists() && !default.exists());
+    }
+
+    /// D.4b B80 (d4b-e1a): the recovery key is shown with the id of the slot that holds it —
+    /// the vault's recovery-key slot once `lock on` says Locked — and the result says so.
+    #[test]
+    fn the_key_is_shown_with_the_id_of_the_slot_that_holds_it() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let end = lock_at_terminal(&sp);
+        assert!(end.status.success(), "{}", end.terminal);
+        assert!(
+            end.terminal
+                .contains("This recovery key opens the store only when AppRafter says Locked."),
+            "{}",
+            end.terminal
+        );
+        let id = shown_slot_id(&end.terminal);
+        let bytes = std::fs::read(sp.store().join("vault")).unwrap();
+        let vault = apprafter_core::vault::VaultFile::parse(&bytes).unwrap();
+        let recovery = vault
+            .header()
+            .slots
+            .iter()
+            .find(|slot| slot.kind == apprafter_core::vault::SlotKind::RecoveryKey)
+            .unwrap();
+        assert!(
+            recovery.id.to_string().starts_with(&id),
+            "{id} is not {}",
+            recovery.id
+        );
+        assert!(
+            end.stdout.contains(&format!(
+                "the recovery key of slot {id} opens it from now on"
+            )),
+            "{}",
+            end.stdout
+        );
+    }
+
+    /// B80: a key shown before a cancel names a slot no vault holds — none was written — and
+    /// the next run shows a key of another id.
+    #[test]
+    fn a_key_shown_before_a_cancel_names_a_slot_no_vault_holds() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let cancelled = converse(
+            &sp,
+            &["lock", "on", "--lock-password"],
+            &[
+                Step::Expect(NEW),
+                line(PASSWORD),
+                Step::Expect(REPEAT),
+                line(PASSWORD),
+                Step::Expect(CONFIRM),
+                Step::Type(vec![0x03]),
+            ],
+        );
+        assert_eq!(cancelled.status.code(), Some(1), "{}", cancelled.terminal);
+        let first = shown_slot_id(&cancelled.terminal);
+        assert!(!sp.store().join("vault").exists());
+        let end = lock_at_terminal(&sp);
+        assert!(end.status.success(), "{}", end.terminal);
+        assert_ne!(shown_slot_id(&end.terminal), first);
+    }
+
+    /// D.4b B55, B82, B88 (1) (d4b-e1a): a plain `lock on` where APPRAFTER_SANDBOX fences this
+    /// account — every spawned test's — asks this computer nothing, says so first and takes a
+    /// lock password: the fence's two lines, then D.4a's dialogue byte for byte
+    /// (`lock_on_lock_password`, G-LOCKON-D4A).
+    #[test]
+    fn a_plain_lock_on_under_the_fence_takes_a_lock_password_and_says_why() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let end = converse(&sp, &["lock", "on"], &lock_steps());
+        assert!(end.status.success(), "{}", end.terminal);
+        check_transcript("lock/lock_on_fallback_sandbox_unix", &sp, &end);
+        let d4a = std::fs::read_to_string(
+            common::golden::golden_root().join("lock/lock_on_lock_password.golden"),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript(&sp, &end).replacen(SANDBOX_HEAD_UNIX, "", 1),
+            d4a,
+            "the fence's two lines, then D.4a's dialogue"
+        );
+    }
+
+    /// D.4b-e1a: the transcript harness masks what varies per run — the root, the recovery
+    /// key's groups, a carriage return, a test build's line — and nothing else.
+    #[test]
+    fn a_transcript_masks_what_varies_and_nothing_else() {
+        let sp = Spawn::new();
+        let root = sp.root().display().to_string();
+        let raw = format!(
+            "INSECURE-FAST-KDF: this test build derives keys with weak parameters\r\n\
+             Recovery key for {root}/s — shown only now:\r\n\r\n    APPRAFTER-RECOVERY-KEY-1\r\n\
+             \x20   QQQSY-QCYQ5\r\n\r\nIt opens this store.\r\n"
+        );
+        assert_eq!(
+            normalize(&sp, &raw),
+            "Recovery key for <SANDBOX>/s — shown only now:\n\n    APPRAFTER-RECOVERY-KEY-1\n    \
+             <RECOVERY-KEY>\n\nIt opens this store.\n"
+        );
+        assert_eq!(normalize(&sp, "Lock the secrets\n"), "Lock the secrets\n");
+        assert_eq!(
+            normalize(
+                &sp,
+                "for ~/s · slot 3a4b5c6d — shown\n✓ the recovery key of slot 0123abcd opens\n\
+                 slot 0123456789abcdef0 stays\nslot 3A4B5C6D stays\n"
+            ),
+            "for ~/s · slot <SLOT> — shown\n✓ the recovery key of slot <SLOT> opens\n\
+             slot 0123456789abcdef0 stays\nslot 3A4B5C6D stays\n"
+        );
     }
 }

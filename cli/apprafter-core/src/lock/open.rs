@@ -157,22 +157,39 @@ use cli_core::CliError;
 
 use crate::error::{CoreError, CoreResult};
 use crate::secrets::{read_vault, vault_error, StoreId};
+use crate::vault::MachineId;
 use crate::vault::{DataKey, KdfPolicy, SlotInput, SlotSecret, VaultError, VaultFile, VaultId};
 
+use super::SlotRef;
+
 /// A vault opened in this process from one prompt's input (D.4a §3.9): its data key, for the
-/// vault it opens. Its `Debug` shows no key (`DataKey`'s own).
+/// vault it opens, and the slot whose secret opened it. Its `Debug` shows no key (`DataKey`'s
+/// own). Only [`open_at`] makes one (`opened_with` is private): a flow given an `OpenedVault`
+/// knows a fresh secret opened the vault in this process — never a holder's key, never the
+/// key an unlocked app holds (D.4b B19, B60).
 #[derive(Debug)]
 pub struct OpenedVault {
     pub key: Arc<DataKey>,
     pub vault_id: VaultId,
     /// The store's default unlock window, from the vault (T33).
     pub unlock_timeout_min: u32,
+    opened_with: SlotRef,
+}
+
+impl OpenedVault {
+    /// The slot whose secret opened the vault (B60: an outcome names it).
+    pub fn opened_with(&self) -> &SlotRef {
+        &self.opened_with
+    }
 }
 
 /// Opens the vault of the store at `root`, whose `store.yaml` names `id`, with one prompt's
-/// `input` under `policy`, in this process (T62): a recovery key tries the recovery slots,
-/// anything else the password slots, and recovery-key-shaped input whose checksum fails is tried
-/// as a password too and, when that fails, is `recovery_key_invalid` naming its group. A secret
+/// `input` under `policy`, in this process (T62): a recovery key tries the recovery slots; a
+/// lock password the lock-password slots; the account password this computer's
+/// account-password slot (B54); typed text the lock-password slot, then this computer's
+/// account-password slot (B27, the prompt's input from d4b-c1 on); recovery-key-shaped input
+/// whose checksum fails is tried as a lock password too and, when that fails, is
+/// `recovery_key_invalid` naming its group. A secret
 /// no slot takes is one failed attempt (`unlock_failed`, `attempts: 1`), for the caller to
 /// count. The vault is read and checked to be this store's first (`vault_unreadable`, T29).
 pub fn open_at(
@@ -186,6 +203,10 @@ pub fn open_at(
     let opened = match input {
         SlotInput::RecoveryKey(key) => parsed.open(&SlotSecret::RecoveryKey(key), policy),
         SlotInput::Password(password) => parsed.open(&SlotSecret::Password(password), policy),
+        SlotInput::AccountPassword(password, machine) => {
+            parsed.open(&SlotSecret::AccountPassword(password, machine), policy)
+        }
+        SlotInput::Typed(typed, machine) => parsed.open_typed(&typed, machine.as_ref(), policy),
         SlotInput::MistypedRecoveryKey { as_password, error } => {
             match parsed.open(&SlotSecret::Password(as_password), policy) {
                 Err(VaultError::WrongSecret { .. } | VaultError::NoUsableSlot { .. }) => {
@@ -202,10 +223,20 @@ pub fn open_at(
         .payload()
         .unlock_timeout_min()
         .map_err(|e| failed(root, e))?;
+    let opened_with = opened
+        .opened_by()
+        .and_then(|id| opened.header().slots.iter().find(|slot| slot.id == id))
+        .map(SlotRef::from)
+        .ok_or_else(|| {
+            CoreError::Cli(CliError::Other(
+                "the vault opened, and no slot says it opened it".to_string(),
+            ))
+        })?;
     Ok(OpenedVault {
         key: opened.data_key().clone(),
         vault_id: opened.header().vault_id,
         unlock_timeout_min,
+        opened_with,
     })
 }
 
@@ -256,17 +287,17 @@ pub fn set_unlock_timeout(
 /// One slot of a store's vault, opened in this process by a secret of that slot's own kind
 /// (D.4a rule 4; team decision 2026-10-13): what a resumed `lock on` needs twice — the
 /// password slot and the recovery slot — before any clear datum goes. Made only by
-/// [`open_slot_at`], so its kind is the slot that opened, never a caller's claim.
+/// [`open_slot_at`], so its kind is the slot that opened — the vault names it
+/// (`OpenedVault::opened_with`, D.4b B56) — never a caller's claim.
 #[derive(Debug)]
 pub struct SlotOpened {
-    kind: crate::secrets::LockSlotKind,
     opened: OpenedVault,
 }
 
 impl SlotOpened {
     /// The kind of slot that opened the vault.
     pub fn kind(&self) -> crate::secrets::LockSlotKind {
-        self.kind
+        self.opened.opened_with().kind
     }
 
     /// The vault it opened: its data key, for that vault.
@@ -276,21 +307,27 @@ impl SlotOpened {
 }
 
 /// Opens the vault of the store at `root` (`id`) with `secret` as the secret of a `kind` slot,
-/// and of no other kind: a lock password tries the password slots only, so a recovery key typed
-/// there opens nothing; a recovery key is parsed first (`recovery_key_invalid` naming its group,
-/// one attempt) and tries the recovery slots only. A secret no slot of that kind takes is
-/// `unlock_failed`, one attempt, for the caller to count. Any other kind is the caller's
-/// mistake: `usage_refused`.
+/// and of no other kind: a lock password tries the lock-password slot only, so a recovery key
+/// or an account password typed there opens nothing; the account password tries this
+/// computer's account-password slot only — with its machine id, `machine` (D.4b B56; without
+/// one it is `account_password_refused`, never a try) — and asks the system nothing (B13); a
+/// recovery key is parsed first (`recovery_key_invalid` naming its group, one attempt) and
+/// tries the recovery slots only. A secret no slot of that kind takes is `unlock_failed`, one
+/// attempt, for the caller to count. Any other kind is the caller's mistake: `usage_refused`.
 pub fn open_slot_at(
     root: &Path,
     id: &StoreId,
     kind: crate::secrets::LockSlotKind,
     secret: crate::context::SecretString,
+    machine: Option<MachineId>,
     policy: &KdfPolicy,
 ) -> CoreResult<SlotOpened> {
     use crate::secrets::LockSlotKind;
     let input = match kind {
         LockSlotKind::Password => SlotInput::Password(secret),
+        LockSlotKind::OsPassword => {
+            SlotInput::AccountPassword(secret, machine.ok_or_else(no_machine_id)?)
+        }
         LockSlotKind::RecoveryKey => SlotInput::RecoveryKey(
             crate::vault::RecoveryKey::parse(secret.expose())
                 .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?,
@@ -306,8 +343,18 @@ pub fn open_slot_at(
         }
     };
     Ok(SlotOpened {
-        kind,
         opened: open_at(root, id, input, policy)?,
+    })
+}
+
+/// D.4b B54: an account-password slot opens only with this computer's machine id, which the
+/// client could not read here.
+fn no_machine_id() -> CoreError {
+    CoreError::Cli(CliError::AccountPasswordRefused {
+        reason: cli_core::AccountPasswordRefusal::Unavailable {
+            what: cli_core::AccountCheckUnavailable::NoMachineId,
+        },
+        messages: Vec::new(),
     })
 }
 
@@ -362,7 +409,9 @@ mod check_password_tests {
 mod open_at_tests {
     use super::*;
     use crate::context::SecretString;
-    use crate::secrets::testing::locked_store;
+    use crate::secrets::testing::{locked_store, LockedTestStore};
+    use crate::vault::{MachineId, NewSlot, OsRandom, VAULT_FILE};
+    use cli_core::StoreLock;
 
     const TOKEN: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
@@ -380,7 +429,7 @@ mod open_at_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let made = locked_store(&root, &[("prod", Some(TOKEN))]);
-        let input = SlotInput::from_input(made.recovery_key().clone());
+        let input = SlotInput::from_input(made.recovery_key().clone(), None);
         let opened = open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap();
         assert_eq!(opened.vault_id, made.vault_id);
         assert_eq!(opened.key.expose(), made.data_key().expose());
@@ -394,7 +443,7 @@ mod open_at_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
         let made = locked_store(&root, &[("prod", Some(TOKEN))]);
-        let input = SlotInput::from_input(SecretString::new("not the password"));
+        let input = SlotInput::from_input(SecretString::new("not the password"), None);
         match open_at(&root, &made.store_id, input, KdfPolicy::active()).unwrap_err() {
             CoreError::Cli(CliError::UnlockFailed {
                 attempts, store, ..
@@ -414,7 +463,7 @@ mod open_at_tests {
         match open_at(
             &root,
             &made.store_id,
-            SlotInput::from_input(typed),
+            SlotInput::from_input(typed, None),
             KdfPolicy::active(),
         )
         .unwrap_err()
@@ -434,7 +483,7 @@ mod open_at_tests {
         let made_a = locked_store(&a, &[("prod", Some(TOKEN))]);
         let made_b = locked_store(&b, &[("prod", Some(TOKEN))]);
         std::fs::copy(b.join("vault"), a.join("vault")).unwrap();
-        let input = SlotInput::from_input(made_b.recovery_key().clone());
+        let input = SlotInput::from_input(made_b.recovery_key().clone(), None);
         assert!(matches!(
             open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
             CoreError::Cli(CliError::VaultUnreadable {
@@ -443,7 +492,7 @@ mod open_at_tests {
             })
         ));
         std::fs::remove_file(a.join("vault")).unwrap();
-        let input = SlotInput::from_input(made_a.recovery_key().clone());
+        let input = SlotInput::from_input(made_a.recovery_key().clone(), None);
         assert!(matches!(
             open_at(&a, &made_a.store_id, input, KdfPolicy::active()).unwrap_err(),
             CoreError::Cli(CliError::VaultUnreadable {
@@ -451,5 +500,150 @@ mod open_at_tests {
                 ..
             })
         ));
+    }
+
+    const ACCOUNT: &str = "hunter2 is not a password";
+
+    fn here() -> MachineId {
+        MachineId::new(&[0x0a; 16]).unwrap()
+    }
+
+    /// `made`'s vault with this computer's account-password slot added (fast costs), as d4b-c1's
+    /// `lock slot add os-password` will add one.
+    fn with_account_password(root: &Path, made: &LockedTestStore) {
+        let path = root.join(VAULT_FILE);
+        let bytes = crate::vault::file::read(&path).unwrap();
+        let mut opened = VaultFile::parse(&bytes)
+            .unwrap()
+            .open_with_key(made.data_key(), made.vault_id)
+            .unwrap();
+        opened
+            .add_slot(
+                NewSlot::OsPassword {
+                    secret: SecretString::new(ACCOUNT),
+                    label: "account password of walker on box-a".into(),
+                    enrolled_at: 1_760_000_000,
+                    machine: here(),
+                },
+                &KdfPolicy::INSECURE_FAST,
+                &mut OsRandom,
+            )
+            .unwrap();
+        let sealed = opened.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+        let held = StoreLock::exclusive(&TargetStorePaths::for_root(root.to_path_buf())).unwrap();
+        crate::vault::file::replace(&path, &sealed, &held).unwrap();
+    }
+
+    fn one_failed_attempt(result: CoreResult<OpenedVault>) {
+        match result.unwrap_err() {
+            CoreError::Cli(CliError::UnlockFailed { attempts: 1, .. }) => {}
+            e => panic!("expected one failed attempt, got {e:?}"),
+        }
+    }
+
+    /// B27 (the prompt's input from d4b-c1 on): typed text opens this computer's
+    /// account-password slot; without its machine id, or with another computer's, it is one
+    /// failed attempt.
+    #[test]
+    fn typed_text_opens_this_computers_account_password_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        let input = SlotInput::Typed(typed(), Some(here()));
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.key.expose(), made.data_key().expose());
+        one_failed_attempt(open_at(
+            &root,
+            &made.store_id,
+            SlotInput::Typed(typed(), None),
+            fast,
+        ));
+        let elsewhere = MachineId::new(&[0x0b; 16]).unwrap();
+        let input = SlotInput::Typed(typed(), Some(elsewhere));
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// Critic-plan M1, B56: a lock password's input never opens an account-password slot; the
+    /// account password's opens this computer's slot only.
+    #[test]
+    fn the_account_password_input_opens_only_this_computers_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        one_failed_attempt(open_at(
+            &root,
+            &made.store_id,
+            SlotInput::Password(typed()),
+            fast,
+        ));
+        let input = SlotInput::AccountPassword(typed(), here());
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.vault_id, made.vault_id);
+        let elsewhere = MachineId::new(&[0x0b; 16]).unwrap();
+        let input = SlotInput::AccountPassword(typed(), elsewhere);
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// B27 (d4b-c1): the prompt's input — whatever a client's prompt or field gets — opens
+    /// this computer's account-password slot when the client knows the machine id, and is
+    /// one failed attempt without it, as before.
+    #[test]
+    fn the_prompts_input_reaches_this_computers_account_password_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let typed = || SecretString::new(ACCOUNT);
+        let input = SlotInput::from_input(typed(), Some(here()));
+        let opened = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(opened.vault_id, made.vault_id);
+        let input = SlotInput::from_input(typed(), None);
+        one_failed_attempt(open_at(&root, &made.store_id, input, fast));
+    }
+
+    /// B60: an opened vault names the slot whose secret opened it — the recovery key's, this
+    /// computer's account password's — by its id, kind and label.
+    #[test]
+    fn an_opened_vault_names_the_slot_whose_secret_opened_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let made = locked_store(&root, &[("prod", Some(TOKEN))]);
+        with_account_password(&root, &made);
+        let bytes = crate::vault::file::read(&root.join(VAULT_FILE)).unwrap();
+        let ids: Vec<String> = VaultFile::parse(&bytes)
+            .unwrap()
+            .header()
+            .slots
+            .iter()
+            .map(|slot| slot.id.to_string())
+            .collect();
+        let fast = &KdfPolicy::INSECURE_FAST;
+        let input = SlotInput::from_input(made.recovery_key().clone(), None);
+        let by_key = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(
+            by_key.opened_with(),
+            &SlotRef {
+                id: ids[0].clone(),
+                kind: crate::secrets::LockSlotKind::RecoveryKey,
+                label: "recovery key".into(),
+            }
+        );
+        let input = SlotInput::from_input(SecretString::new(ACCOUNT), Some(here()));
+        let by_account = open_at(&root, &made.store_id, input, fast).unwrap();
+        assert_eq!(
+            by_account.opened_with(),
+            &SlotRef {
+                id: ids[1].clone(),
+                kind: crate::secrets::LockSlotKind::OsPassword,
+                label: "account password of walker on box-a".into(),
+            }
+        );
     }
 }

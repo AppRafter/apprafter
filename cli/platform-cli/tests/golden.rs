@@ -303,9 +303,12 @@ fn harness_refuses_output_that_still_names_the_sandbox_root() {
     sb.assert_no_raw_root("harness/split", &format!("× {head}\n  │ {tail}/home\n"));
 }
 
-/// Every recorded file must belong to a case in this file or in
-/// `golden_doctor.rs`; otherwise a renamed or deleted case would leave a
-/// golden that nothing checks.
+/// Every recorded file must belong to a case in this file, in
+/// `golden_doctor.rs` or, for `lock on`'s transcripts (D.4b-e1a), in
+/// `lock_test.rs` or `lock_on_ways_test.rs` — by its case name, or by its
+/// file's path where a test reads it so (`lock_on_fallback_sandbox_windows`);
+/// otherwise a renamed or deleted case would leave a golden that nothing
+/// checks.
 #[test]
 fn every_golden_file_has_a_case() {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -318,7 +321,12 @@ fn every_golden_file_has_a_case() {
             }
         }
     }
-    let sources = [include_str!("golden.rs"), include_str!("golden_doctor.rs")];
+    let sources = [
+        include_str!("golden.rs"),
+        include_str!("golden_doctor.rs"),
+        include_str!("lock_test.rs"),
+        include_str!("lock_on_ways_test.rs"),
+    ];
     let root = golden_root();
     let mut files = Vec::new();
     collect(&root, &mut files);
@@ -338,13 +346,16 @@ fn every_golden_file_has_a_case() {
         })
         .filter(|id| {
             let quoted = format!("\"{id}\"");
-            !sources.iter().any(|source| source.contains(&quoted))
+            let path = format!("/{id}.golden\"");
+            !sources
+                .iter()
+                .any(|source| source.contains(&quoted) || source.contains(&path))
         })
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs or golden_doctor.rs (restore the case or \
-         delete the file): {orphans:?}"
+        "golden files with no case in golden.rs, golden_doctor.rs, lock_test.rs or \
+         lock_on_ways_test.rs (restore the case or delete the file): {orphans:?}"
     );
 }
 

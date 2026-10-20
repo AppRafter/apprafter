@@ -7,7 +7,8 @@
 //! 1. `store.yaml` says `locking`, with a fresh id (after a re-read under the lock: a run that
 //!    won the race finished meanwhile, G13);
 //! 2. the vault is written by no-replace, its directory synced (c1's `write_new`);
-//! 3. it is read back from disk and opened with the password slot AND the recovery slot, and
+//! 3. it is read back from disk and opened with the first slot (the plan's way in, D.4b B56)
+//!    AND the recovery slot, and
 //!    every entry compared;
 //! 4. per target, each cache is re-sealed to the store's key and checked (Cancel is honoured
 //!    until here: before it, what this run wrote is undone);
@@ -17,7 +18,8 @@
 //!
 //! No clear datum is deleted before a vault verified with both slots (rule 4). A run
 //! interrupted with its vault on disk resumes at step 3 with both slots' secrets — the vault on
-//! disk opened with the password slot's key AND the recovery slot's, each slot opened by a
+//! disk opened with the everyday slot's key — of the kind the plan read from it (D.4b B56)
+//! — AND the recovery slot's, each slot opened by a
 //! secret of its own kind (`lock::open_slot_at`; team decision 2026-10-13); without one of
 //! them the way out is `lock off`, which backs out, and a new `lock on`. One interrupted before
 //! starts over, with a new id and a new recovery key (the one shown before is void, G13).
@@ -36,12 +38,16 @@ use age::secrecy::ExposeSecret;
 use cli_core::secrets::{CachedSecret, Identity};
 use cli_core::target::TargetStorePaths;
 use cli_core::{CliError, LockPhase, SecretsModeKind, StoreLock};
-use cli_state::{SealedTo, State, StatePaths, Write};
+use cli_state::{SealedTo, State, StatePaths};
 use serde::Serialize;
-use zeroize::Zeroizing;
 
 use super::faults::{self, FaultPoint};
-use super::open::{check_password, SlotOpened};
+use super::open::SlotOpened;
+use super::reseal::StateFolder;
+use super::reseal::{reseal, OldKeys, ResealMode, Resealed};
+use super::ways::FirstSlot;
+use super::ways::{self, LockOnWay, Way, WayAsked, WayFallback};
+use super::SlotNote;
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
@@ -53,10 +59,13 @@ use crate::secrets::{
     vault_write_error, CacheKey, KeySession, LockSlotKind, SecretsMode, SlotInfo, StoreFile,
     StoreId, STORE_FILE, STORE_FILE_FORMAT,
 };
+use crate::vault::MachineId;
+use crate::vault::VaultHeader;
 use crate::vault::{
     self, ConfirmedRecoveryKey, NewSlot, OsRandom, RecoveryKey, SlotSecret, UnlockedVault,
     VaultError, VaultFile, VaultPayload, DEFAULT_UNLOCK_TIMEOUT_MIN,
 };
+use crate::vault::{SlotId, VaultId, VaultIds};
 use crate::CancellationToken;
 
 /// The labels of the two slots `lock on` makes (`store.yaml` mirrors them).
@@ -80,9 +89,10 @@ thread_local! {
 pub enum LockOnStart {
     /// From files, or after a run that wrote no vault (`restart`: its recovery key is void).
     New { restart: bool },
-    /// A run interrupted with its vault on disk: finished once the vault opens with both
-    /// slots' secrets (rule 4).
-    Resume { id: StoreId },
+    /// A run interrupted with its vault on disk: finished once the vault opens with its
+    /// everyday slot's secret — `everyday`, that slot's kind, read from the vault when the
+    /// run was planned (D.4b B56) — and with the recovery key's (rule 4).
+    Resume { id: StoreId, everyday: LockSlotKind },
     /// The store is locked already.
     AlreadyLocked,
 }
@@ -94,14 +104,33 @@ pub struct CacheDrop {
     pub secret: CachedSecret,
 }
 
-/// What [`execute_on`] carries out. It never crosses IPC (`Plan::payload`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`execute_on`] carries out. It never crosses IPC (`Plan::payload`). Not
+/// `PartialEq`: a plan for the account password holds this computer's machine id, compared
+/// only as bytes where it binds a slot.
+#[derive(Debug, Clone)]
 pub struct LockOnPayload {
     start: LockOnStart,
     timeout_min: u32,
     keys: Vec<PathBuf>,
     drops: Vec<CacheDrop>,
+    /// A new run's way in; `None` for a resume or a store locked already.
+    new_run: Option<NewRun>,
 }
+
+/// What a new run's plan settles before anything is asked (D.4b B55, B56).
+#[derive(Debug, Clone)]
+struct NewRun {
+    /// The way its first slot takes, from the client's facts in B88's order.
+    way: Way,
+    /// The new vault's id and its slots' — the first slot's, then the recovery key's —
+    /// minted when the run is planned (B57, B80).
+    ids: VaultIds,
+    /// ADR 0069 §1 answer 2: the account password was checked with the system already.
+    checked: bool,
+}
+
+/// Where the recovery key's slot is among a new vault's: after the first slot (B57).
+const RECOVERY_SLOT: usize = 1;
 
 impl LockOnPayload {
     pub fn start(&self) -> &LockOnStart {
@@ -119,20 +148,96 @@ impl LockOnPayload {
     pub fn keys(&self) -> &[PathBuf] {
         &self.keys
     }
+
+    /// The way a new run's first slot takes (D.4b B55): this computer's everyday way, or a
+    /// separate lock password; `None` for a resume or a store locked already.
+    pub fn way(&self) -> Option<LockOnWay> {
+        self.new_run.as_ref().map(|run| run.way.way)
+    }
+
+    /// Why the plan takes a separate lock password instead of this computer's everyday way,
+    /// when it does (B55, B88): the client says it in the plan's first lines.
+    pub fn fallback(&self) -> Option<WayFallback> {
+        self.new_run.as_ref().and_then(|run| run.way.fallback)
+    }
+
+    /// B75 (2): this account's password status could not be read, so the account-password
+    /// prompt says that Enter on an empty line means "no password" — and the run then takes
+    /// a separate lock password.
+    pub fn empty_entry_falls_back(&self) -> bool {
+        self.new_run
+            .as_ref()
+            .is_some_and(|run| run.way.empty_entry_falls_back)
+    }
+
+    /// What the everyday slot costs and adds, each said before its secret is asked (B61,
+    /// B70, B76): the CLI's words are `text::plan_note_line`.
+    pub fn notes(&self) -> &[SlotNote] {
+        match &self.new_run {
+            Some(run) => &run.way.notes,
+            None => &[],
+        }
+    }
+
+    /// The new vault's id, minted when the run was planned (D.4b B57): `None` for a resume or
+    /// a store locked already.
+    pub fn vault_id(&self) -> Option<VaultId> {
+        self.new_run.as_ref().map(|run| run.ids.vault_id)
+    }
+
+    /// The recovery key's slot id, minted when the run was planned (D.4b B80): shown with the
+    /// key, so a key shown before a crash is never taken for one that opens the store — its
+    /// id is then in no slot list. `None` for a resume or a store locked already.
+    pub fn recovery_slot_id(&self) -> Option<SlotId> {
+        self.new_run
+            .as_ref()
+            .map(|run| run.ids.slots[RECOVERY_SLOT])
+    }
+
+    /// The machine id a new run's account-password slot is bound to (D.4b B54): this
+    /// computer's, as the client's facts gave it to the plan.
+    pub(super) fn machine(&self) -> Option<&MachineId> {
+        self.new_run
+            .as_ref()
+            .and_then(|run| run.way.machine.as_ref())
+    }
+
+    /// ADR 0069 §1 answer 2: one check of the account password a run — `true` the first
+    /// time a new run's plan spends it, `false` after (F11).
+    pub(super) fn take_check(&mut self) -> bool {
+        match self.new_run.as_mut() {
+            Some(run) if !run.checked => {
+                run.checked = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A new run's ids, read before anything is written.
+    fn ids(&self) -> CoreResult<&VaultIds> {
+        self.new_run.as_ref().map(|run| &run.ids).ok_or_else(|| {
+            CoreError::Cli(CliError::Other(
+                "a `lock on` plan for a new run holds no ids; nothing was written".to_string(),
+            ))
+        })
+    }
 }
 
 /// The secrets a run is given.
 pub enum LockOnInput {
-    /// A new vault: the lock password (`check_password`'s), and the recovery key the person typed
-    /// back in full (T25, O12).
+    /// A new vault: its first slot, made by `lock::first_slot` for the plan's way once its
+    /// secret was checked (D.4b B56), and the recovery key that step drew, typed back in
+    /// full (T25, O12).
     New {
-        password: SecretString,
+        first: FirstSlot,
         recovery: ConfirmedRecoveryKey,
     },
-    /// Finishing an interrupted run: its vault, opened once by the lock password's slot and
-    /// once by the recovery key's (`lock::open_slot_at`; rule 4, team decision 2026-10-13).
+    /// Finishing an interrupted run: its vault, opened once by its everyday slot — of the
+    /// kind the plan read (`LockOnStart::Resume`'s `everyday`) — and once by the recovery
+    /// key's (`lock::open_slot_at`; rule 4, team decision 2026-10-13; D.4b B56).
     Resume {
-        password: SlotOpened,
+        everyday: SlotOpened,
         recovery: SlotOpened,
     },
 }
@@ -236,6 +341,7 @@ fn plan(
     timeout_min: u32,
     keys: Vec<PathBuf>,
     drops: Vec<CacheDrop>,
+    new_run: Option<NewRun>,
 ) -> Plan<LockOnPayload> {
     Plan {
         class: PlanClass::Bounded,
@@ -246,6 +352,7 @@ fn plan(
             timeout_min,
             keys,
             drops,
+            new_run,
         },
     }
 }
@@ -323,7 +430,16 @@ pub(super) fn refresh(secret: CachedSecret, target: &str) -> String {
 /// credentials and state, the shared keys when a target has a sealed cache (never created) —
 /// refusing a record it cannot read, which may hold the only copy of a secret. Under a weak KDF
 /// policy outside its roots it is `insecure_kdf_refused` before anything is asked (T23).
-pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockOnPayload>> {
+///
+/// A new run takes its way in here (D.4b B55, B88): `asked` is a separate lock password
+/// (`--lock-password`) or this computer's everyday way with what the client found out about
+/// it; a back-off in force refuses the plan (B74). A resume, or a store locked already, asks
+/// the client nothing.
+pub fn plan_on(
+    ctx: &Context,
+    timeout_min: Option<u32>,
+    asked: WayAsked<'_>,
+) -> CoreResult<Plan<LockOnPayload>> {
     super::permit(ctx)?;
     let timeout = timeout_min.unwrap_or(DEFAULT_UNLOCK_TIMEOUT_MIN);
     super::check_timeout(timeout)?;
@@ -343,12 +459,22 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
             timeout,
             Vec::new(),
             Vec::new(),
+            None,
         )),
         Some((SecretsMode::Unlocking, _)) => Err(CoreError::Cli(CliError::LockIncomplete {
             store: root.to_path_buf(),
             phase: LockPhase::Unlocking,
         })),
+        // D.4b B63, F2: an unfinished key change is finished by `lock rekey` or `lock
+        // recovery`, never planned over as a new `lock on`.
+        Some((SecretsMode::Rotating, _)) => Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: LockPhase::Rotating,
+        })),
         Some((SecretsMode::Locking, Some(id))) if vault_on_disk(root)? => {
+            // D.4b B56: what the resume asks besides the recovery key, from the vault's
+            // header (F6).
+            let everyday = resumable(&store, &id)?;
             let mut changes = Vec::new();
             for target in &targets {
                 if let Credentials::Clear(_) = transfer::credentials(&store, target)? {
@@ -371,23 +497,33 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
                 "Vault",
                 &vault_path(root).display().to_string(),
                 ChangeAction::Keep,
-                "written by the earlier run; opened with the lock password and with the \
-                 recovery key before anything leaves the files",
+                &format!(
+                    "written by the earlier run; opened with {} and with the recovery key \
+                     before anything leaves the files",
+                    opener_noun(everyday)
+                ),
             ));
             let keys = keys_for_caches(ctx, &store, &targets)?;
             Ok(plan(
-                LockOnStart::Resume { id },
+                LockOnStart::Resume { id, everyday },
                 title("Finish locking the secrets of", root, &targets),
                 changes,
                 timeout,
                 keys,
                 Vec::new(),
+                None,
             ))
         }
         mode => {
             let restart = matches!(mode, Some((SecretsMode::Locking, _)));
+            // D.4b B55, B74, B88: the way in first, from the client's facts; a back-off in
+            // force refuses here, before a cache is read or anything is asked.
+            let way = ways::decide(asked)?;
+            // D.4b B57, B80: the vault's id and both slots' — the first, then the recovery
+            // key's — minted now, so the recovery key is shown with its slot's id.
+            let ids = VaultIds::draw(2, &mut OsRandom).map_err(|e| vault_err(root, e))?;
             let keys = keys_for_caches(ctx, &store, &targets)?;
-            let (changes, drops) = survey(&store, root, &targets, &keys)?;
+            let (changes, drops) = survey(&store, root, &targets, &keys, way.way)?;
             Ok(plan(
                 LockOnStart::New { restart },
                 title("Lock the secrets of", root, &targets),
@@ -395,8 +531,49 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
                 timeout,
                 keys,
                 drops,
+                Some(NewRun {
+                    way,
+                    ids,
+                    checked: false,
+                }),
             ))
         }
+    }
+}
+
+/// The everyday slot's kind of an interrupted run's vault (D.4b B56), read from its header
+/// without a secret: what its resume asks besides the recovery key. A vault with no such
+/// slot this build opens by a typed secret — Windows Hello until d4b-w2 — cannot be
+/// finished here: `lock_incomplete`, whose help names `lock off`, which backs the run out
+/// with the recovery key.
+fn resumable(store: &TargetStorePaths, id: &StoreId) -> CoreResult<LockSlotKind> {
+    let disk = read_vault(store, id)?;
+    let parsed = VaultFile::parse(&disk).map_err(|e| vault_err(store.root(), e))?;
+    everyday_slot(parsed.header()).ok_or_else(|| {
+        CoreError::Cli(CliError::LockIncomplete {
+            store: store.root().to_path_buf(),
+            phase: LockPhase::Locking,
+        })
+    })
+}
+
+/// The kind of `header`'s everyday slot (D.4b B56): its first slot that is not a recovery
+/// key's, when that is a lock password's or an account password's — the kinds this build
+/// opens by a typed secret.
+pub(super) fn everyday_slot(header: &VaultHeader) -> Option<LockSlotKind> {
+    header
+        .slots
+        .iter()
+        .map(|slot| LockSlotKind::from(slot.kind))
+        .find(|kind| *kind != LockSlotKind::RecoveryKey)
+        .filter(|kind| matches!(kind, LockSlotKind::Password | LockSlotKind::OsPassword))
+}
+
+/// What a resume opens the everyday slot with, as its plan line says it (D.4a C6; D.4b B56).
+fn opener_noun(kind: LockSlotKind) -> &'static str {
+    match kind {
+        LockSlotKind::OsPassword => "your account password",
+        _ => "the lock password",
     }
 }
 
@@ -406,6 +583,7 @@ fn survey(
     root: &Path,
     targets: &[String],
     keys: &[PathBuf],
+    way: LockOnWay,
 ) -> CoreResult<(Vec<PlannedChange>, Vec<CacheDrop>)> {
     let identities = transfer::shared_identities(keys)?;
     let mut changes = Vec::new();
@@ -451,7 +629,7 @@ fn survey(
             // d4a-h F13's residue: a cache that records the vault it was sealed to — on a store
             // in files, a vault that is gone — names it: no age key ever opened it.
             let why = match h.sealed_to(secret) {
-                Some(SealedTo::StoreVault { store_id }) => format!(
+                Some(SealedTo::StoreVault { store_id, .. }) => format!(
                     "it was encrypted to the key of a target store vault that is no longer here \
                      (store id {store_id}), which no age key opens; if you still have that vault \
                      and its `store.yaml`, put them back and unlock instead of going on"
@@ -506,9 +684,44 @@ fn survey(
         "Vault",
         &vault_path(root).display().to_string(),
         ChangeAction::Create,
-        "opened by a lock password or a recovery key",
+        vault_opened_by(way),
     ));
     Ok((changes, drops))
+}
+
+/// What a new vault opens with, as its plan line says it (D.4a C6; D.4b B55).
+pub(super) fn vault_opened_by(way: LockOnWay) -> &'static str {
+    match way {
+        LockOnWay::AccountPassword => {
+            "opened by your account password on this computer or a recovery key"
+        }
+        LockOnWay::WindowsHello => "opened by Windows Hello on this computer or a recovery key",
+        LockOnWay::LockPassword => "opened by a lock password or a recovery key",
+    }
+}
+
+/// The slot a new vault's read-back opens first, as `not_kept` names it (D.4a T36; D.4b
+/// B56).
+fn first_noun(way: LockOnWay) -> &'static str {
+    match way {
+        LockOnWay::AccountPassword => "a slot the account password opens",
+        LockOnWay::WindowsHello => "a slot Windows Hello opens",
+        LockOnWay::LockPassword => "a slot the lock password opens",
+    }
+}
+
+/// B75 (2): a new run's plan after an empty entry where this account's password status
+/// could not be read — a separate lock password, `reason` named, its ids kept (B80: the
+/// recovery key is shown with the plan's id) and its Vault line saying so.
+pub(super) fn fall_back(plan: &mut Plan<LockOnPayload>, reason: WayFallback) {
+    if let Some(run) = plan.payload.new_run.as_mut() {
+        run.way = Way::lock_password(Some(reason));
+    }
+    for change in &mut plan.changes {
+        if change.kind == "Vault" {
+            change.detail = Some(vault_opened_by(LockOnWay::LockPassword).to_string());
+        }
+    }
 }
 
 /// Carries out `plan` with `input` (module docs). `Completed { already_locked }` when another
@@ -528,12 +741,24 @@ pub fn execute_on(
                 ..LockedOn::empty(ctx, payload.timeout_min)
             },
         }),
-        (LockOnStart::New { restart }, LockOnInput::New { password, recovery }) => {
-            on_new(ctx, &payload, restart, password, recovery, reporter, cancel)
+        (LockOnStart::New { restart }, LockOnInput::New { first, recovery }) => {
+            on_new(ctx, &payload, restart, first, recovery, reporter, cancel)
         }
-        (LockOnStart::Resume { id }, LockOnInput::Resume { password, recovery }) => {
-            on_resume(ctx, &payload, &id, password, recovery, reporter, cancel)
-        }
+        (
+            LockOnStart::Resume {
+                id,
+                everyday: planned,
+            },
+            LockOnInput::Resume { everyday, recovery },
+        ) => on_resume(
+            ctx,
+            &payload,
+            (&id, planned),
+            everyday,
+            recovery,
+            reporter,
+            cancel,
+        ),
         (start, _) => Err(CoreError::Cli(CliError::Other(format!(
             "a `lock on` plan to start {start:?} was given the other kind of input; nothing \
              was written"
@@ -554,7 +779,7 @@ fn on_new(
     ctx: &Context,
     payload: &LockOnPayload,
     restart: bool,
-    password: SecretString,
+    first: FirstSlot,
     recovery: ConfirmedRecoveryKey,
     reporter: &dyn Reporter,
     cancel: &CancellationToken,
@@ -565,8 +790,29 @@ fn on_new(
             left: Vec::new(),
         });
     }
-    check_password(&password)?;
+    // D.4b B56: the first slot is its plan's way's — `first_slot` made it once its secret
+    // was checked — never a slot of another way; and (B80) never one another plan's step
+    // made, so the recovery key's slot id the client showed is the new vault's.
+    let way = first.way();
+    if Some(way) != payload.way() {
+        return Err(CoreError::Cli(CliError::Other(
+            "a `lock on` plan was given a first slot of another way in; nothing was written"
+                .to_string(),
+        )));
+    }
+    if first
+        .plan_vault()
+        .is_some_and(|made| Some(made) != payload.vault_id())
+    {
+        return Err(CoreError::Cli(CliError::Other(
+            "a `lock on` plan was given the first slot of another plan; nothing was written"
+                .to_string(),
+        )));
+    }
     super::permit(ctx)?;
+    // D.4b B57, B80: the ids the plan minted, the recovery key's shown with it — read
+    // before anything is written.
+    let ids = payload.ids()?;
     let policy = super::kdf_policy(ctx);
     let store = ctx.store();
     let root = ctx.config_root();
@@ -604,16 +850,14 @@ fn on_new(
         secrets: SecretsMode::Locking,
         id: Some(id.clone()),
         slots: vec![
-            SlotInfo {
-                kind: LockSlotKind::Password,
-                label: PASSWORD_LABEL.to_string(),
-            },
+            first.info(),
             SlotInfo {
                 kind: LockSlotKind::RecoveryKey,
                 label: RECOVERY_LABEL.to_string(),
             },
         ],
         unlock_timeout_min: Some(payload.timeout_min),
+        rotation: None,
     };
     crate::secrets::write_store_file(root, &file, &held)?;
     sync_root(&store)?;
@@ -646,16 +890,15 @@ fn on_new(
     let shown = recovery.to_display();
     let again = RecoveryKey::parse(shown.expose())
         .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?;
+    let (slot, secret) = first.into_parts();
     let writer = ctx.vault_access().writer();
-    let (bytes, made) = vault::create(
+    let (bytes, made) = vault::create_with(
+        ids,
         id.as_str(),
         &writer,
         contents,
         vec![
-            NewSlot::Password {
-                secret: password.clone(),
-                label: PASSWORD_LABEL.to_string(),
-            },
+            slot,
             NewSlot::RecoveryKey {
                 key: recovery.into_key(),
                 label: RECOVERY_LABEL.to_string(),
@@ -685,13 +928,13 @@ fn on_new(
     {
         return Err(CoreError::Cli(not_kept(&store, "the vault this run wrote")));
     }
-    let by_password = parsed
-        .open(&SlotSecret::Password(password), policy)
-        .map_err(|_| CoreError::Cli(not_kept(&store, "a slot the lock password opens")))?;
+    let by_first = parsed
+        .open(&secret, policy)
+        .map_err(|_| CoreError::Cli(not_kept(&store, first_noun(way))))?;
     let by_recovery = parsed
         .open(&SlotSecret::RecoveryKey(again), policy)
         .map_err(|_| CoreError::Cli(not_kept(&store, "a slot the recovery key opens")))?;
-    for opened in [&by_password, &by_recovery] {
+    for opened in [&by_first, &by_recovery] {
         check_entries(&store, opened, &placed, &identity, payload.timeout_min)?;
     }
     faults::hit(ctx, FaultPoint::AfterVaultVerified)?;
@@ -700,8 +943,8 @@ fn on_new(
     }
     // Steps 4–6.
     let session = KeySession::new(
-        by_password.data_key().clone(),
-        by_password.header().vault_id,
+        by_first.data_key().clone(),
+        by_first.header().vault_id,
         root.to_path_buf(),
     );
     let key = transfer::store_key(root, session, disk);
@@ -711,35 +954,31 @@ fn on_new(
         ..LockedOn::empty(ctx, payload.timeout_min)
     };
     finish(
-        &run,
-        file,
-        &key,
-        &by_password,
-        payload,
-        false,
-        reporter,
-        &mut done,
+        &run, file, &key, &by_first, payload, false, reporter, &mut done,
     )?;
     Ok(Outcome::Completed { result: done })
 }
 
 /// Step 3 again, then steps 4–6 (rule 4; team decision 2026-10-13): the vault on disk opens
-/// with the password slot's key AND the recovery slot's, each slot opened by a secret of its
-/// own kind, before any clear datum goes. Two openings of one kind are refused as the
-/// interrupted lock they leave (`lock_incomplete`, whose help names `lock off` and a new
-/// `lock on`); a key for another vault is the store changing under the run (`store_changed`).
+/// with the everyday slot's key AND the recovery slot's, each slot opened by a secret of its
+/// own kind — the everyday one of the kind the plan read from the vault (D.4b B56), so an
+/// account password never stands in for a lock password, nor the reverse — before any
+/// clear datum goes. An opening of another kind than planned, or two of one kind, is
+/// refused as the interrupted lock it leaves (`lock_incomplete`, whose help names `lock
+/// off` and a new `lock on`); a key for another vault is the store changing under the run
+/// (`store_changed`). The id and the planned kind travel as one parameter (F4).
 fn on_resume(
     ctx: &Context,
     payload: &LockOnPayload,
-    id: &StoreId,
-    password: SlotOpened,
+    (id, planned): (&StoreId, LockSlotKind),
+    everyday: SlotOpened,
     recovery: SlotOpened,
     reporter: &dyn Reporter,
     cancel: &CancellationToken,
 ) -> CoreResult<Outcome<LockedOn>> {
     let store = ctx.store();
     let root = ctx.config_root();
-    if password.kind() != LockSlotKind::Password || recovery.kind() != LockSlotKind::RecoveryKey {
+    if everyday.kind() != planned || recovery.kind() != LockSlotKind::RecoveryKey {
         return Err(CoreError::Cli(CliError::LockIncomplete {
             store: root.to_path_buf(),
             phase: LockPhase::Locking,
@@ -773,7 +1012,7 @@ fn on_resume(
     let disk = read_vault(&store, id)?;
     let parsed = VaultFile::parse(&disk).map_err(|e| vault_err(root, e))?;
     let vault = parsed
-        .open_with_key(&password.opened().key, password.opened().vault_id)
+        .open_with_key(&everyday.opened().key, everyday.opened().vault_id)
         .map_err(|e| vault_err(root, e))?;
     parsed
         .open_with_key(&recovery.opened().key, recovery.opened().vault_id)
@@ -791,7 +1030,7 @@ fn on_resume(
         held: &held,
         id,
     };
-    let opened = password.opened();
+    let opened = everyday.opened();
     let key = transfer::store_key(
         root,
         KeySession::new(opened.key.clone(), opened.vault_id, root.to_path_buf()),
@@ -860,21 +1099,22 @@ fn finish(
     stage(reporter, 3, "Re-encrypting cached secrets");
     // D.4a f Task 3: the shared key is read when the first cache the store's key does not
     // open is met — never when every cache is the store's already (a resume), or none is.
-    let old = transfer::SharedKeys::at(&payload.keys);
+    let shared = transfer::SharedKeys::at(&payload.keys);
+    let old = OldKeys::Shared(&shared);
+    let mode = ResealMode::LockOn {
+        agreed: &payload.drops,
+        resume,
+    };
     let targets = cli_core::list_target_names(run.store)?;
+    let mut resealed = Resealed::default();
     for (n, target) in targets.iter().enumerate() {
-        reseal(
-            run.store,
-            run.held,
-            target,
-            (key, run.id),
-            &old,
-            &payload.drops,
-            resume,
-            done,
-        )?;
+        let folder = StateFolder::target(target);
+        reseal(run.store, run.held, &folder, key, &old, mode, &mut resealed)?;
         faults::hit(run.ctx, FaultPoint::AfterCachesTarget(n))?;
     }
+    done.caches_resealed += resealed.resealed;
+    done.caches_dropped.append(&mut resealed.dropped);
+    done.caches_left.append(&mut resealed.left);
     stage(reporter, 4, "Removing the secrets from files");
     for (n, target) in targets.iter().enumerate() {
         if let Credentials::Clear(token) = transfer::credentials(run.store, target)? {
@@ -895,105 +1135,6 @@ fn finish(
     crate::secrets::write_store_file(run.root, &locked, run.held)?;
     sync_root(run.store)?;
     faults::hit(run.ctx, FaultPoint::AfterLocked)?;
-    Ok(())
-}
-
-/// Step 4 for one target (T36): a cache under an old key re-sealed to the store's and checked;
-/// one already the store's skipped (a resume); one no key of this run opens dropped when the
-/// plan listed it (or on a resume, whose plan says so), else left; a winning plaintext
-/// kubeconfig sealed, a shadowed one dropped. F13: each cache sealed to the store's key — a
-/// skipped one too — records it (`SealedTo::StoreVault` with the store's id); a dropped one
-/// loses its record; a left one keeps whatever it had. The state is read again under the held
-/// lock and only its caches change (WI-487, `State::update`).
-#[allow(clippy::too_many_arguments)]
-fn reseal(
-    store: &TargetStorePaths,
-    held: &StoreLock,
-    target: &str,
-    (key, id): (&CacheKey, &StoreId),
-    old: &transfer::SharedKeys<'_>,
-    agreed: &[CacheDrop],
-    resume: bool,
-    done: &mut LockedOn,
-) -> CoreResult<()> {
-    let paths = StatePaths::for_active_target(store, target);
-    State::update::<CoreError>(&paths, held, |state| {
-        let Some(mut h) = state.hetzner_cloud.clone() else {
-            return Ok(Write::Leave);
-        };
-        let vault = || SealedTo::StoreVault {
-            store_id: id.as_str().to_string(),
-        };
-        let shadowed = h.kubeconfig_age.is_some();
-        let mut changed = false;
-        for secret in [CachedSecret::Kubeconfig, CachedSecret::ArgocdPassword] {
-            let (slot, record) = h.cache_mut(secret);
-            let Some(armored) = slot.clone() else {
-                continue;
-            };
-            if transfer::opens(key, secret, &armored).is_some() {
-                // A resume: sealed to the store's key already; recorded so, once.
-                if *record != Some(vault()) {
-                    *record = Some(vault());
-                    changed = true;
-                }
-                continue;
-            }
-            match transfer::open_with_any(&armored, old.get()?) {
-                Some(plain) => {
-                    *slot = Some(sealed_and_checked(store, key, secret, target, &plain)?);
-                    *record = Some(vault());
-                    changed = true;
-                    done.caches_resealed += 1;
-                }
-                None if resume
-                    || agreed.contains(&CacheDrop {
-                        target: target.to_string(),
-                        secret,
-                    }) =>
-                {
-                    *slot = None;
-                    *record = None;
-                    changed = true;
-                    done.caches_dropped.push(dropped(
-                        target,
-                        secret,
-                        "no age key this run read decrypts it",
-                    ));
-                }
-                None => done.caches_left.push(dropped(
-                    target,
-                    secret,
-                    "it stopped decrypting after the plan was made; `--refresh` fetches it again",
-                )),
-            }
-        }
-        if let Some(plain) = h.kubeconfig_yaml.take().map(Zeroizing::new) {
-            changed = true;
-            if shadowed {
-                done.caches_dropped.push(dropped(
-                    target,
-                    CachedSecret::Kubeconfig,
-                    "a plaintext copy beside the encrypted one",
-                ));
-            } else {
-                h.kubeconfig_age = Some(sealed_and_checked(
-                    store,
-                    key,
-                    CachedSecret::Kubeconfig,
-                    target,
-                    &plain,
-                )?);
-                h.kubeconfig_sealed_to = Some(vault());
-                done.caches_resealed += 1;
-            }
-        }
-        if !changed {
-            return Ok(Write::Leave);
-        }
-        state.hetzner_cloud = Some(h);
-        Ok(Write::Save)
-    })?;
     Ok(())
 }
 
@@ -1032,6 +1173,7 @@ fn undo_locking(run: &Run<'_>, wrote_vault: bool) -> CoreResult<Outcome<LockedOn
             id: None,
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         },
         run.held,
     )?;

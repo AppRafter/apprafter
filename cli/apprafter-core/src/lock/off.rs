@@ -15,6 +15,8 @@
 //!    one that differs from the vault's is kept, and named — and each cache re-sealed to the
 //!    shared key and checked;
 //! 4. every token written is read back from its file, and no marker of this store is left;
+//!    then this computer's key of each Windows Hello slot of the vault is handed to the
+//!    client to delete (D.4b B25), while the vault still names it;
 //! 5. the vault is deleted, the directory synced;
 //! 6. `store.yaml` says `files`.
 //!
@@ -39,6 +41,7 @@ use cli_core::{CliError, StoreLock, VaultProblem};
 use cli_state::{State, StatePaths, Write};
 use serde::Serialize;
 
+use super::facts::{HelloKeyDeleted, HelloKeys};
 use super::faults::{self, FaultPoint};
 use super::on::{
     change, dropped, refresh, sealed_and_checked, sealed_cache_in, title, vault_err, DroppedCache,
@@ -54,6 +57,7 @@ use crate::secrets::{
     KeySession, SecretsMode, StoreFile, StoreId, STORE_FILE, STORE_FILE_FORMAT,
 };
 use crate::vault::VaultFile;
+use crate::vault::{SlotKind, VaultHeader};
 use crate::CancellationToken;
 
 /// Tests: what [`AFTER_FILES_WRITE`] runs on the store.
@@ -157,6 +161,11 @@ pub struct LockedOff {
     /// and so loaded and created no key (D.4a f Task 3).
     pub age_key: Option<String>,
     pub age_key_created: bool,
+    /// This computer's key of each Windows Hello slot of the vault, handed to the client
+    /// before the vault went (D.4b B25). Left out of the JSON when there were none, so the
+    /// desktop reads D.4a's outcome byte for byte (F7).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hello_keys: Vec<HelloKeyGone>,
 }
 
 impl LockedOff {
@@ -173,8 +182,20 @@ impl LockedOff {
             caches_left: Vec::new(),
             age_key: None,
             age_key_created: false,
+            hello_keys: Vec::new(),
         }
     }
+}
+
+/// What `lock off` did with this computer's key of one Windows Hello slot (D.4b B25).
+/// `Serialize` with `LockedOff`; its TypeScript export is d4b-c4's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelloKeyGone {
+    /// The slot's id, 32 hex characters (surfaces show the first 8).
+    pub slot: String,
+    pub label: String,
+    pub deleted: HelloKeyDeleted,
 }
 
 fn stage(reporter: &dyn Reporter, index: u32, title: &str) {
@@ -258,6 +279,7 @@ fn write_files(store: &TargetStorePaths, held: &StoreLock) -> CoreResult<()> {
             id: None,
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         },
         held,
     )?;
@@ -304,6 +326,16 @@ pub fn plan_off(ctx: &Context) -> CoreResult<Plan<LockOffPayload>> {
             detail: "it names no id".to_string(),
         }));
     };
+    // D.4b B63, F2: `lock off` from an unfinished key change opens each cache with either
+    // store key the vault holds (d4b-c2b). Until then it is refused here — never run as from
+    // `locked`, which would re-seal with the new key only and delete the vault that holds
+    // the old one, leaving caches sealed to a key no vault holds (rule 10).
+    if file.secrets == SecretsMode::Rotating {
+        return Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: cli_core::LockPhase::Rotating,
+        }));
+    }
     let vault = vault_on_disk(root)?;
     match file.secrets {
         SecretsMode::Locking if !vault => {
@@ -587,6 +619,15 @@ fn unlock(
             return Ok(Outcome::Completed { result: done });
         }
     };
+    // D.4b B63, F2: a key change that stopped after this `lock off` was planned is
+    // finished first (d4b-c2b brings `lock off` from `rotating`); D.4a's steps never run
+    // over it — whose `unlocking` write would carry the key change's fields on.
+    if matches!(file.secrets, SecretsMode::Rotating) {
+        return Err(CoreError::Cli(CliError::LockIncomplete {
+            store: root.to_path_buf(),
+            phase: cli_core::LockPhase::Rotating,
+        }));
+    }
     if file.id.as_ref() != Some(id) || !vault_on_disk(root)? {
         return Err(store_changed(root, from, file.secrets));
     }
@@ -706,6 +747,11 @@ fn unlock(
         }
     }
     faults::hit(ctx, FaultPoint::AfterFilesVerified)?;
+    // D.4b B25: this computer's Windows Hello keys of the vault's Hello slots are handed
+    // over while the vault still names them — after the files' read-back, before the
+    // vault is deleted. A key the client could not delete is listed, never a reason to
+    // keep the store from files.
+    done.hello_keys = hello_keys_gone(ctx, id, vault.header());
     // Step 5: the vault goes.
     stage(reporter, 4, "Removing the vault");
     std::fs::remove_file(vault_path(root)).map_err(|e| CoreError::Cli(CliError::Io(e)))?;
@@ -717,6 +763,22 @@ fn unlock(
     done.store_id = Some(id.to_string());
     done.backed_out = from == SecretsMode::Locking;
     Ok(Outcome::Completed { result: done })
+}
+
+/// D.4b B25: each Windows Hello slot of the vault (its header authenticated by the data
+/// key), its key on this computer handed to the client (`Context::hello_keys`); what
+/// became of each, for the outcome.
+fn hello_keys_gone(ctx: &Context, id: &StoreId, header: &VaultHeader) -> Vec<HelloKeyGone> {
+    header
+        .slots
+        .iter()
+        .filter(|slot| slot.kind == SlotKind::WindowsHello)
+        .map(|slot| HelloKeyGone {
+            slot: slot.id.to_string(),
+            label: slot.label.clone(),
+            deleted: HelloKeys::delete(&**ctx.hello_keys(), id, slot),
+        })
+        .collect()
 }
 
 /// Step 3's caches for one target: one the shared key opens already skipped (a resume, or

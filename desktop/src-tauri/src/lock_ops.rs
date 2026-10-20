@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use apprafter_core::lock::open::RecoveryKeyProblem;
 use apprafter_core::lock::{self, HolderHardening, LockOnInput, LockOnStart, LockedOn};
 use apprafter_core::secrets::{LockSlotKind, StoreId};
-use apprafter_core::vault::{ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, SlotInput};
+use apprafter_core::vault::{ConfirmedRecoveryKey, KdfPolicy, RecoveryKey, SlotInput};
 use apprafter_core::{CoreError, PlanClass, SecretString};
 use apprafter_desktop_ipc::{LockOffPlan, LockOnPlan, LockSectionInfo, OpId, PlanView};
 
@@ -165,7 +165,8 @@ pub fn lock_info(shell: &Shell) -> Result<LockSectionInfo, DesktopError> {
     }
     let window = shell.window(&now);
     let client = shell.limit_client_later()();
-    let (report, limits) = match lock::status(&shell.context, window.clone(), &client) {
+    let facts = crate::vault_access::slot_facts();
+    let (report, limits) = match lock::status(&shell.context, window.clone(), &client, &*facts) {
         Ok(report) => {
             let limits = report.limits.clone();
             (Some(report), limits)
@@ -208,7 +209,12 @@ pub fn plan_lock_on(
     // verifier's finding 11).
     shell.recheck();
     lock::check_password(&password)?;
-    let plan = lock::plan_on(&shell.context, timeout_minutes)?;
+    // D.4a's Protect — a separate lock password — until d4b-g2b offers the ways (B58).
+    let mut plan = lock::plan_on(
+        &shell.context,
+        timeout_minutes,
+        lock::WayAsked::LockPassword,
+    )?;
     match plan.payload.start() {
         LockOnStart::New { .. } => {}
         LockOnStart::Resume { .. } => {
@@ -224,11 +230,20 @@ pub fn plan_lock_on(
             ))
         }
     }
-    let key = RecoveryKey::generate(&mut OsRandom).map_err(|e| {
-        DesktopError::Core(CoreError::Cli(cli_core::CliError::RandomUnavailable {
-            detail: e.to_string(),
-        }))
-    })?;
+    // D.4b B56: the lock password checked as the first slot, and the recovery key drawn
+    // only then — the same two steps Protect has always taken (until d4b-g2b's ways).
+    let step = lock::first_slot(&mut plan, lock::FirstSecret::LockPassword(password))?;
+    let (first, key) = match step {
+        lock::FirstStep::Ready { first, recovery } => (first, recovery),
+        lock::FirstStep::Mistake(e) => return Err(e.into()),
+        // Only an account password's empty entry falls back (d4b-g2b asks it).
+        lock::FirstStep::FellBack => {
+            return Err(refused(
+                "Protect's plan left the lock password while it was checked",
+                "Start Protect again.",
+            ));
+        }
+    };
     let shown = key.to_display();
     let new_key = NewKey::new(key);
     let epoch = shell.vault.epoch();
@@ -249,7 +264,7 @@ pub fn plan_lock_on(
             let outcome = lock::execute_on(
                 &ctx,
                 plan,
-                LockOnInput::New { password, recovery },
+                LockOnInput::New { first, recovery },
                 reporter,
                 cancel,
             )?;
@@ -385,8 +400,9 @@ pub fn plan_lock_finish(
     password: SecretString,
     recovery: SecretString,
 ) -> Result<PlanView, Refusal> {
-    let plan = lock::plan_on(&shell.context, None).map_err(DesktopError::from)?;
-    let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+    let plan = lock::plan_on(&shell.context, None, lock::WayAsked::LockPassword)
+        .map_err(DesktopError::from)?;
+    let LockOnStart::Resume { id, everyday } = plan.payload.start().clone() else {
         return Err(refused(
             "there is no interrupted Protect to finish in this target store",
             "The Security page shows where its secrets are.",
@@ -394,9 +410,9 @@ pub fn plan_lock_finish(
         .into());
     };
     let root = shell.context.config_root().to_path_buf();
-    let password = shell
-        .vault
-        .open_slot(&root, &id, LockSlotKind::Password, password)?;
+    // D.4b B56: the everyday slot by its own kind — the lock password's for every vault
+    // Protect writes until d4b-g2b offers the ways, whose Finish field then names it.
+    let everyday = shell.vault.open_slot(&root, &id, everyday, password)?;
     let recovery = shell
         .vault
         .open_slot(&root, &id, LockSlotKind::RecoveryKey, recovery)?;
@@ -415,7 +431,7 @@ pub fn plan_lock_finish(
         let result = lock::execute_on(
             &ctx,
             plan,
-            LockOnInput::Resume { password, recovery },
+            LockOnInput::Resume { everyday, recovery },
             reporter,
             cancel,
         );
@@ -490,6 +506,7 @@ mod tests {
     use apprafter_core::lock::{MachineLimit, UnlockWindow};
     use apprafter_core::secrets::testing::locked_store;
     use apprafter_core::secrets::{SecretsMode, VaultAccess};
+    use apprafter_core::vault::OsRandom;
     use apprafter_core::{Context, Outcome, PathSource, SecretString};
     use apprafter_desktop_ipc::{errors, Gesture, LockReason, OpEvent, PlanView, Settings};
     use cli_core::{Target, TargetConfig, TargetCredentials};
@@ -938,8 +955,11 @@ mod tests {
             help.as_deref(),
             Some("The Security page shows where its secrets are.")
         );
-        // An interrupted Protect with its vault: the test store has a recovery slot only, so
-        // the lock password opens nothing — refused through the gate, before any plan.
+        // An interrupted Protect with its vault: the test store has a recovery slot only — no
+        // everyday slot a typed secret opens — so Finish's plan refuses it before any secret
+        // is tried (D.4b-c3 Deviation 10: `lock_incomplete`, whose way out is Stop
+        // protecting). A wrong lock password through the gate is
+        // `an_interrupted_protect_finishes_with_both_secrets`'.
         let mut made = None;
         let r = rig_with(
             |root| {
@@ -966,7 +986,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(*e.error, crate::errors::DesktopError::AuthFailed { .. }),
+            matches!(
+                &*e.error,
+                crate::errors::DesktopError::Core(CoreError::Cli(
+                    cli_core::CliError::LockIncomplete {
+                        phase: cli_core::LockPhase::Locking,
+                        ..
+                    }
+                ))
+            ),
             "{e:?}"
         );
     }
@@ -1205,6 +1233,18 @@ mod tests {
             text.replacen("secrets: locked", "secrets: locking", 1),
         )
         .unwrap();
+        // A lock password that is not the store's opens nothing: refused through the gate,
+        // before any plan (D.4b-c3: the everyday slot is opened by the kind its plan read).
+        let e = plan_lock_finish(
+            &r.shell,
+            SecretString::new("not the lock password"),
+            SecretString::new(key.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(*e.error, crate::errors::DesktopError::AuthFailed { .. }),
+            "{e:?}"
+        );
         let finish = plan_lock_finish(
             &r.shell,
             SecretString::new(PASSWORD),

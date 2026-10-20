@@ -50,16 +50,19 @@ fn lock_state(ctx: &Context, secrets: SecretsMode, with_id: Option<&str>) {
                 label: "recovery key".into(),
             }],
             unlock_timeout_min: Some(5),
+            rotation: None,
         },
         &held,
     )
     .unwrap();
 }
 
-/// F13: the record of a cache sealed to the vault of the store with `id`.
+/// F13: the record of a cache sealed to the vault of the store with `id`, as AppRafter
+/// 0.2.80 wrote it: no vault id (B86).
 fn vault_record(id: &str) -> cli_state::SealedTo {
     cli_state::SealedTo::StoreVault {
         store_id: id.to_string(),
+        vault_id: None,
     }
 }
 
@@ -92,6 +95,7 @@ fn the_lock_state_round_trips_and_says_never_to_delete_it() {
                 label: "recovery key".into()
             }],
             unlock_timeout_min: Some(5),
+            rotation: None,
         }
     );
     let path = ctx.config_root().join(STORE_FILE);
@@ -159,7 +163,7 @@ fn a_lock_state_that_cannot_be_read_is_refused() {
         ("format: 0\nsecrets: files\n", Some("format 0 is no format")),
         (
             "format: 1\nsecrets: sealed\n",
-            Some("\"sealed\"` is none of files, locking, locked, unlocking"),
+            Some("\"sealed\"` is none of files, locking, locked, unlocking, rotating"),
         ),
         (
             "format: 1\nsecrets: locked\n",
@@ -205,6 +209,7 @@ fn the_lock_state_needs_the_held_write_lock() {
         id: Some(id(ID)),
         slots: Vec::new(),
         unlock_timeout_min: None,
+        rotation: None,
     };
     let err = write_store_file(ctx.config_root(), &file, &unheld).unwrap_err();
     assert!(
@@ -231,6 +236,7 @@ fn a_lock_state_without_an_id_is_never_written() {
             id: None,
             slots: Vec::new(),
             unlock_timeout_min: None,
+            rotation: None,
         };
         let err = write_store_file(ctx.config_root(), &file, &held).unwrap_err();
         assert!(
@@ -576,6 +582,7 @@ fn the_frozen_v1_store_yaml_reads_as_its_lock_state() {
                 },
             ],
             unlock_timeout_min: Some(15),
+            rotation: None,
         }
     );
 }
@@ -1493,6 +1500,26 @@ fn a_shared_key_is_created_only_when_allowed() {
     );
 }
 
+/// F13, B86: a cache key says what a cache sealed to it records — the store vault its
+/// identity is in, by the store's id and the vault's — and nothing for the shared age key.
+#[test]
+fn a_cache_key_records_the_vault_its_identity_is_in() {
+    let (_d, ctx, made) = locked(&[("prod", Some(TOKEN_A))]);
+    assert_eq!(
+        ctx.secrets().cache_key("prod").unwrap().record().unwrap(),
+        Some(cli_state::SealedTo::StoreVault {
+            store_id: made.store_id.as_str().to_string(),
+            vault_id: Some(made.vault_id.to_string()),
+        })
+    );
+    let (_f, files, _paths) = provisioned_in_files();
+    load_or_create_identity(files.age_key_path()).unwrap();
+    assert_eq!(
+        files.secrets().cache_key("prod").unwrap().record().unwrap(),
+        None
+    );
+}
+
 /// c2's hand-off: on a locked store the cache is sealed to the store's own key — a shared key
 /// is never created — and this client keeps the plaintext for the rest of the command.
 #[test]
@@ -1532,10 +1559,13 @@ fn a_locked_store_seals_to_its_own_key_and_remembers_the_plaintext() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].0.as_str(), h.kubeconfig_age.as_deref().unwrap());
     assert_eq!(kept[0].1, YAML);
-    // F13: sealed to this store's vault, and recorded so.
+    // F13, B86: sealed to this store's vault, and recorded so, with the vault's id.
     assert_eq!(
         h.kubeconfig_sealed_to,
-        Some(vault_record(made.store_id.as_str()))
+        Some(cli_state::SealedTo::StoreVault {
+            store_id: made.store_id.as_str().to_string(),
+            vault_id: Some(made.vault_id.to_string()),
+        })
     );
     assert_eq!(h.argocd_admin_password_sealed_to, None);
     drop(dir);

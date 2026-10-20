@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
-use apprafter_core::lock::{self, OpenedVault, SlotOpened};
+use apprafter_core::lock::{self, OpenedVault, SlotFacts, SlotOpened, UnknownFacts};
 use apprafter_core::secrets::{
     KeySession, LockSlotKind, StoreId, VaultAccess, VaultRequest, VaultSession,
 };
@@ -57,6 +57,13 @@ use zeroize::Zeroizing;
 use crate::errors::{DesktopError, Refusal};
 use crate::harden;
 use crate::ops::{Clock, SecretGesture};
+
+/// What this computer tells the lock (D.4b B30): every fact unknown until d4b-g1b answers
+/// them over `apprafter-os-slots` — so a typed secret tries the lock-password slot only, as
+/// before (B81).
+pub fn slot_facts() -> Arc<dyn SlotFacts> {
+    Arc::new(UnknownFacts)
+}
 
 /// How far `forget` has moved on: a key opened before a lock is not kept after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,8 +273,15 @@ impl DesktopVaultAccess {
         id: &StoreId,
         secret: SecretString,
     ) -> Result<OpenedVault, Refusal> {
-        self.gate
-            .attempt(|| lock::open_at(root, id, SlotInput::from_input(secret), KdfPolicy::active()))
+        let machine = slot_facts().machine_id().id().cloned();
+        self.gate.attempt(|| {
+            lock::open_at(
+                root,
+                id,
+                SlotInput::from_input(secret, machine),
+                KdfPolicy::active(),
+            )
+        })
     }
 
     /// Opens one slot of `kind` with `secret`, through the gate (Finish, rule 4).
@@ -278,8 +292,10 @@ impl DesktopVaultAccess {
         kind: LockSlotKind,
         secret: SecretString,
     ) -> Result<SlotOpened, Refusal> {
+        // D.4b B56: an account-password slot opens only with this computer's machine id.
+        let machine = slot_facts().machine_id().id().cloned();
         self.gate
-            .attempt(|| lock::open_slot_at(root, id, kind, secret, KdfPolicy::active()))
+            .attempt(|| lock::open_slot_at(root, id, kind, secret, machine, KdfPolicy::active()))
     }
 
     /// Tests: `hook` runs inside every opening through the gate, before the vault opens (D.4a

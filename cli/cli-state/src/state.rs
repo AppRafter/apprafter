@@ -59,6 +59,8 @@
 //! to the store's own key, a cache `kubeconfig --refresh` fetched. Its
 //! slow work (a provider's calls) stays outside the lock. `State::save`
 //! is for tests and `update` alone (`apprafter-core/tests/guards.rs`).
+//! A key change's re-seal writes through [`State::update_durable`]: `update`, with the file
+//! on disk durably before it returns whether it changed or not (D.4b B78, B79).
 //!
 //! Encoding stays JSON for now — switching to CUE-encoded text
 //! lands in phase 1.x.
@@ -432,14 +434,23 @@ pub struct HetznerCloudState {
     pub argocd_admin_password_sealed_to: Option<SealedTo>,
 }
 
-/// The key a cached secret was sealed to, when it was not the shared age key (F13). A store id
-/// only, never a key.
+/// The key a cached secret was sealed to, when it was not the shared age key (F13): a store
+/// id and, since D.4b, the vault's id (B86) — never a key. A vault id names exactly one store
+/// key: both change together, at `lock on` and at every key change. So a cache whose record
+/// names this store's vault under another id than the vault on disk was sealed to a store
+/// key a key change retired. AppRafter 0.2.80 wrote no vault id: its record reads with
+/// `vault_id: None`; it ignores the field and drops it when it rewrites the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SealedTo {
-    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it, or
-    /// it was cached while that store was locked.
-    StoreVault { store_id: String },
+    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it,
+    /// it was cached while that store was locked, or a key change re-sealed it. `vault_id`
+    /// is that vault's id, 32 lower-case hex characters.
+    StoreVault {
+        store_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault_id: Option<String>,
+    },
 }
 
 impl HetznerCloudState {
@@ -491,6 +502,21 @@ pub enum Write {
     Leave,
 }
 
+/// What [`State::update_durable`] did with a `state.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableWrite {
+    /// The change saved the copy it changed: on disk, durably.
+    Saved,
+    /// The change found nothing to write: the file's own bytes were put back, durably — so a
+    /// replace an interrupted run made of it before is durable too.
+    Kept,
+    /// There is no `state.json`: nothing was changed or written.
+    NoFile,
+    /// The file did not parse: it was renamed to this path — never deleted, never over
+    /// another file — and the change did not run.
+    SetAside(PathBuf),
+}
+
 impl State {
     pub fn load_or_default(paths: &StatePaths) -> Result<Self> {
         let path = paths.state_file();
@@ -529,17 +555,7 @@ impl State {
                 if !force {
                     return Err(err);
                 }
-                let live = paths.state_file();
-                // This crate carries no date dependency (cli-core,
-                // serde, serde_json, thiserror), so the stamp is epoch
-                // seconds rather than RFC 3339.
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let backup = live.with_file_name(format!("{STATE_FILE}.corrupt-{stamp}"));
-                std::fs::rename(&live, &backup)?;
-                Ok((Self::default(), Some(backup)))
+                Ok((Self::default(), Some(set_aside(paths, epoch_now())?)))
             }
         }
     }
@@ -598,6 +614,87 @@ impl State {
         Ok((Self::write(paths, &mut state, change)?, moved))
     }
 
+    /// [`State::update`] for a key change's re-seal (D.4b B78, B79): under the store's write
+    /// lock `held` the file is read again and `change` writes into that fresh copy, as
+    /// `update` does — and then, whether the change saved or not, the file is on disk
+    /// durably before this returns ([`cli_core::fsutil::replace_durable`]: the directory
+    /// fsynced on Unix, a write-through move on Windows, either failing the call). A key
+    /// change may then retire the key the file's old copy was sealed to. A file the change
+    /// leaves is put back byte for byte, a newer build's fields included. No file: nothing
+    /// is done — nor for a path through a file, which `load_or_default` reads as no file too
+    /// (critic round, finding 2). A file that does not parse is renamed aside
+    /// ([`DurableWrite::SetAside`]) and the change does not run. A file that cannot be read
+    /// fails the call, naming it, and nothing is renamed or written.
+    pub fn update_durable<E: From<CliError>>(
+        paths: &StatePaths,
+        held: &StoreLock,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<DurableWrite, E> {
+        let _ = held;
+        let path = paths.state_file();
+        let Some(raw) = Self::read_raw(&path)? else {
+            return Ok(DurableWrite::NoFile);
+        };
+        let mut state: State = match serde_json::from_slice(&raw) {
+            Ok(state) => state,
+            Err(_) => {
+                let aside = set_aside(paths, epoch_now())?;
+                return Ok(DurableWrite::SetAside(aside));
+            }
+        };
+        seam::reached(WritePoint::Reread);
+        let (bytes, wrote) = match change(&mut state)? {
+            Write::Save => {
+                let bytes = serde_json::to_vec_pretty(&state).map_err(CliError::from)?;
+                (bytes, DurableWrite::Saved)
+            }
+            Write::Leave => (raw, DurableWrite::Kept),
+        };
+        cli_core::fsutil::replace_durable(&path, &bytes, ".state.json.", None)
+            .map_err(|e| write_failed(&path, e))?;
+        Ok(wrote)
+    }
+
+    /// `state.json` at `paths`, read strictly, as a key change's plan reads every state file
+    /// before it asks anything (D.4b B79): `None` when there is no file — nor for a path
+    /// through a file, which every reader calls no file —; any other read error names the
+    /// file (`StorePathIo`), and content that does not parse is `state::corrupt` naming it,
+    /// with `apprafter import --force` as its remedy. Nothing is renamed or written.
+    pub fn read_existing(paths: &StatePaths) -> Result<Option<Self>> {
+        let path = paths.state_file();
+        let Some(raw) = Self::read_raw(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|err| CliError::InvalidState {
+                path,
+                message: err.to_string(),
+            })
+    }
+
+    /// `path`'s bytes through the owner-only reader (WI-473), for a durable or a strict read
+    /// (D.4b B78, B79): `None` when there is no file, nor for a path through a file — as
+    /// `load_or_default` and the store's own readers see both —; any other failure names the
+    /// file.
+    fn read_raw(path: &Path) -> Result<Option<Vec<u8>>> {
+        match cli_core::owner_only::read_secret(path) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(source) => Err(CliError::StorePathIo {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     /// `change` on `state`, just read under the lock, then the save it asks for.
     fn write<E: From<CliError>>(
         paths: &StatePaths,
@@ -613,10 +710,102 @@ impl State {
     }
 }
 
+/// Renames the `state.json` at `paths` aside, beside it, to the first free name of
+/// `state.json.corrupt-<stamp>`, `…-<stamp>-1`, `…-<stamp>-2`, … — never over another file,
+/// never deleted: it may hold the only record of a field a rebuild cannot recover — and
+/// returns where it went (`import --force`; a key change, D.4b B79).
+fn set_aside(paths: &StatePaths, stamp: u64) -> Result<PathBuf> {
+    let live = paths.state_file();
+    let mut n = 0u32;
+    loop {
+        let name = match n {
+            0 => format!("{STATE_FILE}.corrupt-{stamp}"),
+            n => format!("{STATE_FILE}.corrupt-{stamp}-{n}"),
+        };
+        let aside = live.with_file_name(name);
+        match std::fs::symlink_metadata(&aside) {
+            Ok(_) => n += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(&live, &aside).map_err(|e| write_failed(&live, e))?;
+                return Ok(aside);
+            }
+            Err(source) => {
+                return Err(CliError::StorePathIo {
+                    path: aside,
+                    source,
+                })
+            }
+        }
+    }
+}
+
+/// Seconds since the Unix epoch, for a set-aside's name: this crate carries no date
+/// dependency (cli-core, serde, serde_json, thiserror), so not RFC 3339.
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A durable write of `path` that failed, as an I/O error naming the file (D.4b B78).
+fn write_failed(path: &Path, e: std::io::Error) -> CliError {
+    write_failed_on(path, e, cfg!(windows))
+}
+
+/// [`write_failed`] for an OS: on Windows a file another program holds open fails after a
+/// bounded retry (`MoveFileExW`'s sharing, access or lock violation, 32, 5, 33), and the
+/// words say what the person can do about it.
+fn write_failed_on(path: &Path, e: std::io::Error, windows: bool) -> CliError {
+    let busy = windows && matches!(e.raw_os_error(), Some(5 | 32 | 33));
+    let hint = if busy {
+        " — another program may have it open: close that program, then run the command again"
+    } else {
+        ""
+    };
+    CliError::Io(std::io::Error::new(
+        e.kind(),
+        format!("{}: {e}{hint}", path.display()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// D.4b B79: a key change's plan reads each state file strictly — no file, or a path
+    /// through a file, is none; one that parses is its state; one that does not is
+    /// `state::corrupt` naming it — and moves or writes nothing.
+    #[test]
+    fn a_strict_read_names_a_state_that_does_not_parse_and_moves_nothing() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        assert!(State::read_existing(&paths).unwrap().is_none());
+        std::fs::write(dir.path().join("a-file"), b"x").unwrap();
+        let through = StatePaths::for_root(&dir.path().join("a-file"));
+        assert!(State::read_existing(&through).unwrap().is_none());
+        State {
+            provider: Some("hetzner-cloud".into()),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let read = State::read_existing(&paths).unwrap().unwrap();
+        assert_eq!(read.provider.as_deref(), Some("hetzner-cloud"));
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        match State::read_existing(&paths) {
+            Err(CliError::InvalidState { path, .. }) => assert_eq!(path, paths.state_file()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), b"{ not json");
+        let folder = paths.state_file().parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::read_dir(folder).unwrap().count(),
+            1,
+            "nothing set aside"
+        );
+    }
 
     #[test]
     fn save_replaces_the_file_atomically_and_leaves_no_temp_file() {
@@ -882,6 +1071,7 @@ mod tests {
             argocd_admin_password_age: None,
             kubeconfig_sealed_to: Some(SealedTo::StoreVault {
                 store_id: "3f9c0a1b7d2e4c56".into(),
+                vault_id: None,
             }),
             argocd_admin_password_sealed_to: None,
         }
@@ -982,6 +1172,248 @@ mod tests {
         let (_, moved) =
             State::update_recovering::<CliError>(&paths, &held, |_| Ok(Write::Save)).unwrap();
         assert_eq!(moved, None);
+    }
+
+    // ── D.4b B78, B79: a key change's durable update ──────────────────────
+
+    /// The change lands in the state read again, as `update`'s, and is saved.
+    #[test]
+    fn a_durable_update_saves_its_change_into_the_state_read_again() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        State {
+            hetzner_cloud: Some(cached(42, "RESEALED")),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update_durable::<CliError>(&paths, &held, |s| {
+            assert_eq!(
+                s.hetzner_cloud,
+                Some(cached(42, "RESEALED")),
+                "read under the lock"
+            );
+            s.region = Some("fsn1".into());
+            Ok(Write::Save)
+        })
+        .unwrap();
+        assert_eq!(wrote, DurableWrite::Saved);
+        let after = State::load_or_default(&paths).unwrap();
+        assert_eq!(after.region.as_deref(), Some("fsn1"));
+        assert_eq!(after.hetzner_cloud, Some(cached(42, "RESEALED")));
+    }
+
+    /// Nothing to change: the file's own bytes are put back — a field this build does not know
+    /// included — never a copy written again from what this build parsed.
+    #[test]
+    fn a_durable_update_puts_an_unchanged_file_back_byte_for_byte() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        let written = b"{\"cluster_name\": \"as written\", \"a_newer_field\": 7}";
+        std::fs::write(paths.state_file(), written).unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update_durable::<CliError>(&paths, &held, |_| Ok(Write::Leave)).unwrap();
+        assert_eq!(wrote, DurableWrite::Kept);
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), written);
+    }
+
+    /// B78 (Unix): saved or kept, the file is on disk durably before the call returns: a
+    /// folder that cannot be synced fails it, naming the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_durable_update_fails_when_its_folder_cannot_be_synced() {
+        for write in [Write::Save, Write::Leave] {
+            let (_dir, store, paths) = locked_state(&State::default());
+            let held = StoreLock::exclusive(&store).unwrap();
+            cli_core::fsutil::testing::fail_next_dir_sync();
+            let err = State::update_durable::<CliError>(&paths, &held, |_| Ok(write)).unwrap_err();
+            let file = paths.state_file().display().to_string();
+            assert!(err.to_string().contains(&file), "{write:?}: {err}");
+        }
+    }
+
+    /// B78 (Windows): saved or kept, the file moves with write-through.
+    #[cfg(windows)]
+    #[test]
+    fn a_durable_update_moves_with_write_through() {
+        // MOVEFILE_REPLACE_EXISTING (0x1) | MOVEFILE_WRITE_THROUGH (0x8).
+        const WRITE_THROUGH_MOVE: u32 = 0x1 | 0x8;
+        for write in [Write::Save, Write::Leave] {
+            let (_dir, store, paths) = locked_state(&State::default());
+            let held = StoreLock::exclusive(&store).unwrap();
+            let _ = cli_core::fsutil::testing::take_moves();
+            State::update_durable::<CliError>(&paths, &held, |_| Ok(write)).unwrap();
+            // Critic round, finding 10: a busy retry records the same flags again.
+            let moves = cli_core::fsutil::testing::take_moves();
+            assert!(
+                !moves.is_empty() && moves.iter().all(|m| *m == WRITE_THROUGH_MOVE),
+                "{write:?}: {moves:?}"
+            );
+        }
+    }
+
+    /// No `state.json`: the change does not run and nothing is written.
+    #[test]
+    fn a_durable_update_without_a_file_writes_nothing() {
+        let (_dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "prod");
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update_durable::<CliError>(
+            &paths,
+            &held,
+            |_| -> std::result::Result<Write, CliError> { panic!("the change ran without a file") },
+        )
+        .unwrap();
+        assert_eq!(wrote, DurableWrite::NoFile);
+        assert!(!paths.state_file().exists());
+    }
+
+    /// Critic round, finding 2: a path through a file — `.apprafter` a file — is no
+    /// `state.json`, as `load_or_default` reads it: the change does not run and nothing is
+    /// written or renamed. An error here would fail every finish of a key change whose plan
+    /// read the folder as empty.
+    #[test]
+    fn a_durable_update_through_a_file_is_no_file() {
+        let (_dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "prod");
+        let folder = paths.state_dir();
+        std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+        std::fs::write(&folder, b"a file where a folder goes").unwrap();
+        assert_eq!(State::load_or_default(&paths).unwrap(), State::default());
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update_durable::<CliError>(
+            &paths,
+            &held,
+            |_| -> std::result::Result<Write, CliError> { panic!("the change ran without a file") },
+        )
+        .unwrap();
+        assert_eq!(wrote, DurableWrite::NoFile);
+        assert_eq!(
+            std::fs::read(&folder).unwrap(),
+            b"a file where a folder goes"
+        );
+    }
+
+    /// B79: a file that does not parse is renamed aside — never deleted — and the change does
+    /// not run.
+    #[test]
+    fn a_durable_update_sets_a_state_that_does_not_parse_aside() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update_durable::<CliError>(
+            &paths,
+            &held,
+            |_| -> std::result::Result<Write, CliError> {
+                panic!("the change ran on a state that did not parse")
+            },
+        )
+        .unwrap();
+        let DurableWrite::SetAside(aside) = wrote else {
+            panic!("{wrote:?}")
+        };
+        let name = aside.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("state.json.corrupt-"), "{name}");
+        assert_eq!(aside.parent(), paths.state_file().parent());
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{ not json");
+        assert!(!paths.state_file().exists());
+    }
+
+    /// B79: a file that cannot be read fails the call, naming it; nothing is renamed or
+    /// written.
+    #[test]
+    fn a_durable_update_of_an_unreadable_state_fails_and_renames_nothing() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::remove_file(paths.state_file()).unwrap();
+        std::fs::create_dir(paths.state_file()).unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let err =
+            State::update_durable::<CliError>(&paths, &held, |_| Ok(Write::Save)).unwrap_err();
+        assert!(
+            matches!(&err, CliError::StorePathIo { path, .. } if *path == paths.state_file()),
+            "{err:?}"
+        );
+        assert!(paths.state_file().is_dir());
+        let names: Vec<_> = std::fs::read_dir(paths.state_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("state.json")]);
+    }
+
+    /// `WritePoint::Reread` is reached once, after the read and before the change, as
+    /// `update`'s.
+    #[test]
+    fn a_durable_update_reaches_the_reread_point_once() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = reached.clone();
+        let _armed = seam::testing::arm(move |point| {
+            assert_eq!(point, WritePoint::Reread);
+            count.set(count.get() + 1);
+        });
+        let held = StoreLock::exclusive(&store).unwrap();
+        State::update_durable::<CliError>(&paths, &held, |_| Ok(Write::Leave)).unwrap();
+        assert_eq!(reached.get(), 1);
+    }
+
+    /// B79: a set-aside name already taken — an earlier set-aside in the same second — is
+    /// never replaced: the next free name is used.
+    #[test]
+    fn a_set_aside_never_replaces_an_earlier_one() {
+        let (_dir, _store, paths) = locked_state(&State::default());
+        let dir = paths.state_dir();
+        std::fs::write(dir.join("state.json.corrupt-42"), b"first").unwrap();
+        std::fs::write(paths.state_file(), b"second").unwrap();
+        assert_eq!(
+            set_aside(&paths, 42).unwrap(),
+            dir.join("state.json.corrupt-42-1")
+        );
+        std::fs::write(paths.state_file(), b"third").unwrap();
+        assert_eq!(
+            set_aside(&paths, 42).unwrap(),
+            dir.join("state.json.corrupt-42-2")
+        );
+        for (name, bytes) in [
+            ("42", &b"first"[..]),
+            ("42-1", &b"second"[..]),
+            ("42-2", &b"third"[..]),
+        ] {
+            let read = std::fs::read(dir.join(format!("state.json.corrupt-{name}"))).unwrap();
+            assert_eq!(read, bytes, "{name}");
+        }
+        assert!(!paths.state_file().exists());
+    }
+
+    /// B78: a failed durable write names the file; on Windows a sharing, access or lock
+    /// violation — another program has the file open — also says what to do.
+    #[test]
+    fn a_failed_durable_write_names_the_file_and_a_busy_one_says_why() {
+        let path = Path::new("/s/state/prod/.apprafter/state.json");
+        let text = |code: i32, windows: bool| {
+            write_failed_on(path, std::io::Error::from_raw_os_error(code), windows).to_string()
+        };
+        for code in [5, 32, 33] {
+            let busy = text(code, true);
+            assert!(
+                busy.contains("/s/state/prod/.apprafter/state.json: "),
+                "{busy}"
+            );
+            assert!(
+                busy.contains(
+                    "another program may have it open: close that program, then run the \
+                     command again"
+                ),
+                "{busy}"
+            );
+            assert!(
+                !text(code, false).contains("another program"),
+                "{code} off Windows"
+            );
+        }
+        assert!(
+            !text(28, true).contains("another program"),
+            "not a busy file"
+        );
     }
 
     /// `WritePoint::Reread` comes after the read and before the save: a write landing there

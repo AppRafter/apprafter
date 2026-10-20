@@ -3,6 +3,9 @@
 //! policy of `on_tests`' fixtures: every interruption loses nothing and a run again finishes,
 //! an interrupted `lock on` is backed out, and no clear token is ever overwritten.
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use cli_core::secrets::{encrypt_for_recipient, CachedSecret, Identity};
 use cli_core::target::{save_target_credentials, TargetCredentials};
 use cli_core::{CliError, LockPhase, StoreLock, VaultProblem};
@@ -13,9 +16,11 @@ use super::on_tests::{
 };
 use super::*;
 use crate::secrets::marker::{classify, write_marker, Marker};
+use crate::secrets::StoreId;
 use crate::secrets::{read_store_file, LockSlotKind, SecretsMode};
 use crate::target::testkit::{TOKEN_A, TOKEN_B};
 use crate::vault::{KdfPolicy, SlotInput, VAULT_FILE};
+use crate::vault::{OsRandom, SlotBody, SlotId, SlotKind, SlotRecord, VaultFile};
 use crate::{
     CancellationToken, ChangeAction, Context, CoreError, NullReporter, Outcome, PlanClass,
     SecretString,
@@ -29,7 +34,7 @@ fn open_with(ctx: &Context, secret: &str) -> OpenedVault {
     open_at(
         ctx.config_root(),
         file.id.as_ref().unwrap(),
-        SlotInput::from_input(SecretString::new(secret)),
+        SlotInput::from_input(SecretString::new(secret), None),
         &KdfPolicy::INSECURE_FAST,
     )
     .unwrap()
@@ -255,7 +260,7 @@ fn lock_off_backs_out_of_an_interrupted_lock_on() {
         FaultPoint::AfterMarkerTarget(1),
     ] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -307,7 +312,8 @@ fn lock_off_backs_out_of_an_interrupted_lock_on() {
         assert_eq!(
             hetzner_of(&f.ctx, "staging").argocd_admin_password_sealed_to,
             (!dropped_by_lock_on).then(|| cli_state::SealedTo::StoreVault {
-                store_id: "0123456789abcdef".into()
+                store_id: "0123456789abcdef".into(),
+                vault_id: None
             }),
             "{at:?}"
         );
@@ -700,7 +706,7 @@ fn a_back_out_with_a_marker_and_no_vault_stops() {
     let (input, _) = new_input();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterMarkerTarget(0)),
-        plan_on(&f.ctx, None).unwrap(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap(),
         input,
         &NullReporter,
         &CancellationToken::new(),
@@ -724,7 +730,7 @@ fn a_back_out_with_a_marker_and_no_vault_stops() {
     let f = files_store();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterStoreFileLocking),
-        plan_on(&f.ctx, None).unwrap(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap(),
         new_input().0,
         &NullReporter,
         &CancellationToken::new(),
@@ -785,7 +791,7 @@ fn plant_unreadable_key(ctx: &Context) {
 fn a_store_with_no_cache_never_reads_or_creates_the_shared_key() {
     let f = bare_store();
     assert!(!f.ctx.age_key_path().exists());
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     assert!(plan.payload.keys().is_empty(), "{:?}", plan.payload.keys());
     assert!(
         plan.changes
@@ -841,7 +847,7 @@ fn no_interrupted_run_of_a_store_with_no_cache_touches_the_shared_key() {
     ] {
         let f = bare_store();
         plant_unreadable_key(&f.ctx);
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -910,7 +916,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         (FaultPoint::AfterMarkerTarget(0), false),
     ] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -921,8 +927,8 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         )
         .unwrap_err();
         std::fs::write(f.ctx.age_key_path(), NOT_A_KEY).unwrap();
-        let plan = plan_on(&f.ctx, None).unwrap();
-        let LockOnStart::Resume { id } = plan.payload.start().clone() else {
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+        let LockOnStart::Resume { id, .. } = plan.payload.start().clone() else {
             panic!("{at:?}: {:?}", plan.payload.start())
         };
         let slot = |kind, secret: &str| {
@@ -931,6 +937,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
                 &id,
                 kind,
                 SecretString::new(secret),
+                None,
                 &KdfPolicy::INSECURE_FAST,
             )
             .unwrap()
@@ -939,7 +946,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
             &f.ctx,
             plan,
             LockOnInput::Resume {
-                password: slot(LockSlotKind::Password, PASSWORD),
+                everyday: slot(LockSlotKind::Password, PASSWORD),
                 recovery: slot(LockSlotKind::RecoveryKey, shown.as_str()),
             },
             &NullReporter,
@@ -1042,4 +1049,181 @@ fn each_reseal_back_reads_the_state_again_under_the_held_lock_and_keeps_the_rest
         (vec![7], Some(100), Some("cx22"))
     );
     assert_eq!(h.kubeconfig_sealed_to, None, "back under the shared key");
+}
+
+/// The Windows Hello slot `with_hello_slot` puts in a vault: its id and its label.
+const HELLO_SLOT: [u8; 16] = [0x44; 16];
+const HELLO_LABEL: &str = "Windows Hello on DESK-1";
+
+/// `ctx`'s locked vault (its recovery key `shown`) with a Windows Hello slot beside its own —
+/// its body opaque, as a build without Windows Hello keeps one (d4b-b1): a header no write of
+/// this build makes (c1's `header_mut`).
+fn with_hello_slot(ctx: &Context, shown: &str) {
+    let key = open_with(ctx, shown);
+    let path = ctx.config_root().join(VAULT_FILE);
+    let bytes = crate::vault::file::read(&path).unwrap();
+    let mut vault = VaultFile::parse(&bytes)
+        .unwrap()
+        .open_with_key(&key.key, key.vault_id)
+        .unwrap();
+    vault.header_mut().slots.push(SlotRecord {
+        id: SlotId(HELLO_SLOT),
+        kind: SlotKind::WindowsHello,
+        body: SlotBody::Opaque(vec![0x01; 193]),
+        label: HELLO_LABEL.into(),
+    });
+    let sealed = vault.seal("apprafter 0.0.0-test", &mut OsRandom).unwrap();
+    let held = StoreLock::exclusive(&ctx.store()).unwrap();
+    crate::vault::file::replace(&path, &sealed, &held).unwrap();
+}
+
+/// This computer's Windows Hello keys, played (B15): each call recorded with the slot's id and
+/// whether the vault was on disk at that moment — read from the file system at the call, never
+/// from timing — and answered with `answer`.
+#[derive(Debug)]
+struct HelloRecorder {
+    vault: PathBuf,
+    answer: HelloKeyDeleted,
+    calls: Mutex<Vec<(String, bool)>>,
+}
+
+impl HelloRecorder {
+    fn answering(ctx: &Context, answer: HelloKeyDeleted) -> Arc<HelloRecorder> {
+        Arc::new(HelloRecorder {
+            vault: ctx.config_root().join(VAULT_FILE),
+            answer,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, bool)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl HelloKeys for HelloRecorder {
+    fn delete(&self, _store: &StoreId, slot: &SlotRecord) -> HelloKeyDeleted {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((slot.id.to_string(), self.vault.exists()));
+        self.answer.clone()
+    }
+}
+
+/// The Windows Hello slot's id as `lock off` names it.
+fn hello_id() -> String {
+    SlotId(HELLO_SLOT).to_string()
+}
+
+/// D.4b B25: `lock off` hands this computer's key of each Windows Hello slot to the client
+/// while the vault still names it — the files written and read back, the vault not yet
+/// deleted — and lists what became of each; a key not deleted never keeps the store from
+/// files (Deviation 14).
+#[test]
+fn lock_off_hands_each_hello_key_over_before_the_vault_goes() {
+    for answer in [
+        HelloKeyDeleted::Deleted,
+        HelloKeyDeleted::OtherComputer,
+        HelloKeyDeleted::NotHere,
+        HelloKeyDeleted::Kept {
+            why: "the system refused".into(),
+        },
+    ] {
+        let f = files_store();
+        let shown = lock(&f.ctx);
+        with_hello_slot(&f.ctx, &shown);
+        let recorder = HelloRecorder::answering(&f.ctx, answer.clone());
+        let done = unlock(&f.ctx.clone().with_hello_keys(recorder.clone()), PASSWORD);
+        assert_eq!(
+            recorder.calls(),
+            [(hello_id(), true)],
+            "{answer:?}: the vault on disk"
+        );
+        assert_eq!(
+            done.hello_keys,
+            [HelloKeyGone {
+                slot: hello_id(),
+                label: HELLO_LABEL.into(),
+                deleted: answer.clone(),
+            }],
+            "{answer:?}"
+        );
+        assert_files_whole(&f.ctx);
+    }
+}
+
+/// B25, §8.5: a `lock off` interrupted before the keys were handed over — files written and
+/// read back, the vault still there — hands them over when it runs again; one interrupted
+/// after had handed them over already, and its finish, with the vault gone, asks nothing.
+#[test]
+fn an_interrupted_lock_off_hands_the_keys_over_when_it_runs_again() {
+    for (at, handed_before) in [
+        (FaultPoint::AfterFilesVerified, 0),
+        (FaultPoint::AfterVaultDeleted, 1),
+    ] {
+        let f = files_store();
+        let shown = lock(&f.ctx);
+        with_hello_slot(&f.ctx, &shown);
+        let recorder = HelloRecorder::answering(&f.ctx, HelloKeyDeleted::Deleted);
+        let ctx = f.ctx.clone().with_hello_keys(recorder.clone());
+        let plan = plan_off(&ctx).unwrap();
+        let opened = Some(open_with(&ctx, PASSWORD));
+        let e = execute_off(
+            &ctx.clone().with_fault(at),
+            plan,
+            opened,
+            &NullReporter,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("injected fault"), "{at:?}: {e}");
+        assert_eq!(recorder.calls().len(), handed_before, "{at:?}");
+        let done = unlock(&ctx, PASSWORD);
+        assert_eq!(
+            recorder.calls(),
+            [(hello_id(), true)],
+            "{at:?}: once, the vault on disk"
+        );
+        assert_eq!(done.hello_keys.len(), 1 - handed_before, "{at:?}");
+        assert_files_whole(&f.ctx);
+    }
+}
+
+/// B25, F7: a vault without a Windows Hello slot asks the client nothing, and `lock off`'s
+/// outcome reads as D.4a's to the desktop: no `helloKeys` in its JSON.
+#[test]
+fn a_vault_without_hello_slots_asks_nothing_and_says_nothing() {
+    let f = files_store();
+    lock(&f.ctx);
+    let recorder = HelloRecorder::answering(&f.ctx, HelloKeyDeleted::Deleted);
+    let done = unlock(&f.ctx.clone().with_hello_keys(recorder.clone()), PASSWORD);
+    assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
+    assert!(done.hello_keys.is_empty());
+    let json = serde_json::to_value(&done).unwrap();
+    assert!(json.get("helloKeys").is_none(), "{json}");
+    assert!(json.get("ageKeyCreated").is_some(), "{json}");
+}
+
+/// Until d4b-w2 every client passes no Windows Hello (`NoHelloKeys`): a Windows Hello slot a
+/// newer AppRafter made here is listed in the outcome as kept, with why — which w2's and
+/// w3's words then show (critic round, finding 5).
+#[test]
+fn without_windows_hello_a_hello_key_is_listed_as_kept() {
+    let f = files_store();
+    let shown = lock(&f.ctx);
+    with_hello_slot(&f.ctx, &shown);
+    let done = unlock(&f.ctx, PASSWORD);
+    assert!(
+        matches!(
+            &done.hello_keys[..],
+            [HelloKeyGone {
+                deleted: HelloKeyDeleted::Kept { .. },
+                ..
+            }]
+        ),
+        "{:?}",
+        done.hello_keys
+    );
+    assert_files_whole(&f.ctx);
 }

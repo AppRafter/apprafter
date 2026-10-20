@@ -35,6 +35,25 @@ pub enum FaultPoint {
     AfterVaultDeleted,
     /// `lock off`: `store.yaml` says `files`.
     AfterFiles,
+    /// `lock slot add` / `remove` (D.4b c1): the new vault is sealed, not yet written.
+    BeforeSlotWrite,
+    /// `lock slot add` / `remove`: the new vault is on disk, not yet read back nor mirrored.
+    AfterSlotWrite,
+    /// A key change (D.4b B63): `store.yaml` says `rotating` (R1).
+    AfterStoreFileRotating,
+    /// A key change: the rotated vault is on disk (R2), not yet read back.
+    AfterVaultRotated,
+    /// A key change: the rotated vault was read back and opened with every slot it holds.
+    AfterRotatedVerified,
+    /// A key change: state folder `n`'s caches are re-sealed (R3).
+    AfterCachesRekeyed(usize),
+    /// A key change: the retiring store key is out of the vault (R4).
+    AfterRetiringDropped,
+    /// A key change: this computer's Windows Hello keys of dropped slots were handed over
+    /// (R4b).
+    AfterHelloKeysHandedOver,
+    /// A key change: `store.yaml` says `locked` (R5).
+    AfterRotated,
 }
 
 /// An injected failure when `ctx` is armed with `at`; nothing in a build without `test-support`.

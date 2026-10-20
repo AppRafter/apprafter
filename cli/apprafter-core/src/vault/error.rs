@@ -28,9 +28,11 @@ pub enum VaultError {
     /// No vault file where one must be: never an empty vault.
     #[error("no vault file at {}", path.display())]
     Missing { path: PathBuf },
-    /// Every slot of this kind failed its key check: the secret is not one of theirs.
-    #[error("this {kind} does not open the vault")]
-    WrongSecret { kind: SlotKind },
+    /// Every slot tried failed its key check: the secret is not one of theirs. `kinds` are
+    /// the kinds tried, in order — one for a secret of one kind; for typed text, the
+    /// lock-password slot's, then this computer's account-password slot's (B27).
+    #[error("this {} does not open the vault", kinds_or(kinds))]
+    WrongSecret { kinds: Vec<SlotKind> },
     /// The secret passed the slot's key check, but the wrapped data key does not decrypt.
     #[error("vault slot {slot} is damaged: the secret is right, the slot does not open")]
     SlotCorrupt { slot: SlotId },
@@ -96,6 +98,9 @@ pub enum VaultError {
     /// No slot with that id.
     #[error("the vault has no slot {slot}")]
     SlotNotFound { slot: SlotId },
+    /// One slot id given to two new slots (`create_with`, B57): a caller's bug.
+    #[error("slot id {slot} is given to two new slots")]
+    SlotIdTaken { slot: SlotId },
     /// A new lock password breaks one of O2's three rules.
     #[error("a new lock password is refused: {0}")]
     PasswordRefused(PasswordProblem),
@@ -118,6 +123,14 @@ pub enum VaultError {
     /// A recovery key that does not parse, or is not the one shown.
     #[error(transparent)]
     RecoveryKey(#[from] RecoveryKeyError),
+}
+
+fn kinds_or(kinds: &[SlotKind]) -> String {
+    kinds
+        .iter()
+        .map(SlotKind::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 fn kinds_text(kinds: &[SlotKind]) -> String {
@@ -184,6 +197,7 @@ pub enum PayloadWhat {
     ValueLength,
     AgeIdentityMissing,
     AgeIdentity,
+    RetiringIdentity,
     HetznerToken,
     UnlockTimeout,
     TargetName,
@@ -202,6 +216,7 @@ impl fmt::Display for PayloadWhat {
             Self::ValueLength => "an entry value's length",
             Self::AgeIdentityMissing => "no age identity",
             Self::AgeIdentity => "the age identity does not parse",
+            Self::RetiringIdentity => "the retiring age identity does not parse",
             Self::HetznerToken => "a Hetzner token is empty, too long or not text",
             Self::UnlockTimeout => "the unlock timeout is not a whole number of minutes, 0 to 1440",
             Self::TargetName => "a target name breaks the target-name rule",
@@ -239,6 +254,14 @@ pub enum InputWhat {
     StoreId,
     Writer,
     NoRecoverySlot,
+    MachineId,
+    OneSlotPerComputer,
+    SlotIds,
+    FirstSlots,
+    RotationUnfinished,
+    SameVaultId,
+    OneRecoverySlot,
+    NothingToRetire,
 }
 
 impl fmt::Display for InputWhat {
@@ -248,6 +271,22 @@ impl fmt::Display for InputWhat {
             Self::StoreId => "a store id is 1 to 64 printable ASCII characters without spaces",
             Self::Writer => "a vault's writer is 1 to 64 printable ASCII characters",
             Self::NoRecoverySlot => "a new vault needs a recovery-key slot",
+            Self::MachineId => {
+                "a machine id is 16 raw bytes or 32 lower-case hex characters, never all zero"
+            }
+            Self::OneSlotPerComputer => {
+                "a vault holds at most one account-password slot per computer"
+            }
+            Self::SlotIds => "a vault made at plan time needs one minted id per new slot",
+            Self::FirstSlots => {
+                "a vault made at plan time holds exactly one recovery-key slot and another slot"
+            }
+            Self::RotationUnfinished => {
+                "the vault already retires a store key: that key change is finished first"
+            }
+            Self::SameVaultId => "a rotated vault needs a vault id of its own",
+            Self::OneRecoverySlot => "a rotated vault holds exactly one recovery-key slot",
+            Self::NothingToRetire => "the vault retires no store key",
         })
     }
 }

@@ -1,24 +1,29 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter lock on` and `apprafter lock off` (ADR 0068 §5; D.4a T36, T37, T60; overview
-//! §3.11): the two leaves over `apprafter_core::lock`. The core plans and executes; this module
-//! shows the plan, holds the dialogue at the controlling terminal and prints the result. Every
-//! secret is asked, and the recovery key shown, at the terminal itself ([`Asker`]) — never on
-//! stdout or stderr, which a log or a pipe may keep: the new lock password twice (O2), the
-//! recovery key once and typed back whole (O12), the lock password and the recovery key for a
-//! resume, each opening its own slot (rule 4; team decision 2026-10-13), one slot's secret for
-//! `lock off` (asked fresh, O11).
+//! §3.11; D.4b B55, B56): the two leaves over `apprafter_core::lock`. The core plans and
+//! executes; this module shows the plan, holds the dialogue at the controlling terminal and
+//! prints the result. Every secret is asked, and the recovery key shown, at the terminal itself
+//! ([`Asker`]) — never on stdout or stderr, which a log or a pipe may keep: by default this
+//! computer's account password, checked with the system once (`crate::os_slots`), or a new lock
+//! password twice (O2) where this computer cannot check it or `--lock-password` asks for one;
+//! the recovery key once and typed back whole (O12); the everyday slot's secret and the
+//! recovery key for a resume, each opening its own slot (rule 4; team decision 2026-10-13); one
+//! slot's secret for `lock off` (asked fresh, O11).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use apprafter_core::lock::text;
 use apprafter_core::lock::{
     self, check_password, HolderUnavailableReason, LockOffPayload, LockOffStart, LockOnInput,
     LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit, PasswordAdvice,
-    PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotRefusalView, SlotView, UnlockWindow,
+    PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotView, UnlockWindow,
 };
+use apprafter_core::lock::{FirstSecret, FirstStep};
+use apprafter_core::lock::{HostOs, LockOnWay, SlotFacts, WayFallback};
 use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId, STORE_FILE};
 use apprafter_core::vault::{
-    ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
+    ConfirmedRecoveryKey, KdfPolicy, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
 };
 use apprafter_core::{
     CancellationToken, ChangeAction, Context, CoreError, CoreResult, Event, Plan, PlannedChange,
@@ -31,8 +36,9 @@ use crate::commands::target::completed;
 use crate::context::{cli_context, diagnostic_context, ProcessEnv};
 use crate::holder::protocol::HolderUnavailable;
 use crate::holder::spawn::HolderStarted;
+use crate::os_slots::OsSlots;
 use crate::prompt::{Asker, PromptError, Terminal};
-use crate::render::core_error::report;
+use crate::render::core_error::{report, report_with_help};
 use crate::render::reporter::CliReporter;
 use crate::vault_access::{ask_and_open, prompt_refusal, sentence, ATTEMPTS};
 use crate::{holder_window, limits_client};
@@ -53,11 +59,52 @@ const CONFIRM: &str = "Type the recovery key to confirm you saved it (the \
 /// A resume's answer that is not the slot's secret (C29's resume form).
 const NOT_THE_PASSWORD: &str = "That is not the lock password of this store.\n";
 const NOT_THE_KEY: &str = "That is not the recovery key of this store.\n";
-/// A resume without one of its two secrets: the way out (team decision 2026-10-13).
-const WAY_OUT: &str = "This `apprafter lock on` finishes only with both the lock password and \
-                       the recovery key. Without one of them, `apprafter lock off` backs out of \
-                       it with the other, and a new `apprafter lock on` makes a new vault and a \
-                       new recovery key.\n";
+const NOT_THE_ACCOUNT_PASSWORD: &str =
+    "That is not the account password this store's slot on this computer was made with.\n";
+/// D.4b B55, B56 (d4b-e1a): the account password's check, said before its prompt.
+const ACCOUNT_CHECK_NOTE: &str = "Your account password is checked with the system once, now. \
+                                  Type it at the prompt — a fingerprint reader does not count — \
+                                  and know that a wrong one may count as a failed login on \
+                                  systems that lock an account after failed logins.\n";
+/// B75 (2): an empty entry where this account's password status could not be read.
+const EMPTY_ENTRY_FELL_BACK: &str = "You pressed Enter on an empty line, so this account has no \
+                                     password: the store gets a separate lock password instead.\n";
+/// c3's Deviation 7: an empty entry where the account has a password is asked again.
+const HAS_A_PASSWORD: &str = "This account has a password: type it, or press Ctrl-C and run \
+                              `apprafter lock on --lock-password` for a separate lock \
+                              password.\n";
+/// B55: what the default way is, in the plan, before its costs (B61, B70, B76).
+const ACCOUNT_WAY: &str = "It will open with your account password on this computer — checked \
+                           with the system once, now — and with a recovery key you keep away \
+                           from this computer.\n";
+/// B55, B61 (F7): the way back to a separate lock password, said before anything is asked.
+const LOCK_PASSWORD_INSTEAD: &str = "To protect it with a separate lock password instead, press \
+                                     Ctrl-C now and run `apprafter lock on --lock-password`.\n";
+/// B2: after a short account password the system took.
+const ADD_ANYWAY: &str = "Add it anyway? [y/N] ";
+/// B2: a short account password declined, after the check and before any recovery key.
+const NOT_ADDED: &str = "Nothing was written. `apprafter lock on --lock-password` protects the \
+                         store with a separate lock password instead.\n";
+/// D.4b B80: before a new recovery key is shown, when it starts to open the store.
+const KEY_VALID_WHEN: &str = "This recovery key opens the store only when AppRafter says Locked.\n";
+/// C14 for a lock password: where the recovery key opens the store.
+const OPENS_WITHOUT_LOCK_PASSWORD: &str = "It opens this store if the lock password is lost. \
+                                           AppRafter cannot open a locked store without its \
+                                           lock password or its recovery key.";
+/// C14 for this computer's account password (D.4b B70).
+const OPENS_WITHOUT_ACCOUNT_PASSWORD: &str = "It opens this store where your account password \
+                                              does not: on another computer, after you \
+                                              reinstall the system, or once this computer's \
+                                              id changes. AppRafter cannot open a locked \
+                                              store without one of its secrets.";
+/// D.4b (d4b-c3's Deviation 10, d4b-e1a): an interrupted run this AppRafter cannot finish, and
+/// its one way out.
+const CANNOT_FINISH: &str = "This AppRafter cannot finish that run: besides the recovery key, its \
+                             vault has no slot this AppRafter opens (a Windows Hello slot that a \
+                             newer AppRafter made, say). `apprafter lock off` backs it out with \
+                             the recovery key, and a new `apprafter lock on` then makes a new \
+                             vault and a new recovery key. Until then commands that need the \
+                             store's secrets refuse, because some may be only in the vault.";
 /// C8.
 const AGENT_NOTE: &str = "This stops an AI agent that runs AppRafter as you from reading \
                           these secrets or using them without you. It does not stop a program \
@@ -70,7 +117,10 @@ const CLEAR_AGAIN: &str = "The secrets will be on disk in clear again: any progr
 
 pub(crate) fn run(action: LockCommand) -> miette::Result<()> {
     match action {
-        LockCommand::On { timeout } => on(&Terminal, timeout),
+        LockCommand::On {
+            timeout,
+            lock_password,
+        } => on(&Terminal, timeout, lock_password),
         LockCommand::Off => off(&Terminal),
         LockCommand::Now => now(),
         LockCommand::Status => status(),
@@ -102,12 +152,43 @@ impl Reporter for Progress {
     }
 }
 
-fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
+/// `lock on`'s plan refused (D.4b, d4b-c3's Deviation 10): an interrupted run whose vault this
+/// AppRafter cannot finish is `lock_incomplete` when it is planned, with help that names `lock
+/// off` alone — `lock_incomplete`'s own help also names `lock on` again, which refuses it the
+/// same way. An interrupted `lock off` keeps its own help.
+fn plan_refused(e: CoreError) -> miette::Report {
+    if matches!(
+        e,
+        CoreError::Cli(CliError::LockIncomplete {
+            phase: LockPhase::Locking,
+            ..
+        })
+    ) {
+        return report_with_help(e, CANNOT_FINISH);
+    }
+    report(e)
+}
+
+fn on(asker: &dyn Asker, timeout: Option<u32>, lock_password: bool) -> miette::Result<()> {
     crate::vault_access::insecure_kdf_note();
     let ctx = crate::context::cli_context()?;
     let root = ctx.config_root().to_path_buf();
     let (shown, targets) = named(&ctx);
-    let plan = lock::plan_on(&ctx, timeout).map_err(report)?;
+    // D.4b B55, B88 (d4b-e1a): this computer's everyday way unless `--lock-password` asks for
+    // a separate lock password; its facts come from the os-slots glue, one call each in B88's
+    // order — under APPRAFTER_SANDBOX's fence none at all (B82). `--lock-password` makes no
+    // backend at all: it reads no fact (critic round, finding 6).
+    let slots = if lock_password {
+        Arc::new(OsSlots::absent())
+    } else {
+        crate::os_slots::process()
+    };
+    let asked = if lock_password {
+        lock::WayAsked::LockPassword
+    } else {
+        lock::WayAsked::Everyday(&*slots)
+    };
+    let mut plan = lock::plan_on(&ctx, timeout, asked).map_err(plan_refused)?;
     if let LockOnStart::AlreadyLocked = plan.payload.start() {
         match timeout {
             None => println!("The target store at {shown} is already locked."),
@@ -118,32 +199,39 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
         }
         return Ok(());
     }
+    let os = slots.os();
     if !asker.present() {
-        return Err(miette::Report::new(CliError::UsageRefused {
-            message: "`apprafter lock on` asks for a new lock password and shows a recovery \
-                      key: run it in a terminal"
-                .to_string(),
-            help: "It cannot be scripted: whoever runs it chooses the password.".to_string(),
-        }));
+        // D.4b B55 (F4): why this run would take a lock password, first — as `lock off` shows
+        // its plan without a terminal; target names and paths, so printable only.
+        if let Some(head) = fallback_head(plan.payload.fallback(), os) {
+            eprint!("{}", crate::prompt::printable(&head));
+        }
+        return Err(miette::Report::new(no_terminal(plan.payload.way())));
     }
     let refused = prompt_refusal(&root);
     asker
-        .tell(&on_plan_text(&ctx, &plan, &shown, &targets))
+        .tell(&on_plan_text(&ctx, &plan, &shown, &targets, os))
         .map_err(|e| miette::Report::new(refused(e)))?;
     let input = match plan.payload.start().clone() {
-        LockOnStart::Resume { id } => {
+        LockOnStart::Resume { id, everyday } => {
             asker
-                .tell(&format!(
-                    "An earlier `apprafter lock on` on {shown} did not finish; finishing it. \
-                     Before any secret leaves the files, the vault it wrote is opened with the \
-                     lock password and with the recovery key.\n"
-                ))
+                .tell(&resume_intro(&shown, everyday, lock_password))
                 .map_err(|e| miette::Report::new(refused(e)))?;
-            let password = ask_slot(asker, &root, &id, LockSlotKind::Password, &shown)
+            let opened = ask_slot(asker, &root, &id, everyday, everyday, &shown)
                 .map_err(miette::Report::new)?;
-            let recovery = ask_slot(asker, &root, &id, LockSlotKind::RecoveryKey, &shown)
-                .map_err(miette::Report::new)?;
-            LockOnInput::Resume { password, recovery }
+            let recovery = ask_slot(
+                asker,
+                &root,
+                &id,
+                LockSlotKind::RecoveryKey,
+                everyday,
+                &shown,
+            )
+            .map_err(miette::Report::new)?;
+            LockOnInput::Resume {
+                everyday: opened,
+                recovery,
+            }
         }
         LockOnStart::New { restart } => {
             if restart {
@@ -158,16 +246,23 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
                 &root.join(apprafter_core::vault::VAULT_FILE),
                 ctx.home_dir(),
             );
-            new_input(asker, &shown, &vault_shown, &root).map_err(miette::Report::new)?
+            new_input(asker, &mut plan, &slots, &shown, &vault_shown, &root)
+                .map_err(miette::Report::new)?
         }
         LockOnStart::AlreadyLocked => unreachable!("answered above"),
     };
+    // After the first slot's step: an empty entry may have moved a new run to a lock password.
+    let everyday = everyday_of(&plan);
+    let shown_slot = recovery_slot(&plan);
     eprintln!("Locking...");
     let done = completed(
         lock::execute_on(&ctx, plan, input, &Progress, &CancellationToken::new())
             .map_err(report)?,
     )?;
-    print!("{}", on_result(&done, &shown));
+    print!(
+        "{}",
+        on_result(&done, &shown, everyday, shown_slot.as_deref())
+    );
     Ok(())
 }
 
@@ -292,20 +387,34 @@ fn new_password(asker: &dyn Asker, shown: &str) -> Result<SecretString, PromptEr
     }
 }
 
-/// C14 with O8's sentences: the key, shown once, and what it opens.
-fn recovery_text(shown: &str, vault_shown: &str, key: &SecretString) -> Zeroizing<String> {
-    let mut text = Zeroizing::new(format!("Recovery key for {shown} — shown only now:\n\n"));
+/// C14 with O8's sentences: the key, shown once with its slot's id after B80's words, and
+/// what it opens — where the everyday slot does not (D.4b B70, B80).
+fn recovery_text(
+    shown: &str,
+    vault_shown: &str,
+    key: &SecretString,
+    everyday: LockSlotKind,
+    slot: &str,
+) -> Zeroizing<String> {
+    let mut text = Zeroizing::new(String::from(KEY_VALID_WHEN));
+    text.push_str(&format!(
+        "Recovery key for {shown} · slot {slot} — shown only now; write the id on the paper \
+         too:\n\n"
+    ));
     for line in key.expose().lines() {
         text.push_str("    ");
         text.push_str(line);
         text.push('\n');
     }
+    let opens = if everyday == LockSlotKind::OsPassword {
+        OPENS_WITHOUT_ACCOUNT_PASSWORD
+    } else {
+        OPENS_WITHOUT_LOCK_PASSWORD
+    };
     text.push_str(&format!(
-        "\nIt opens this store if the lock password is lost. AppRafter cannot open a locked \
-         store without its lock password or its recovery key. Keep the recovery key somewhere \
-         other than this computer. The recovery key opens nothing without the vault file: \
-         include {vault_shown} in your backups; it is encrypted. Clear this screen once it is \
-         saved.\n"
+        "\n{opens} Keep the recovery key somewhere other than this computer. The recovery key \
+         opens nothing without the vault file: include {vault_shown} in your backups; it is \
+         encrypted. Clear this screen once it is saved.\n"
     ));
     text
 }
@@ -317,8 +426,10 @@ fn show_and_confirm(
     key: RecoveryKey,
     shown: &str,
     vault_shown: &str,
+    everyday: LockSlotKind,
+    slot: &str,
 ) -> Result<ConfirmedRecoveryKey, PromptError> {
-    let text = recovery_text(shown, vault_shown, &key.to_display());
+    let text = recovery_text(shown, vault_shown, &key.to_display(), everyday, slot);
     asker.tell(&text)?;
     let mut key = key;
     loop {
@@ -336,55 +447,157 @@ fn show_and_confirm(
     }
 }
 
-/// A new run's secrets: the password, then the recovery key (nothing is written before both).
+/// A new run's secrets (D.4b B55, B56, B75): its first slot's — this computer's account
+/// password, checked with the system once, or a new lock password — and only then the recovery
+/// key that slot's step drew, shown and typed back (nothing is written before both). An empty
+/// account password where the plan says it means "no password" moves the run to a lock
+/// password; a password no slot holds is said and asked again; a check the system refused ends
+/// the run. B2: a short account password the system took is kept only on `y`.
 fn new_input(
     asker: &dyn Asker,
+    plan: &mut Plan<LockOnPayload>,
+    slots: &OsSlots,
     shown: &str,
     vault_shown: &str,
     root: &Path,
 ) -> Result<LockOnInput, CliError> {
     let refused = prompt_refusal(root);
-    let password = new_password(asker, shown).map_err(&refused)?;
-    let key = RecoveryKey::generate(&mut OsRandom).map_err(|e| CliError::RandomUnavailable {
-        detail: e.to_string(),
+    if plan.payload.way() == Some(LockOnWay::AccountPassword) {
+        asker.tell(ACCOUNT_CHECK_NOTE).map_err(&refused)?;
+    }
+    let (first, key) = loop {
+        let step = if plan.payload.way() == Some(LockOnWay::AccountPassword) {
+            let question = account_prompt(
+                slots.account_name().as_deref(),
+                plan.payload.empty_entry_falls_back(),
+            );
+            let typed = asker.ask(&question).map_err(&refused)?;
+            let empty = typed.expose().is_empty();
+            let secret = FirstSecret::AccountPassword {
+                typed,
+                check: slots,
+            };
+            match lock::first_slot(plan, secret).map_err(crate::context::into_cli_error)? {
+                // c3's Deviation 7: Enter where this account has a password is a slip.
+                FirstStep::Mistake(_) if empty => {
+                    asker.tell(HAS_A_PASSWORD).map_err(&refused)?;
+                    continue;
+                }
+                step => step,
+            }
+        } else {
+            let password = new_password(asker, shown).map_err(&refused)?;
+            lock::first_slot(plan, FirstSecret::LockPassword(password))
+                .map_err(crate::context::into_cli_error)?
+        };
+        match step {
+            FirstStep::Ready { first, recovery } => break (first, recovery),
+            FirstStep::FellBack => asker.tell(EMPTY_ENTRY_FELL_BACK).map_err(&refused)?,
+            FirstStep::Mistake(e) => asker
+                .tell(&format!("{}.\n", sentence(&e.to_string())))
+                .map_err(&refused)?,
+        }
+    };
+    if first.way() == LockOnWay::AccountPassword {
+        if let Some(PasswordAdvice::Short { chars, recommended }) = first.advice() {
+            asker
+                .tell(&short_account_password(chars, recommended))
+                .map_err(&refused)?;
+            let answer = asker.answer(ADD_ANYWAY).map_err(&refused)?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                asker.tell(NOT_ADDED).map_err(&refused)?;
+                return Err(CliError::Cancelled);
+            }
+        }
+    }
+    let everyday = everyday_of(plan);
+    // D.4b B80: the key is shown with its slot's id, minted when the run was planned.
+    let slot = recovery_slot(plan).ok_or_else(|| {
+        CliError::Other("a new `lock on` run's plan holds no recovery slot id".to_string())
     })?;
-    let recovery = show_and_confirm(asker, key, shown, vault_shown).map_err(&refused)?;
-    Ok(LockOnInput::New { password, recovery })
+    let recovery =
+        show_and_confirm(asker, key, shown, vault_shown, everyday, &slot).map_err(&refused)?;
+    Ok(LockOnInput::New { first, recovery })
 }
 
 /// A resume's question for the secret of a `kind` slot of the store `shown` (rule 4).
 fn resume_question(kind: LockSlotKind, shown: &str) -> String {
     let what = match kind {
         LockSlotKind::Password => "Lock password",
+        LockSlotKind::OsPassword => "Account password",
         _ => "Recovery key",
     };
     format!("{what} of {shown} (Enter alone if you no longer have it): ")
 }
 
+/// What a resume opens its everyday slot with, as its lines say it (D.4b B56).
+fn opener_words(everyday: LockSlotKind) -> &'static str {
+    match everyday {
+        LockSlotKind::OsPassword => "your account password",
+        LockSlotKind::WindowsHello => "Windows Hello",
+        _ => "the lock password",
+    }
+}
+
+/// A resume without one of its two secrets: the way out (team decision 2026-10-13), naming the
+/// run's everyday slot (D.4b B56).
+fn way_out(everyday: LockSlotKind) -> String {
+    format!(
+        "This `apprafter lock on` finishes only with both {} and the recovery key. Without one \
+         of them, `apprafter lock off` backs out of it with the other, and a new `apprafter lock \
+         on` makes a new vault and a new recovery key.\n",
+        opener_words(everyday)
+    )
+}
+
+/// A resume's first words (C20; D.4b B56): the vault it finishes opens with the everyday slot's
+/// secret and the recovery key — and, with `--lock-password` on a run that chose another way,
+/// that the flag is a new run's.
+fn resume_intro(shown: &str, everyday: LockSlotKind, lock_password: bool) -> String {
+    let opener = opener_words(everyday);
+    let mut out = format!(
+        "An earlier `apprafter lock on` on {shown} did not finish; finishing it. Before any \
+         secret leaves the files, the vault it wrote is opened with {opener} and with the \
+         recovery key.\n"
+    );
+    if lock_password && everyday != LockSlotKind::Password {
+        out.push_str(&format!(
+            "That run chose {opener}: `--lock-password` applies to a new `apprafter lock on`, \
+             once `apprafter lock off` has backed this one out.\n"
+        ));
+    }
+    out
+}
+
 /// One slot's secret for a resume (rule 4; team decision 2026-10-13): asked up to
 /// [`ATTEMPTS`] times by its own question and opened for that slot alone
 /// (`lock::open_slot_at`). A wrong secret or a mistyped key is told and costs one attempt.
-/// Enter alone — the person no longer has it — or a third wrong answer ends the resume:
-/// [`WAY_OUT`] at the terminal, then `lock_incomplete`, whose help says the same.
+/// Enter alone — the person no longer has it — or a third wrong answer ends the resume: the
+/// way out ([`way_out`], naming `everyday`, the run's everyday slot) at the terminal, then
+/// `lock_incomplete`, whose help says the same.
 fn ask_slot(
     asker: &dyn Asker,
     root: &Path,
     id: &StoreId,
     kind: LockSlotKind,
+    everyday: LockSlotKind,
     shown: &str,
 ) -> Result<SlotOpened, CliError> {
     let refused = prompt_refusal(root);
     let question = resume_question(kind, shown);
+    // D.4b B56: an account-password slot opens only with this computer's machine id.
+    let machine = crate::vault_access::slot_facts().machine_id().id().cloned();
     for _ in 0..ATTEMPTS {
         let secret = asker.ask(&question).map_err(&refused)?;
         if secret.expose().trim().is_empty() {
             break;
         }
-        match lock::open_slot_at(root, id, kind, secret, KdfPolicy::active()) {
+        match lock::open_slot_at(root, id, kind, secret, machine.clone(), KdfPolicy::active()) {
             Ok(opened) => return Ok(opened),
             Err(CoreError::Cli(CliError::UnlockFailed { .. })) => asker
                 .tell(match kind {
                     LockSlotKind::Password => NOT_THE_PASSWORD,
+                    LockSlotKind::OsPassword => NOT_THE_ACCOUNT_PASSWORD,
                     _ => NOT_THE_KEY,
                 })
                 .map_err(&refused)?,
@@ -394,7 +607,7 @@ fn ask_slot(
             Err(e) => return Err(crate::context::into_cli_error(e)),
         }
     }
-    asker.tell(WAY_OUT).map_err(&refused)?;
+    asker.tell(&way_out(everyday)).map_err(&refused)?;
     Err(CliError::LockIncomplete {
         store: root.to_path_buf(),
         phase: LockPhase::Locking,
@@ -425,10 +638,18 @@ fn plan_line(c: &PlannedChange) -> String {
     format!("{}\n", line.trim_end())
 }
 
-/// `lock on`'s plan (C1–C9, O1's two notes; C7 without the window a later step opens). A test
-/// build said so on stderr already (`insecure_kdf_note`, T23).
-fn on_plan_text(ctx: &Context, plan: &Plan<LockOnPayload>, shown: &str, targets: &str) -> String {
-    let mut out = String::new();
+/// `lock on`'s plan (C1–C9, O1's two notes; C7 without the window a later step opens), after
+/// why it takes a lock password when it fell back (D.4b B55, B88), and — for this computer's
+/// account password — what that way is and costs, before anything is asked (B61, B70, B76). A
+/// test build said so on stderr already (`insecure_kdf_note`, T23).
+fn on_plan_text(
+    ctx: &Context,
+    plan: &Plan<LockOnPayload>,
+    shown: &str,
+    targets: &str,
+    os: HostOs,
+) -> String {
+    let mut out = fallback_head(plan.payload.fallback(), os).unwrap_or_default();
     out.push_str(&format!(
         "Lock the secrets of the target store at {shown} ({targets}):\n"
     ));
@@ -453,15 +674,173 @@ fn on_plan_text(ctx: &Context, plan: &Plan<LockOnPayload>, shown: &str, targets:
             path.display()
         ));
     }
+    if plan.payload.way() == Some(LockOnWay::AccountPassword) {
+        out.push_str(ACCOUNT_WAY);
+        for note in plan.payload.notes() {
+            out.push_str(text::plan_note_line(note, LockSlotKind::OsPassword));
+            out.push('\n');
+        }
+        out.push_str(LOCK_PASSWORD_INSTEAD);
+    }
     out.push_str(&format!(
         "Unlock window: {} min (`--timeout` changes it). Once locked, a command that needs \
-         these secrets asks for the lock password or the recovery key in its terminal, and a \
-         command with no terminal is refused. HCLOUD_TOKEN and APPRAFTER_AGE_KEY no longer \
-         stand in for the store's secrets.\n",
-        plan.payload.timeout_min()
+         these secrets asks for {} in its terminal, and a command with no terminal is refused. \
+         HCLOUD_TOKEN and APPRAFTER_AGE_KEY no longer stand in for the store's secrets.\n",
+        plan.payload.timeout_min(),
+        secret_words(everyday_of(plan))
     ));
     out.push_str(AGENT_NOTE);
     out
+}
+
+/// The slot a store opens with every day, as a plan says it (D.4b B55, B56): the resumed
+/// vault's, or the new run's way — a lock password when it fell back.
+fn everyday_of(plan: &Plan<LockOnPayload>) -> LockSlotKind {
+    match (plan.payload.start(), plan.payload.way()) {
+        (LockOnStart::Resume { everyday, .. }, _) => *everyday,
+        (_, Some(LockOnWay::AccountPassword)) => LockSlotKind::OsPassword,
+        (_, Some(LockOnWay::WindowsHello)) => LockSlotKind::WindowsHello,
+        _ => LockSlotKind::Password,
+    }
+}
+
+/// The recovery key's slot id as surfaces show it — its first 8 hex characters (D.4b B80) —
+/// minted when a new run was planned; `None` for a resume or a store locked already.
+fn recovery_slot(plan: &Plan<LockOnPayload>) -> Option<String> {
+    let id = plan.payload.recovery_slot_id()?;
+    Some(text::short_id(&id.to_string()).to_owned())
+}
+
+/// What a command of a locked store asks for, by its everyday slot (C7, C16; D.4b B55).
+fn secret_words(everyday: LockSlotKind) -> &'static str {
+    match everyday {
+        LockSlotKind::OsPassword => "your account password or the recovery key",
+        LockSlotKind::WindowsHello => "Windows Hello or the recovery key",
+        _ => "the lock password or the recovery key",
+    }
+}
+
+/// What a locked store opens with, by its everyday slot (C16; D.4b B55).
+fn opened_by_words(everyday: LockSlotKind) -> &'static str {
+    match everyday {
+        LockSlotKind::OsPassword => "your account password on this computer or the recovery key",
+        LockSlotKind::WindowsHello => "Windows Hello on this computer or the recovery key",
+        _ => "the lock password or the recovery key",
+    }
+}
+
+/// Why a plan takes a separate lock password, as its first lines say it (D.4b B55, B88): the
+/// reason, then what the store gets instead; `None` when it did not fall back.
+fn fallback_head(fallback: Option<WayFallback>, os: HostOs) -> Option<String> {
+    let reason = fallback?;
+    Some(format!(
+        "{}\nThe store gets a separate lock password instead.\n",
+        fallback_reason(reason, os)
+    ))
+}
+
+/// One fallback reason in words (B55, B88): c1's refusal words where a refusal says the same.
+fn fallback_reason(reason: WayFallback, os: HostOs) -> &'static str {
+    match reason {
+        WayFallback::Sandbox if os == HostOs::Windows => {
+            "AppRafter does not ask Windows Hello while APPRAFTER_SANDBOX is set: the variable \
+             fences tests and agents away from it."
+        }
+        WayFallback::Sandbox => {
+            "AppRafter does not check your account password while APPRAFTER_SANDBOX is set: \
+             the variable fences tests and agents away from it."
+        }
+        WayFallback::HelloNotBuilt => "This AppRafter cannot open a store with Windows Hello yet.",
+        WayFallback::NoLibpam => {
+            "This computer cannot check your account password: libpam is not installed."
+        }
+        WayFallback::NoService => {
+            "This computer cannot check your account password: none of the sign-in services \
+             AppRafter uses (common-auth, system-auth, login) is set up."
+        }
+        WayFallback::NoCheckRoute => {
+            "This computer cannot check your account password: the system offers no check \
+             that sees what was typed."
+        }
+        WayFallback::NoAccount => {
+            "This computer cannot check your account password: the user running AppRafter has \
+             no account entry."
+        }
+        WayFallback::NoNewPrivs => {
+            "AppRafter cannot check your account password safely here: it runs with \
+             no_new_privs (a sandbox such as Flatpak or bubblewrap, or a service started with \
+             NoNewPrivileges=), under which the system may refuse even the right password and \
+             count it as a failed login."
+        }
+        WayFallback::HelloNotSupported => "Windows Hello is not available on this computer.",
+        WayFallback::HelloNotSetUp => "Windows Hello is not set up for this account.",
+        WayFallback::RemoteSession => "Windows Hello cannot be asked in a remote session.",
+        WayFallback::NoMachineId => {
+            "This computer has no machine id to bind an account-password slot to (on Linux, \
+             /etc/machine-id is missing or not valid)."
+        }
+        WayFallback::NoBackoffRecord => {
+            "AppRafter cannot check your account password safely here: there is no folder of \
+             yours for the record that spaces out failed checks (on Linux, /run/user/<uid>, \
+             which a login session makes)."
+        }
+        WayFallback::NoPassword => {
+            "This account has no password the system can check (none, an empty one, or a \
+             locked one)."
+        }
+    }
+}
+
+/// The account-password prompt (D.4b B55; B75 (2): Enter on an empty line means "no password"
+/// only where this account's password status could not be read).
+fn account_prompt(account: Option<&str>, empty_entry_falls_back: bool) -> String {
+    let whose = match account {
+        Some(name) => format!("Account password of {name}"),
+        None => "Your account password".to_string(),
+    };
+    if empty_entry_falls_back {
+        format!("{whose} (Enter on an empty line if it has none): ")
+    } else {
+        format!("{whose}: ")
+    }
+}
+
+/// B2 with O2's sentence, for an account password the system took: short, and a copy of the
+/// vault with this computer's id lets anyone guess it offline.
+fn short_account_password(chars: u32, recommended: u32) -> String {
+    format!(
+        "Your account password has {chars} characters; {recommended} or more is recommended. \
+         Anyone with a copy of this store's vault and this computer's id — any program running \
+         as you — can try passwords against it offline, as fast as their hardware allows.\n"
+    )
+}
+
+/// `lock on` with no terminal (C38; D.4b B55): refused, naming what it would ask.
+fn no_terminal(way: Option<LockOnWay>) -> CliError {
+    let (asks, help) = match way {
+        Some(LockOnWay::AccountPassword) => (
+            "asks for your account password",
+            "It cannot be scripted: whoever owns the account types its password. `apprafter \
+             lock on --lock-password` asks for a separate lock password instead, also in a \
+             terminal.",
+        ),
+        Some(LockOnWay::WindowsHello) => (
+            "asks Windows Hello",
+            "It cannot be scripted: whoever owns the account approves Windows Hello. \
+             `apprafter lock on --lock-password` asks for a separate lock password instead, \
+             also in a terminal.",
+        ),
+        _ => (
+            "asks for a new lock password",
+            "It cannot be scripted: whoever runs it chooses the password.",
+        ),
+    };
+    CliError::UsageRefused {
+        message: format!(
+            "`apprafter lock on` {asks} and shows a recovery key: run it in a terminal"
+        ),
+        help: help.to_string(),
+    }
 }
 
 /// `lock off`'s plan (C21–C23).
@@ -501,8 +880,13 @@ fn noun(secret: &str) -> &str {
     }
 }
 
-/// C16, C17 (no window yet), G2's and G13's lines.
-fn on_result(done: &LockedOn, shown: &str) -> String {
+/// C16, C17 (no window yet), G2's and G13's lines, naming the everyday slot (D.4b B55).
+fn on_result(
+    done: &LockedOn,
+    shown: &str,
+    everyday: LockSlotKind,
+    recovery_slot: Option<&str>,
+) -> String {
     if done.already_locked {
         return format!(
             "The target store at {shown} was locked by another `apprafter lock on` meanwhile; \
@@ -510,13 +894,20 @@ fn on_result(done: &LockedOn, shown: &str) -> String {
         );
     }
     let mut out = format!(
-        "Locked: the secrets of {shown} are in its vault (opened by the lock password or the \
-         recovery key).\nA command that needs them asks for the lock password or the recovery \
-         key in its terminal; a command with no terminal is refused.\n  ✓ {} token(s) moved \
-         into the vault\n  ✓ {} cached secret(s) re-encrypted\n",
+        "Locked: the secrets of {shown} are in its vault (opened by {}).\nA command that needs \
+         them asks for {} in its terminal; a command with no terminal is refused.\n  ✓ {} \
+         token(s) moved into the vault\n  ✓ {} cached secret(s) re-encrypted\n",
+        opened_by_words(everyday),
+        secret_words(everyday),
         done.tokens_moved.len(),
         done.caches_resealed
     );
+    // D.4b B80: the key shown at the start opens the store from now on.
+    if let Some(slot) = recovery_slot {
+        out.push_str(&format!(
+            "  ✓ the recovery key of slot {slot} opens it from now on\n"
+        ));
+    }
     for d in &done.caches_dropped {
         out.push_str(&format!(
             "  dropped the cached {} of `{}`: {}\n",
@@ -596,7 +987,9 @@ pub(crate) fn status() -> miette::Result<()> {
     let place = holder_window::HolderPlace::of(&ctx);
     let window = holder_window::window_state(&ctx, &place, terminal).map_err(report)?;
     let client = limits_client::cli_limit_client(&ProcessEnv, terminal);
-    let lock_report = apprafter_core::lock::status(&ctx, window, &client).map_err(report)?;
+    let facts = crate::vault_access::slot_facts();
+    let lock_report =
+        apprafter_core::lock::status(&ctx, window, &client, &*facts).map_err(report)?;
     print!("{}", render_status(&lock_report));
     Ok(())
 }
@@ -639,6 +1032,7 @@ pub(crate) fn unlock(timeout: Option<u32>) -> miette::Result<()> {
         }
         SecretsMode::Locking => Some(LockPhase::Locking),
         SecretsMode::Unlocking => Some(LockPhase::Unlocking),
+        SecretsMode::Rotating => Some(LockPhase::Rotating),
         SecretsMode::Locked => None,
     };
     // WI-478 (d4a-h F1's class): a store other accounts can change is refused before its lock
@@ -894,6 +1288,11 @@ fn secrets_text(r: &LockReport) -> String {
         SecretsMode::Unlocking => {
             "unlocking — an earlier `apprafter lock off` did not finish: run it again".into()
         }
+        SecretsMode::Rotating => "rotating — an earlier key change (`apprafter lock rekey` or \
+                                  `apprafter lock recovery`) did not finish: run either \
+                                  again, or `apprafter lock off` to return the secrets to \
+                                  files"
+            .into(),
     }
 }
 
@@ -904,7 +1303,7 @@ fn opened_by(slots: &[SlotView]) -> String {
         let kind = match s.kind {
             LockSlotKind::Password => "a password",
             LockSlotKind::RecoveryKey => "the recovery key",
-            LockSlotKind::OsPassword => "your OS password",
+            LockSlotKind::OsPassword => "your account password",
             LockSlotKind::WindowsHello => "Windows Hello",
             LockSlotKind::TouchId => "Touch ID",
             LockSlotKind::Unknown => continue,
@@ -918,12 +1317,7 @@ fn opened_by(slots: &[SlotView]) -> String {
 
 fn slot_text(s: &SlotView) -> String {
     match s.refused {
-        Some(SlotRefusalView::KdfTooWeak) => {
-            format!("{} (refused by this build: kdf_too_weak)", s.label)
-        }
-        Some(SlotRefusalView::KdfOutOfRange) => {
-            format!("{} (refused by this build: kdf_out_of_range)", s.label)
-        }
+        Some(refused) => format!("{} (refused by this build: {})", s.label, refused.as_str()),
         None => s.label.clone(),
     }
 }
@@ -998,6 +1392,12 @@ mod tests {
 
     use super::*;
     use crate::prompt::{PromptError, Script};
+    use apprafter_core::lock::{SlotNote, WayFallback};
+    use apprafter_os_slots::stand_in::Call;
+    use cli_core::AccountPasswordRefusal;
+
+    use crate::commands::state_paths::testing::Scratch;
+    use crate::os_slots::scripted;
 
     const PW: &str = "correct horse battery staple";
     /// 58 characters of the Bech32 set: the shape of a recovery key without its prefix.
@@ -1127,7 +1527,15 @@ mod tests {
             .expose()
             .replace('\n', " ");
         let s = Script::new(vec![Ok(other.as_str()), Ok(typed.as_str())]);
-        let confirmed = show_and_confirm(&s, key, "~/store", "~/store/vault").unwrap();
+        let confirmed = show_and_confirm(
+            &s,
+            key,
+            "~/store",
+            "~/store/vault",
+            LockSlotKind::Password,
+            "3a4b5c6d",
+        )
+        .unwrap();
         assert_eq!(confirmed.to_display().expose(), shown);
         let told = s.told();
         let groups = shown.lines().nth(1).unwrap();
@@ -1192,7 +1600,7 @@ mod tests {
             caches_left: Vec::new(),
             unlock_timeout_min: 5,
         };
-        let out = on_result(&done, "/s");
+        let out = on_result(&done, "/s", LockSlotKind::Password, None);
         assert!(
             out.contains(
                 "`apprafter target add prod --renew` stores a token in the vault (at a terminal \
@@ -1223,13 +1631,14 @@ mod tests {
             dir.path(),
             &made.store_id,
             LockSlotKind::RecoveryKey,
+            LockSlotKind::Password,
             "~/store",
         )
         .unwrap();
         assert_eq!(opened.kind(), LockSlotKind::RecoveryKey);
         assert_eq!(s.asked(), vec![question.clone(), question.clone()]);
         assert!(
-            !s.told().is_empty() && !s.told().contains(WAY_OUT),
+            !s.told().is_empty() && !s.told().contains(&way_out(LockSlotKind::Password)),
             "{}",
             s.told()
         );
@@ -1240,6 +1649,7 @@ mod tests {
                 dir.path(),
                 &made.store_id,
                 LockSlotKind::RecoveryKey,
+                LockSlotKind::Password,
                 "~/store"
             ),
             Err(CliError::LockIncomplete {
@@ -1247,8 +1657,529 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(s.told(), WAY_OUT);
+        assert_eq!(s.told(), way_out(LockSlotKind::Password));
         assert_eq!(s.asked(), vec![question]);
+    }
+
+    /// D.4b B56 (F8): a resume asks its everyday slot by the slot's own name — the account
+    /// password of a run that made one (d4b-e1a writes such vaults), never as a lock password.
+    #[test]
+    fn a_resume_asks_the_everyday_slot_by_its_own_name() {
+        assert_eq!(
+            resume_question(LockSlotKind::OsPassword, "~/store"),
+            "Account password of ~/store (Enter alone if you no longer have it): "
+        );
+        assert_eq!(
+            resume_question(LockSlotKind::Password, "~/store"),
+            "Lock password of ~/store (Enter alone if you no longer have it): "
+        );
+    }
+
+    /// D.4b-e1a: the stand-in's script for this computer's account password — usable, taken
+    /// by the system when it is ACCOUNT (25 characters: no short-password question).
+    const VERIFIED: &str = "os linux\naccount walker\nhost box-a\nstatus usable\n\
+                            check verified-if walker-account-password-1\n";
+    const ACCOUNT: &str = "walker-account-password-1";
+    const ACCOUNT_PROMPT: &str = "Account password of walker: ";
+    const ACCOUNT_PROMPT_EMPTY: &str =
+        "Account password of walker (Enter on an empty line if it has none): ";
+
+    /// What `new_input` did with a plan of this computer's account password (D.4b B55, B56).
+    struct AccountRun {
+        input: Result<LockOnInput, CliError>,
+        asked: Vec<String>,
+        told: String,
+        calls: Vec<Call>,
+        fallback: Option<WayFallback>,
+    }
+
+    /// `new_input` over a plan of this computer's account password on a scratch store — the
+    /// stand-in playing `script` (B15), a person giving `answers` — ending, where a run gets
+    /// that far, with a cancel at the recovery key's confirmation: the key was shown, nothing
+    /// was written (the dialogue writes nothing; `execute_on` would).
+    fn account_run(script: &str, answers: Vec<Result<&str, PromptError>>) -> AccountRun {
+        let s = Scratch::new();
+        let (slots, stand) = scripted(script);
+        let mut plan = lock::plan_on(&s.ctx, None, lock::WayAsked::Everyday(&slots))
+            .expect("the lock on plan");
+        let asker = Script::new(answers);
+        let input = new_input(
+            &asker,
+            &mut plan,
+            &slots,
+            "~/store",
+            "~/store/vault",
+            s.ctx.config_root(),
+        );
+        AccountRun {
+            input,
+            asked: asker.asked(),
+            told: asker.told(),
+            calls: stand.calls(),
+            fallback: plan.payload.fallback(),
+        }
+    }
+
+    /// How many times the system was asked to check.
+    fn checks(calls: &[Call]) -> usize {
+        calls
+            .iter()
+            .filter(|c| matches!(c, Call::Check { .. }))
+            .count()
+    }
+
+    /// D.4b B55, B56 (d4b-e1a): the default's first secret is the account password — the
+    /// check's note first, one check — and only then is the recovery key shown, with words of
+    /// where it opens the store that the account password does not (B70).
+    #[test]
+    fn the_account_password_is_checked_once_before_the_recovery_key_is_shown() {
+        let run = account_run(VERIFIED, vec![Ok(ACCOUNT), Err(PromptError::Cancelled)]);
+        assert!(
+            matches!(run.input, Err(CliError::Cancelled)),
+            "{:?}",
+            run.input.as_ref().err()
+        );
+        assert_eq!(
+            run.asked,
+            vec![ACCOUNT_PROMPT.to_string(), CONFIRM.to_string()]
+        );
+        let note = run.told.find(ACCOUNT_CHECK_NOTE).expect("the check's note");
+        let key = run
+            .told
+            .find("Recovery key for ~/store")
+            .expect("the recovery key shown");
+        assert!(note < key, "{}", run.told);
+        assert!(
+            run.told
+                .contains("It opens this store where your account password does not"),
+            "{}",
+            run.told
+        );
+        assert_eq!(checks(&run.calls), 1);
+        assert_eq!(run.calls.last(), Some(&Call::Check { chars: 25 }));
+    }
+
+    /// B75 (2): where this account's password status could not be read, the prompt says that
+    /// Enter means no password; an empty entry then moves the run to a separate lock password
+    /// — said, and asked twice — and the system is asked nothing.
+    #[test]
+    fn an_empty_entry_where_the_status_is_unknown_takes_a_lock_password() {
+        let script = format!("{VERIFIED}status unknown\n");
+        let run = account_run(
+            &script,
+            vec![Ok(""), Ok(PW), Ok(PW), Err(PromptError::Cancelled)],
+        );
+        assert!(
+            matches!(run.input, Err(CliError::Cancelled)),
+            "{:?}",
+            run.input.as_ref().err()
+        );
+        assert_eq!(
+            run.asked,
+            vec![
+                ACCOUNT_PROMPT_EMPTY.to_string(),
+                NEW.to_string(),
+                REPEAT.to_string(),
+                CONFIRM.to_string()
+            ]
+        );
+        assert!(run.told.contains(EMPTY_ENTRY_FELL_BACK), "{}", run.told);
+        assert!(
+            run.told
+                .contains("It opens this store if the lock password is lost."),
+            "{}",
+            run.told
+        );
+        assert_eq!(checks(&run.calls), 0, "an empty entry reaches no check");
+        assert_eq!(run.fallback, Some(WayFallback::NoPassword));
+    }
+
+    /// c3's Deviation 7 (revisit after use): where the account has a password, Enter is a
+    /// slip — said in words of its own and asked again; the system is asked once, for the
+    /// password typed after it.
+    #[test]
+    fn an_empty_entry_where_the_account_has_a_password_is_asked_again() {
+        let run = account_run(
+            VERIFIED,
+            vec![Ok(""), Ok(ACCOUNT), Err(PromptError::Cancelled)],
+        );
+        assert_eq!(
+            run.asked,
+            vec![
+                ACCOUNT_PROMPT.to_string(),
+                ACCOUNT_PROMPT.to_string(),
+                CONFIRM.to_string()
+            ]
+        );
+        assert!(run.told.contains(HAS_A_PASSWORD), "{}", run.told);
+        assert_eq!(checks(&run.calls), 1);
+        assert_eq!(run.fallback, None);
+    }
+
+    /// c3's Deviation 13 (d4b-d's hand-off): a password no slot holds is said and asked
+    /// again before the system is asked anything.
+    #[test]
+    fn a_password_no_slot_holds_is_said_and_asked_again() {
+        let long = "a".repeat(1025);
+        let run = account_run(
+            VERIFIED,
+            vec![Ok(long.as_str()), Ok(ACCOUNT), Err(PromptError::Cancelled)],
+        );
+        assert!(
+            run.told.contains(
+                "That account password is longer than 1024 bytes, which no slot holds.\n"
+            ),
+            "{}",
+            run.told
+        );
+        assert_eq!(
+            run.asked,
+            vec![
+                ACCOUNT_PROMPT.to_string(),
+                ACCOUNT_PROMPT.to_string(),
+                CONFIRM.to_string()
+            ]
+        );
+        assert_eq!(checks(&run.calls), 1);
+    }
+
+    /// B55, B75 (3) (acceptance 2): a wrong password and a check that did not see the typed
+    /// text end the run with c1's refusal — before any recovery key exists.
+    #[test]
+    fn a_refused_check_ends_the_run_before_any_recovery_key() {
+        for (line, reason) in [
+            ("check wrong", AccountPasswordRefusal::Wrong),
+            (
+                "check not-checked no-password-asked",
+                AccountPasswordRefusal::NotChecked,
+            ),
+        ] {
+            let script = format!("os linux\naccount walker\nhost box-a\nstatus usable\n{line}\n");
+            let run = account_run(&script, vec![Ok(ACCOUNT)]);
+            match &run.input {
+                Err(CliError::AccountPasswordRefused { reason: said, .. }) => {
+                    assert_eq!(said, &reason, "{line}")
+                }
+                other => panic!("{line}: {:?}", other.as_ref().err()),
+            }
+            assert_eq!(run.asked, vec![ACCOUNT_PROMPT.to_string()], "{line}");
+            assert!(
+                !run.told.contains("Recovery key for"),
+                "{line}: {}",
+                run.told
+            );
+        }
+    }
+
+    /// B2: a short account password the system took asks "Add it anyway? [y/N]" before any
+    /// recovery key: no ends the run with nothing written, yes goes on.
+    #[test]
+    fn a_short_account_password_asks_before_the_recovery_key() {
+        let script =
+            "os linux\naccount walker\nhost box-a\nstatus usable\ncheck verified-if short pass\n";
+        let declined = account_run(script, vec![Ok("short pass"), Ok("n")]);
+        assert!(
+            matches!(declined.input, Err(CliError::Cancelled)),
+            "{:?}",
+            declined.input.as_ref().err()
+        );
+        assert_eq!(
+            declined.asked,
+            vec![ACCOUNT_PROMPT.to_string(), ADD_ANYWAY.to_string()]
+        );
+        assert!(
+            declined
+                .told
+                .contains("Your account password has 10 characters; 15 or more is recommended."),
+            "{}",
+            declined.told
+        );
+        assert!(
+            declined.told.contains(NOT_ADDED) && !declined.told.contains("Recovery key for"),
+            "{}",
+            declined.told
+        );
+        let added = account_run(
+            script,
+            vec![Ok("short pass"), Ok("y"), Err(PromptError::Cancelled)],
+        );
+        assert_eq!(
+            added.asked,
+            vec![
+                ACCOUNT_PROMPT.to_string(),
+                ADD_ANYWAY.to_string(),
+                CONFIRM.to_string()
+            ]
+        );
+        assert!(
+            added.told.contains("Recovery key for ~/store"),
+            "{}",
+            added.told
+        );
+    }
+
+    /// B61, B70, B76, F7: a plan of the account password says what that way is, what it
+    /// costs and how to take a lock password instead, in that order, before the window line
+    /// — which names the account password; in a container also that its id may change.
+    #[test]
+    fn the_account_password_plan_says_what_it_costs_before_anything_is_asked() {
+        let s = Scratch::new();
+        let (slots, _) = scripted(VERIFIED);
+        let plan = lock::plan_on(&s.ctx, None, lock::WayAsked::Everyday(&slots)).unwrap();
+        let said = on_plan_text(&s.ctx, &plan, "~/store", "targets: prod", HostOs::Linux);
+        let at = |what: &str| said.find(what).unwrap_or_else(|| panic!("{what}:\n{said}"));
+        let way = at(ACCOUNT_WAY);
+        let offline = at(text::plan_note_line(
+            &SlotNote::AccountPasswordOffline,
+            LockSlotKind::OsPassword,
+        ));
+        let manages = at(text::plan_note_line(
+            &SlotNote::ManagesStore,
+            LockSlotKind::OsPassword,
+        ));
+        let instead = at(LOCK_PASSWORD_INSTEAD);
+        let window = at("asks for your account password or the recovery key in its terminal");
+        assert!(
+            way < offline && offline < manages && manages < instead && instead < window,
+            "{said}"
+        );
+        assert!(
+            !said.contains("The store gets a separate lock password instead."),
+            "{said}"
+        );
+        let (container, _) = scripted(&format!("{VERIFIED}environment container\n"));
+        let plan = lock::plan_on(&s.ctx, None, lock::WayAsked::Everyday(&container)).unwrap();
+        let said = on_plan_text(&s.ctx, &plan, "~/store", "targets: prod", HostOs::Linux);
+        assert!(
+            said.contains(text::plan_note_line(
+                &SlotNote::MachineIdMayChange,
+                LockSlotKind::OsPassword
+            )),
+            "{said}"
+        );
+    }
+
+    /// B55, B88: a plan that fell back says why in its first two lines, then is the lock
+    /// password's plan word for word.
+    #[test]
+    fn a_fallback_plan_says_why_first_then_the_lock_password_plan() {
+        let s = Scratch::new();
+        let (slots, _) = scripted("backend no-libpam\n");
+        let fell = lock::plan_on(&s.ctx, None, lock::WayAsked::Everyday(&slots)).unwrap();
+        assert_eq!(fell.payload.fallback(), Some(WayFallback::NoLibpam));
+        let chosen = lock::plan_on(&s.ctx, None, lock::WayAsked::LockPassword).unwrap();
+        let head = "This computer cannot check your account password: libpam is not \
+                    installed.\nThe store gets a separate lock password instead.\n";
+        let d4a = on_plan_text(&s.ctx, &chosen, "~/store", "targets: prod", HostOs::Linux);
+        assert!(
+            d4a.starts_with("Lock the secrets of the target store at ~/store (targets: prod):\n"),
+            "{d4a}"
+        );
+        assert_eq!(
+            on_plan_text(&s.ctx, &fell, "~/store", "targets: prod", HostOs::Linux),
+            format!("{head}{d4a}")
+        );
+    }
+
+    /// B55, B88: every fallback reason has its words on every OS — two lines, the second
+    /// what the store gets — and the fence's name Windows Hello on Windows only. The Windows
+    /// golden is these words (`lock_on_fallback_sandbox_windows`, F10).
+    #[test]
+    fn every_fallback_reason_says_why_in_two_lines() {
+        use apprafter_core::lock::WayFallback as F;
+        let every = [
+            F::Sandbox,
+            F::HelloNotBuilt,
+            F::NoLibpam,
+            F::NoService,
+            F::NoCheckRoute,
+            F::NoAccount,
+            F::NoNewPrivs,
+            F::HelloNotSupported,
+            F::HelloNotSetUp,
+            F::RemoteSession,
+            F::NoMachineId,
+            F::NoBackoffRecord,
+            F::NoPassword,
+        ];
+        for reason in every {
+            for os in [HostOs::Linux, HostOs::Macos, HostOs::Windows] {
+                let head = fallback_head(Some(reason), os).unwrap();
+                assert_eq!(head.lines().count(), 2, "{reason:?} {os:?}: {head}");
+                assert!(
+                    head.ends_with("\nThe store gets a separate lock password instead.\n"),
+                    "{reason:?}"
+                );
+            }
+        }
+        assert_eq!(fallback_head(None, HostOs::Linux), None);
+        let unix = "AppRafter does not check your account password while APPRAFTER_SANDBOX \
+                    is set: the variable fences tests and agents away from it.\nThe store \
+                    gets a separate lock password instead.\n";
+        for os in [HostOs::Linux, HostOs::Macos] {
+            assert_eq!(fallback_head(Some(F::Sandbox), os).as_deref(), Some(unix));
+        }
+        assert_eq!(
+            fallback_head(Some(F::Sandbox), HostOs::Windows).as_deref(),
+            Some(include_str!(
+                "../../tests/golden/lock/lock_on_fallback_sandbox_windows.golden"
+            ))
+        );
+    }
+
+    /// C38, B55: with no terminal the refusal names what the run would ask — D.4a's words for
+    /// a lock password, whether asked for or fallen back to.
+    #[test]
+    fn without_a_terminal_the_refusal_names_the_way() {
+        let message = |way| match no_terminal(way) {
+            CliError::UsageRefused { message, .. } => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(message(Some(LockOnWay::AccountPassword))
+            .contains("asks for your account password and shows a recovery key"));
+        for way in [None, Some(LockOnWay::LockPassword)] {
+            assert_eq!(
+                message(way),
+                "`apprafter lock on` asks for a new lock password and shows a recovery key: \
+                 run it in a terminal"
+            );
+        }
+    }
+
+    /// B56: a resume's first words, the result and the recovery key's text name the everyday
+    /// slot — D.4a's words for a lock password; `--lock-password` at a resume of another way
+    /// says it is a new run's.
+    #[test]
+    fn the_resume_the_result_and_the_key_name_the_everyday_slot() {
+        let d4a = "An earlier `apprafter lock on` on ~/store did not finish; finishing it. Before \
+                   any secret leaves the files, the vault it wrote is opened with the lock \
+                   password and with the recovery key.\n";
+        assert_eq!(resume_intro("~/store", LockSlotKind::Password, false), d4a);
+        assert_eq!(resume_intro("~/store", LockSlotKind::Password, true), d4a);
+        let account = resume_intro("~/store", LockSlotKind::OsPassword, false);
+        assert!(
+            account.contains("opened with your account password and with the recovery key"),
+            "{account}"
+        );
+        assert!(!account.contains("--lock-password"), "{account}");
+        assert!(resume_intro("~/store", LockSlotKind::OsPassword, true)
+            .contains("`--lock-password` applies to a new `apprafter lock on`"));
+        let done = LockedOn {
+            store: "/s".into(),
+            store_id: Some("0123456789abcdef".into()),
+            already_locked: false,
+            restarted: false,
+            tokens_moved: Vec::new(),
+            tokens_left: Vec::new(),
+            caches_resealed: 0,
+            caches_dropped: Vec::new(),
+            caches_left: Vec::new(),
+            unlock_timeout_min: 5,
+        };
+        assert!(
+            on_result(&done, "/s", LockSlotKind::Password, None).starts_with(
+                "Locked: the secrets of /s are in its vault (opened by the lock password or the \
+             recovery key).\nA command that needs them asks for the lock password or the \
+             recovery key in its terminal;"
+            )
+        );
+        let account = on_result(&done, "/s", LockSlotKind::OsPassword, None);
+        assert!(
+            account
+                .contains("(opened by your account password on this computer or the recovery key)")
+                && account.contains("asks for your account password or the recovery key"),
+            "{account}"
+        );
+        let key = RecoveryKey::generate(&mut OsRandom).unwrap().to_display();
+        assert!(recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::OsPassword,
+            "3a4b5c6d"
+        )
+        .contains("It opens this store where your account password does not"));
+        assert!(recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::Password,
+            "3a4b5c6d"
+        )
+        .contains("It opens this store if the lock password is lost."));
+    }
+
+    /// B56: a resume of an account-password run without one of its secrets names its own way
+    /// out.
+    #[test]
+    fn a_resume_without_its_account_password_names_its_own_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = apprafter_core::secrets::testing::locked_store(dir.path(), &[("prod", None)]);
+        let s = Script::new(vec![Ok("")]);
+        let ended = ask_slot(
+            &s,
+            dir.path(),
+            &made.store_id,
+            LockSlotKind::RecoveryKey,
+            LockSlotKind::OsPassword,
+            "~/store",
+        )
+        .err();
+        assert!(
+            matches!(ended, Some(CliError::LockIncomplete { .. })),
+            "{ended:?}"
+        );
+        assert_eq!(s.told(), way_out(LockSlotKind::OsPassword));
+        assert!(
+            s.told()
+                .contains("finishes only with both your account password and the recovery key"),
+            "{}",
+            s.told()
+        );
+        assert!(way_out(LockSlotKind::Password)
+            .contains("finishes only with both the lock password and the recovery key"));
+    }
+
+    /// D.4b B80: a new recovery key is shown after the words that it opens the store only once
+    /// AppRafter says Locked, with its slot's id; the result names the id it now opens with.
+    #[test]
+    fn the_recovery_key_is_shown_with_its_slot_id() {
+        let key = RecoveryKey::generate(&mut OsRandom).unwrap().to_display();
+        let said = recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::Password,
+            "3a4b5c6d",
+        );
+        assert!(
+            said.starts_with(
+                "This recovery key opens the store only when AppRafter says Locked.\nRecovery \
+                 key for ~/store · slot 3a4b5c6d — shown only now; write the id on the paper \
+                 too:\n\n"
+            ),
+            "{}",
+            said.as_str()
+        );
+        let done = LockedOn {
+            store: "/s".into(),
+            store_id: Some("0123456789abcdef".into()),
+            already_locked: false,
+            restarted: false,
+            tokens_moved: Vec::new(),
+            tokens_left: Vec::new(),
+            caches_resealed: 0,
+            caches_dropped: Vec::new(),
+            caches_left: Vec::new(),
+            unlock_timeout_min: 5,
+        };
+        assert!(
+            on_result(&done, "/s", LockSlotKind::Password, Some("3a4b5c6d"))
+                .contains("  ✓ the recovery key of slot 3a4b5c6d opens it from now on\n")
+        );
+        assert!(
+            !on_result(&done, "/s", LockSlotKind::Password, None).contains("opens it from now on")
+        );
     }
 }
 
@@ -1264,9 +2195,11 @@ mod status_render_tests {
 
     fn slot(kind: LockSlotKind, label: &str) -> SlotView {
         SlotView {
+            id: None,
             kind,
             label: label.into(),
             refused: None,
+            notes: Vec::new(),
         }
     }
 
@@ -1446,6 +2379,11 @@ mod status_render_tests {
         unlocking.mode = SecretsMode::Unlocking;
         assert!(render_status(&unlocking).contains(
             "Secrets:        unlocking — an earlier `apprafter lock off` did not finish: run it again\n"
+        ));
+        let mut rotating = locked(UnlockWindow::Closed, vec![]);
+        rotating.mode = SecretsMode::Rotating;
+        assert!(render_status(&rotating).contains(
+            "Secrets:        rotating — an earlier key change (`apprafter lock rekey` or `apprafter lock recovery`) did not finish: run either again, or `apprafter lock off` to return the secrets to files\n"
         ));
     }
 }

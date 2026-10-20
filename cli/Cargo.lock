@@ -242,6 +242,7 @@ version = "0.2.80"
 dependencies = [
  "age",
  "apprafter-core",
+ "apprafter-os-slots",
  "arboard",
  "assert_cmd",
  "backup-core",
@@ -324,6 +325,15 @@ dependencies = [
  "ts-rs",
  "ureq",
  "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "apprafter-os-slots"
+version = "0.2.80"
+dependencies = [
+ "libc",
+ "tempfile",
  "zeroize",
 ]
 
