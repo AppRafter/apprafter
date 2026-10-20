@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The toast after a target operation: what it did, and what moved with it — the CLI default,
+// and a server that keeps running at the provider.
+import type { ActivePointerChange } from '../../ipc/generated/ActivePointerChange';
+import type { TargetRemoved } from '../../ipc/generated/TargetRemoved';
+import type { TargetRenamed } from '../../ipc/generated/TargetRenamed';
+import type { TargetRenewed } from '../../ipc/generated/TargetRenewed';
+import type { TargetUsed } from '../../ipc/generated/TargetUsed';
+
+/** Where the CLI default went, when an operation moved it. */
+const pointerPart = (change: ActivePointerChange | null): string[] => {
+  if (change === null) return [];
+  return [change.to === null ? 'no CLI default now' : `the CLI default is now ${change.to}`];
+};
+
+export function renamedMessage(outcome: TargetRenamed): string {
+  return [`Renamed ${outcome.from} to ${outcome.to}`, ...pointerPart(outcome.cliDefault)].join(
+    ' · ',
+  );
+}
+
+/**
+ * A removal: the server it leaves running, and where the CLI default went — naming the targets it
+ * passed over because they cannot be read (WI-458), as the CLI's last line does.
+ */
+export function removedMessage(outcome: TargetRemoved): string {
+  const server = outcome.orphanedServer;
+  const skipped = outcome.skippedUnreadable;
+  const passedOver = skipped.length === 0 ? '' : ` (${skipped.join(', ')} cannot be read)`;
+  return [
+    `Removed ${outcome.name} from this computer`,
+    ...(server === null ? [] : [`server ${server.serverName} keeps running at the provider`]),
+    ...pointerPart(outcome.cliDefault).map((part) => `${part}${passedOver}`),
+  ].join(' · ');
+}
+
+export function usedMessage(outcome: TargetUsed): string {
+  return outcome.pointer === null
+    ? `${outcome.name} is already the CLI default`
+    : `${outcome.name} is the CLI default now`;
+}
+
+/**
+ * A renewal: the token (and how it was checked), the SSH key, or both. No token means the
+ * credentials were kept as they were, and the toast says so.
+ */
+export function renewedMessage(outcome: TargetRenewed): string {
+  if (outcome.token === null) {
+    return outcome.sshKeyChanged ? 'SSH key changed · credentials unchanged' : 'Nothing changed';
+  }
+  const what = outcome.sshKeyChanged ? 'SSH key changed, token renewed' : 'Token renewed';
+  return outcome.token.status === 'verified' ? `${what} · verified with the provider` : what;
+}

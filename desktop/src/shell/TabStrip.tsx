@@ -35,6 +35,8 @@ export interface TabStripProps {
   onShow: (view: View) => void;
   onClose: (key: string) => void;
   onNewTab: () => void;
+  /** An app overlay covers the window: the strip takes no focus and no click. */
+  inert?: boolean;
 }
 
 export function TabStrip({
@@ -46,6 +48,7 @@ export function TabStrip({
   onShow,
   onClose,
   onNewTab,
+  inert = false,
 }: TabStripProps) {
   const elements = useRef(new Map<string, HTMLButtonElement>());
   const plus = useRef<HTMLButtonElement>(null);
@@ -92,7 +95,7 @@ export function TabStrip({
   };
 
   return (
-    <div className="tabstrip">
+    <div className="tabstrip" inert={inert || undefined}>
       <div className="tabs" role="tablist" aria-label="Open clusters">
         {tabs.map((tab, index) => {
           const selected = tab.key === shown;

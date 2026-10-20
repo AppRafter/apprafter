@@ -66,19 +66,22 @@ the diagnostic body usually points at the offending expression.
 
 ### `apprafter::provider::hetzner_api_error`
 
-The Hetzner Cloud API returned a non-2xx response.
+The Hetzner Cloud API refused the request. The credential check
+reports this code too, for any status but 401
+(`apprafter::target::token_rejected`).
 
-**Fix.** Read the inner help — it enumerates the four most common
-failure families:
+**Fix.** Read the inner help. It lists what each status means:
 
-- **401 unauthorized** — the stored token was rotated or revoked.
-  Run `apprafter target add <name> --renew --token <new>` to
-  refresh it.
-- **403 forbidden** — the token's project lacks permission for
-  this resource type.
-- **429 rate limit** — back off and retry; if persistent, the
-  project may need a quota increase.
-- **5xx** — provider-side outage. Check
+- **401 unauthorized** — the token is wrong, or it was revoked or
+  rotated. For a target's stored token,
+  `apprafter target add <name> --renew` replaces it: at a terminal it
+  asks for the new token without showing it; in a script, pass `--token`.
+  An `HCLOUD_TOKEN` in the environment outranks the stored token.
+- **403 forbidden** — the token lacks Read & Write (it is
+  Read-only), or the project forbids the call, for example at one
+  of its limits.
+- **429 rate limit** — too many requests: wait, then try again.
+- **5xx** — an outage at the provider. Check
   https://status.hetzner.com/.
 
 After fixing the root cause, run `apprafter doctor` to confirm
@@ -183,15 +186,35 @@ apprafter import --target <target>
 
 ### `apprafter::target::invalid_config`
 
-A YAML file under `$XDG_CONFIG_HOME/apprafter/` failed to parse.
-Either hand-edited or written by an incompatible CLI version.
+A YAML file in the target store (`$XDG_CONFIG_HOME/apprafter/`, or
+`APPRAFTER_CONFIG_DIR`) failed to parse: it was edited by hand or
+written by an incompatible CLI version. The message and the help name
+the file. For a target's `credentials.yaml` the message gives only the
+line and column where parsing stopped, never the file's text, because
+that text is the API token.
 
-**Fix.** Either fix the YAML by hand (these files are small), or
-nuke just the offending target's directory under
-`$XDG_CONFIG_HOME/apprafter/targets/<name>/` and re-create with
-`apprafter target add <name> --provider hetzner-cloud …`. The
-global `config.yaml` is the only file shared across targets;
-treat it as the last line of defence.
+**Fix.** Fix the file by hand (these files are small), or restore it
+from a backup. Otherwise, it depends on whose file it is:
+
+- **A target's `config.yaml` or `credentials.yaml`**: remove the
+  target with `apprafter target remove <name>` and add it again with
+  `apprafter target add <name> --provider hetzner-cloud …`, its token
+  included. `target remove` takes a target it cannot read: it warns
+  which file cannot be read and deletes the target's files without
+  reading them. The removal also deletes the target's local state:
+  the record of its server, the cached kubeconfig and the Argo CD
+  password. If a server is recorded, fix or restore the file first:
+  the warning names the server, which keeps running, and
+  `apprafter destroy --target <name>` cannot read the token until the
+  files are fixed. If you remove it anyway, add the target again with
+  the same token and region, and
+  `apprafter import --target <name>` rebuilds the record from the
+  provider; the kubeconfig and the Argo CD password are fetched again
+  on first use.
+- **The store's own `config.yaml`**: no target's removal or re-add
+  repairs it. It records only which target is the default, so you can
+  delete it and choose the default again with
+  `apprafter target use <name>`.
 
 ### `apprafter::target::no_active`
 
@@ -216,31 +239,39 @@ nothing, you're seeing the empty-store first-run case.
 
 ### `apprafter::target::token_rejected`
 
-The provider's read-only credential check returned 401 /
+The provider's read-only credential check returned 401
 unauthorized. **Distinct from** the generic Hetzner API error —
 this fires only on the explicit `target add` ping path, so the
 help text targets the rotation flow specifically.
 
-**Fix.** Read the layered help:
+The token was mistyped, or it was revoked or rotated, or its
+project was deleted. Its permissions are not the cause: the check
+only reads, so a Read-only token passes it. A token with stray
+whitespace never reaches the check either; the format check
+refuses it first (`apprafter::target::invalid_token`).
 
-- Verify the token at https://console.hetzner.cloud/projects →
-  Security → API Tokens. It must say `Read & Write` next to
-  the project.
-- Copy the token again — the most common cause is a trailing
-  newline from a clipboard manager (Hetzner tokens are 64
-  ASCII chars, no prefix).
-- If you're rotating, use `apprafter target add <name> --renew
-  --token <new>` instead of re-creating the target.
-- For offline / CI seeding, pass `--no-ping` to skip the
-  network round-trip and save the target anyway.
+**Fix.**
+
+- A token is shown only once, when it is created: paste it again
+  from where you saved it, or create a new one with Read & Write
+  permission in the Hetzner Console (open the project, then
+  Security → API tokens).
+- If you're rotating, use `apprafter target add <name> --renew`
+  instead of re-creating the target. At a terminal it asks for the new
+  token without showing it; in a script, pass `--token`.
 
 ### `apprafter::target::provider_unreachable`
 
-The credential check ping failed for a **non-401** reason —
-transport error (`connection refused`, DNS failure), 5xx
-provider-side outage, or 429 rate limit. The token may still
-be valid once the API recovers — the help text intentionally
-avoids any rotation suggestion that would misdirect operators.
+The provider's API gave **no answer**: the connection was
+refused, the name did not resolve, or the request timed out. Any
+request reports this code, whether it was the credential check, a
+machine catalogue read or `apply`. A provider that answered is
+never reported this way: a 5xx outage or a 429 rate limit is
+`apprafter::provider::hetzner_api_error` with its status, and an
+answer AppRafter cannot read is `apprafter::provider::request_failed`.
+The token may still be valid once the API recovers — the help text
+intentionally avoids any rotation suggestion that would misdirect
+operators.
 
 **Fix.**
 
@@ -249,7 +280,8 @@ avoids any rotation suggestion that would misdirect operators.
   (https://status.hetzner.com/ for hetzner-cloud).
 - VPN / corporate proxy: ensure `https://api.hetzner.cloud/`
   is reachable.
-- `--no-ping` to save the target offline and verify later.
+- `--no-ping` (on `target add`, also with `--renew`, and on
+  `target machine`) to save offline and verify later.
 
 ### `apprafter::io::error` / `apprafter::io::json` / `apprafter::io::yaml`
 
@@ -259,9 +291,25 @@ encode/decode error on `state.json` (JSON) /
 
 **Fix.** The captured OS message names the failing path or
 socket. Common cases: missing directory, wrong permissions
-(`chmod 0600` on credentials), full disk. For decode failures on
-target-store files, re-create the offending target with
-`apprafter target add <name> --force`.
+(`chmod 0600` on credentials), full disk. When the message is
+`cannot read <path>` and the path is the target store's own — its
+root, `targets/` or a folder in it, its `config.yaml` — this account
+cannot read it: most often its permissions, or those of a folder above
+it, do not let it, and `ls -ld` on each shows them. `apprafter doctor`
+says the same in its `Config file readable` row and runs its other checks.
+A folder another account owns or can change is
+[`store_not_private`](#store-not-private) instead. For decode failures on
+target-store files, fix the YAML by hand (they are small files), or
+restore the file from a backup. Otherwise remove that target with
+`apprafter target remove <name>`, which takes a target it cannot
+read, and add it again with `apprafter target add`. The removal
+also deletes the target's local state: the record of its server,
+the cached kubeconfig and the Argo CD password. If a server is
+recorded, fix or restore the file first. After adding the target
+again, `apprafter import --target <name>` rebuilds the record from
+the provider; the kubeconfig and the Argo CD password are fetched
+again on first use. `target add --force` cannot rewrite such a
+target: it keeps the stored values, so it needs a readable config.
 
 ### `apprafter::backup::job_active`
 
@@ -304,6 +352,427 @@ whole case, including how to tell whether tonight's scheduled backup is
 stuck: [the backup runner's pod cannot be
 scheduled](backup-restore.md#runner-unschedulable).
 
+### `apprafter::secrets::age_key_missing` {#age-key-missing}
+
+The age key that the cached kubeconfig and Argo CD password are
+encrypted under is not at the path the error names —
+`APPRAFTER_AGE_KEY`, or `~/.config/apprafter/age.key` by default (see
+[Environment variables](../reference/environment.md)). A command that
+reads a cache never creates a key in its place: a new key cannot
+decrypt anything cached under the old one. `apprafter doctor` reports
+the same on its **Kube API reachable** row.
+
+On a target store that `apprafter lock on` has locked, this does not occur:
+its caches are encrypted to the store's own key, kept in its vault, and
+`APPRAFTER_AGE_KEY` does not apply there.
+
+A locked store whose vault is lost is the exception. Once its vault and
+`store.yaml` are moved aside ([every way into a locked store is
+lost](#locked-store-lost)), the store is in files again and looks for the
+shared key, which never held those caches: they were encrypted to the
+vault's own key. The error, and doctor's row, say so: the cached secrets
+were encrypted to the key of a target store vault that is no longer here,
+not to the age key at that path, and no key put there opens them. If you
+still have the vault and its `store.yaml`, put them back and unlock;
+otherwise fetch the kubeconfig again under a new key, as below.
+
+**Fix.** If you still have the key, put it back at that path, or set
+`APPRAFTER_AGE_KEY` to where it is. Nothing else is needed.
+
+If the key is lost, fetch the kubeconfig again under a new key:
+
+```sh
+apprafter kubeconfig --refresh --target <name>
+```
+
+It reads `/etc/rancher/k3s/k3s.yaml` from the target's node over SSH,
+as the first fetch did, and changes nothing on the node or in the
+cluster. Before it creates the key it lists everything else cached
+under the lost key, which the new key cannot read, and asks; without a
+terminal it refuses unless you pass `--yes`. Answering no, or pressing
+Esc or Ctrl-C, creates, fetches and writes nothing: the command exits 1
+with `apprafter::secrets::new_key_declined` and prints nothing on
+stdout, so `apprafter kubeconfig > kc && …` stops there. The key is
+created only once the node has answered, so a failed fetch leaves none
+behind.
+
+Only the targets of the current config root (`APPRAFTER_CONFIG_DIR`)
+are checked for secrets cached under the lost key. The key is shared
+by every config root on the machine, so the list leaves out the targets
+of another root, and in a root whose targets cache nothing the first
+fetch creates the key without asking, as on a first use. Their caches
+then fail with
+[`apprafter::secrets::cache_undecryptable`](#cache-undecryptable).
+
+What the new key leaves behind, and the way back for each:
+
+| Cached under the lost key | After the new key |
+| --- | --- |
+| The target's kubeconfig | Fetched again by the command itself. |
+| The target's Argo CD admin password | Dropped from the cache: `apprafter argocd-password --target <name>` fetches it from the cluster again. It reads `argocd-initial-admin-secret`; if you deleted that secret after changing the password, use the password you set. |
+| Another target's kubeconfig | `apprafter kubeconfig --refresh --target <other>` fetches it again under the new key, without asking: the key exists now. |
+| Another target's Argo CD admin password | `apprafter argocd-password --refresh --target <other>` fetches it again, once that target's kubeconfig is fetched. |
+
+`apprafter up` and `apprafter restore --reprovision` never create a
+key in place of a lost one. They check for it before they provision
+anything: when the key is missing and anything in the config root is
+cached under it, they stop with this error, and nothing is created.
+The help names a target that has something cached under the lost key.
+Put the key back, or run the command above for that target: the target
+being provisioned has no server yet to fetch a kubeconfig from. Then
+run the same `up` or `restore` command again. With no key and nothing
+cached in the config root, there is no lost key: `up` goes on, and
+creates the key when it caches the new kubeconfig.
+
+If the key goes missing while the server is being created, they stop
+later, in the `k3s-ready` step, with the same error. The server then
+exists and Hetzner bills for it, but cluster-bootstrap has not run.
+Put the key back, or run the command above for the target being
+provisioned (the node may need a few minutes after provisioning before
+it answers). Then run the same `up` or `restore` command again: it
+finds the server it provisioned instead of creating another, and goes
+on with cluster-bootstrap.
+
+### `apprafter::secrets::age_key_identity_count` {#age-key-identity-count}
+
+The age key file the error names does not hold exactly one key. AppRafter
+reads it as `age-keygen -o <file>` writes it: lines that start with `#`
+(age-keygen's `# created:` and `# public key:` lines) and blank lines are
+skipped, and exactly one other line must be the key,
+`AGE-SECRET-KEY-1…`. The message says whether the file holds no such line
+or several. AppRafter itself writes the key line alone. The file is never
+used and never replaced: a command that would create a key on a first use
+stops here instead.
+
+**Fix.** Keep only the key the cached secrets were encrypted with in that
+file, or set `APPRAFTER_AGE_KEY` to a file that holds only that key. A key
+line that is cut short or mistyped is reported as `apprafter::cli::other`,
+with the words `parse age key` and the file's path.
+
+### `apprafter::secrets::cache_undecryptable` {#cache-undecryptable}
+
+A cached kubeconfig or Argo CD password does not decrypt with the age
+key there is. It was cached under another key — one that was lost and
+replaced, or one `APPRAFTER_AGE_KEY` no longer points at — or the
+cached copy is damaged. For a kubeconfig, `apprafter doctor` reports
+the same on its **Kube API reachable** row.
+
+**Fix.** If you have the key it was cached under, set
+`APPRAFTER_AGE_KEY` to it. Otherwise fetch it again under the key
+there is: `apprafter kubeconfig --refresh --target <name>` for a
+kubeconfig, `apprafter argocd-password --refresh --target <name>` for
+an Argo CD admin password. Neither asks, since the key they cache under
+exists.
+
+On a target store that `apprafter lock on` has locked, the key is the
+store's own, in its vault: a cache it does not open was written by an older
+AppRafter or by another program, or the copy is damaged, and whoever holds
+the key it was written for can read it until it is replaced. Replace it
+with the same `--refresh` commands; on a locked store they ask for the lock
+password, unless an unlock window is open in this terminal.
+`APPRAFTER_AGE_KEY` is refused there.
+
+### `apprafter::secrets::store_locked` {#store-locked}
+
+The target store is locked (`apprafter lock on`), the command needs one of
+its secrets, and nothing here can open the vault: no unlock window is open in
+this terminal, and either the command has no terminal to ask at — a script, a
+CI job, an AI agent's tool — or nobody answered the prompt within five
+minutes. Nothing was changed. When `apprafter up` or
+`apprafter restore --reprovision` stops this way, it stops before
+provisioning, so no server was created.
+
+**Fix.** In your own terminal run `apprafter unlock`, then run the command
+from that terminal while the window is open. A command started without a
+terminal cannot ask for the lock password, by design.
+
+In AppRafter the same code says that AppRafter holds no key for the store:
+AppRafter locked, or the store was locked from a terminal while AppRafter
+was open. Unlock AppRafter with the lock password or the recovery key, then
+try again.
+
+How a locked store is opened, and in what order:
+[How the store lock works](../how-it-works/the-store-lock.md#opening).
+
+### `apprafter::secrets::override_refused` {#override-refused}
+
+`HCLOUD_TOKEN` or `APPRAFTER_AGE_KEY` is set, and the target store is
+locked. A locked store uses only the token and the age key in its vault, so a
+value from the environment would pass the lock unnoticed; the command refuses
+before it asks for anything. Commands that need neither still run, and
+`target add` still stores `HCLOUD_TOKEN` as the target's new token (a renewal
+at a terminal asks for it instead).
+
+**Fix.** Unset the variable; the command then asks for the lock password at
+its terminal. To work with a value from the environment on purpose — in CI,
+say — use a target store of its own that is not locked, with its own
+`APPRAFTER_CONFIG_DIR` — [Give an agent a store of its
+own](protecting-secrets-from-agents.md#playground). `apprafter lock off` is the one command that takes
+`APPRAFTER_AGE_KEY` on a locked store: as the file the shared age key is
+written to, when a cached secret goes back under it.
+
+### `apprafter::secrets::unlock_failed` {#unlock-failed}
+
+Three answers at the prompt opened nothing. The prompt takes the lock
+password or the recovery key, either one.
+
+**Fix.** Run the command again with the lock password, or with the recovery
+key if the password is lost. If neither opens the store, see [Every way into
+a locked store is lost](#locked-store-lost).
+
+### `apprafter::secrets::lock_incomplete` {#lock-incomplete}
+
+An earlier `apprafter lock on` or `apprafter lock off` stopped before it
+finished — Ctrl-C, a closed terminal, a crash. Until one finishes or backs
+out, commands that need the store's secrets refuse, because some may be only
+in the vault. Nothing was lost: no copy in clear is removed before the vault
+has been written and checked.
+
+**Fix.** For an interrupted `lock on`, run `apprafter lock on` again. If it
+had written the vault, it asks for both the lock password and the recovery
+key it showed and finishes; if not, it starts over, and the recovery key
+shown before is not valid. Without one of the two, `apprafter lock off`
+backs out with the other, and a new `apprafter lock on` starts over. For an
+interrupted `lock off`, run `apprafter lock off` again. `apprafter doctor`
+names the state.
+
+### `apprafter::secrets::files_not_kept` {#files-not-kept}
+
+Turning the lock off writes each secret back to its file, and reads each one
+back before it deletes the vault. A file did not hold what was written — the
+disk may be full, or another program changed the file — so the run stopped
+with the vault kept. Nothing was lost.
+
+**Fix.** Run `apprafter lock off` again, or choose **Finish…** on the desktop's
+Security page: either finishes from where the run stopped. If it stops here
+again, check the disk the target store is on.
+
+### `apprafter::secrets::store_changed` {#store-changed}
+
+Another AppRafter process turned this store's lock on or off, or replaced
+its vault, while this command ran. Nothing was written.
+
+**Fix.** Run the command again: it reads the store as it is now.
+
+### `apprafter::secrets::store_file_unreadable` {#store-file-unreadable}
+
+`store.yaml`, at the root of the target store, says whether its secrets are
+locked, and it cannot be read — or it says something no AppRafter writes: a
+newer format, an unknown state, a lock without an id, or secrets in files
+with a `vault` beside it. A `vault` with no `store.yaml` beside it is
+refused the same way. AppRafter then treats the store as locked and uses
+none of its secrets.
+
+**Fix.** If a newer AppRafter wrote it, upgrade. Otherwise fix it by hand —
+`secrets:` is one of `files`, `locking`, `locked` or `unlocking` — or restore
+it from a backup. Never delete it while the store's `vault` exists.
+
+### `apprafter::secrets::vault_unreadable` {#vault-unreadable}
+
+The vault is missing, is not an AppRafter vault, was written in a newer
+format, fails its integrity check, or belongs to another target store. The
+message says which.
+
+**Fix.** A newer format: upgrade AppRafter. Any other case: restore the
+store's `vault` from a backup — with its `store.yaml`, when it belongs to
+another store. Never delete the vault while `store.yaml` says the store is
+locked: nothing else holds these secrets. Without a backup, see [Every way
+into a locked store is lost](#locked-store-lost).
+
+### `apprafter::secrets::vault_unwritable` {#vault-unwritable}
+
+A write to the vault did not happen, and the vault is as it was. The vault
+would grow past its limit (the tokens of a few thousand targets), the input
+cannot be stored (a token that is not one line, a target name a vault entry
+cannot hold, a name already taken), or the filesystem cannot create a file
+without risking replacing one (a filesystem without hard links, such as FAT
+or exFAT).
+
+**Fix.** The help names the case. For a filesystem without hard links, keep
+the target store elsewhere: `APPRAFTER_CONFIG_DIR` moves it.
+
+### `apprafter::secrets::vault_needs_write_lock` {#vault-needs-write-lock}
+
+The store's filesystem gives no file locks, and a vault is never written
+without the store's write lock: two writers racing could overwrite the only
+copy of every token.
+
+**Fix.** Keep the target store on a local filesystem with file locks;
+`APPRAFTER_CONFIG_DIR` moves it.
+
+### `apprafter::secrets::slot_refused` {#slot-refused}
+
+The vault's lock-password slot uses key-derivation settings this AppRafter
+refuses — weaker than it accepts, or beyond what it computes — or none of the
+vault's slots is one this AppRafter knows. `apprafter lock status` names a
+refused slot.
+
+**Fix.** Open the store with its recovery key instead — every prompt takes
+it — then run `apprafter lock off` and `apprafter lock on`, which sets a new
+lock password with current settings. Between the two the store's secrets
+are in files, in clear; `lock on` shows a new recovery key, and the old one
+stops working. For slots a newer AppRafter made, upgrade.
+
+### `apprafter::secrets::cache_not_sealed` {#cache-not-sealed}
+
+A target's cached kubeconfig in a locked store is not encrypted: an older
+AppRafter or another program wrote it. A locked store never uses it, and
+never encrypts it later — it cannot be told from a forgery.
+
+**Fix.** Fetch it again from the node, over SSH, which caches it encrypted
+to the store's own key: `apprafter kubeconfig --refresh --target <name>`.
+
+### `apprafter::secrets::token_outside_vault` {#token-outside-vault}
+
+A target of a locked store has a token in clear in its `credentials.yaml`,
+written by an older AppRafter's `target add` or by another program. A locked
+store takes tokens only from its vault, so this one is never used.
+`apprafter doctor` fails that target's token row, and warns for any other
+target with one.
+
+**Fix.** At a terminal, run `apprafter target add <name> --renew`: it asks
+for the new token without showing it (in a script, `--token`), then for the
+lock password, stores the token in the vault and puts the vault's marker
+back in the file. That token was on disk in clear: if it is a real one,
+delete it in the Hetzner Console once the new one works.
+`apprafter lock off` refuses while such a file exists.
+
+### `apprafter::secrets::token_in_another_vault` {#token-in-another-vault}
+
+The target's `credentials.yaml` names the vault of another target store: the
+target's files were copied from it, or this store's `vault` and `store.yaml`
+were moved aside. Its token is not here.
+
+**Fix.** At a terminal, run `apprafter target add <name> --renew`: it asks
+for the token without showing it (in a script, `--token`) and stores it
+here. The old token stays in the other store's vault.
+
+### `apprafter::secrets::token_missing_from_vault` {#token-missing-from-vault}
+
+The target's `credentials.yaml` says its token is in this store's vault, and
+the vault has no entry for it. An older AppRafter renames a target's files
+without its vault entry.
+
+**Fix.** If an older AppRafter renamed it, rename it back with this
+AppRafter (`apprafter target rename <new> <old>`), then rename it again.
+Otherwise store its token again: at a terminal, run
+`apprafter target add <name> --renew`, which asks for it without showing
+it (in a script, `--token`).
+
+### `apprafter::secrets::random_unavailable` {#random-unavailable}
+
+The operating system's random number generator failed, so no key was made
+and nothing was written. AppRafter makes keys only from it, with no
+fallback.
+
+**Fix.** Run the command again. If it keeps failing, the system's source of
+randomness is broken — a container or virtual machine without one, for
+example.
+
+### `apprafter::secrets::runtime_dir_foreign` {#runtime-dir-foreign}
+
+On Windows, the runtime directory — where a command writes the decrypted
+kubeconfig it hands to `kubectl` — belongs to another account. That account
+can give itself access to the directory whatever its permissions say, and
+replace the kubeconfig before `kubectl` reads it, pointing `kubectl` at a
+server of its choosing. AppRafter writes nothing there. The message names
+the directory: `<store>\run` when `APPRAFTER_CONFIG_DIR` is set, a folder
+under `%LOCALAPPDATA%\apprafter\run` when it is not; the app's own is in its
+local data folder. A directory your account, an administrator or the system
+owns is used.
+
+**Fix.** Remove the directory: AppRafter makes it again, owned by you. If
+Windows refuses, an administrator can remove it. When the store is in a
+folder other accounts can write to, set `APPRAFTER_CONFIG_DIR` to a folder
+only you can write. On Linux and macOS such a directory is refused too, as
+an I/O error: its mode cannot be set.
+
+### `apprafter::secrets::store_not_private` {#store-not-private}
+
+A folder of the target store belongs to another account, or other accounts
+can write to it. Whoever can replace a file there can put a Hetzner token, a
+kubeconfig or a vault of their own in place of yours and send your next
+deploy to a project or a cluster of their choosing, so AppRafter neither uses
+nor writes any of the store's secrets until the folder is yours alone. The
+message names the folder: the store itself, `targets` or a target's folder in
+it, `state` or a folder under it. A command refused here is refused before
+it asks for anything at its terminal: a lock password, a Hetzner or
+repository token, a backup passphrase. Commands that need no secret still run —
+`apprafter target list`, `apprafter target show`, `apprafter lock status` —
+and [`apprafter doctor`](#store-folder-foreign) lists every folder and secret
+file concerned. A folder another account owns is often one your account
+cannot open either: a command that has to read a file in it, `apprafter
+target list`, `apprafter target show` and doctor's `Config file readable`
+row included, then gives this message, naming the folder, rather than a bare
+permission error or an empty list of targets.
+
+AppRafter creates every folder of the store your account's alone, whatever
+the umask, and never changes a folder that is already there. So the folder
+the message names was there before: created by hand, by another program, or
+by an earlier AppRafter release under a umask such as 002.
+
+On Linux and macOS a folder counts as writable by others when its mode lets
+others write to it — a sticky bit does not change that, since they can still
+create files in it — or lets its group write, unless that group is your
+account's own: named after your account, your primary group, with no other
+member. On Windows it does when its permissions let another account create,
+change or delete files in it, or change its permissions or its owner, for
+the folder itself or for what is created in it. An owner other than your
+account counts too, except, on Windows, the Administrators group and the
+system.
+
+**Fix.** Keep the store in a folder only you can write: move it there and
+set `APPRAFTER_CONFIG_DIR` to it. Or fix the folder the message names. On
+Linux and macOS, `chmod go-w <folder>` removes the other accounts' write
+access, and an administrator can give a folder back to your account with
+`sudo chown`. On Windows, remove their write access in the folder's
+Properties › Security; an administrator can make your account its owner in
+Properties › Security › Advanced. Then run the command again.
+
+### `apprafter::lock::no_window` {#no-window}
+
+`apprafter unlock` cannot open an unlock window in this terminal: there is
+no private directory for its socket, the socket's path would be too long,
+the terminal's session has no leader, or — on Windows — there is no console
+to bind it to. For these it refuses before asking for anything. The same
+code ends an `unlock` whose new window did not start after the lock
+password was accepted: a holder already running for this terminal does not
+answer, or a new one did not start within five seconds.
+
+**Fix.** `apprafter lock status` says why. Every command in this terminal
+still works: each asks for the lock password itself. On Linux and macOS,
+setting `XDG_RUNTIME_DIR` to a directory only you can open, with a short
+path, usually gives the window a place. A holder that does not answer is
+ended by `apprafter lock now`.
+
+### `apprafter::lock::not_ended` {#not-ended}
+
+`apprafter lock now` found this terminal's unlock window but could not end
+it: its holder does not answer, and it could not be stopped from here. The
+window is still open: until that process ends, it keeps the store's key.
+
+**Fix.** Stop the process the message names: `kill -9 <pid>` on Linux and
+macOS, `taskkill /F /PID <pid>` on Windows. Meanwhile every command asks
+for the lock password at its prompt.
+
+### `apprafter::cluster::k3s_not_ready` {#k3s-not-ready}
+
+`apprafter up` or `apprafter restore --reprovision` provisioned the
+server, then waited five minutes in its `k3s-ready` step for the
+node's kubeconfig, and the node did not get there: SSH did not reach
+it, k3s had not written the file yet, or the apiserver did not accept
+connections. The message ends with the last of those errors. The
+server exists and Hetzner bills for it, but cluster-bootstrap has not
+run.
+
+**Fix.** Run the same `up` or `restore` command again. It finds the
+server it provisioned instead of creating another, waits for the node
+again, and goes on with cluster-bootstrap. `apprafter kubeconfig
+--refresh` alone fetches the kubeconfig but bootstraps nothing. If the
+node still does not answer, see [The `k3s-ready` step of `up` takes
+longer than
+expected](#the-k3s-ready-step-of-bootstrap-all-takes-longer-than-expected).
+
 ### `apprafter::cli::other`
 
 Catch-all for messages that haven't been promoted to a typed
@@ -314,6 +783,112 @@ variants in future releases.
 **Fix.** Read the message text. If you see the same wording often,
 file an issue — recurring catch-all messages should be promoted
 to a typed variant with its own help text.
+
+## Doctor: a secret file other accounts may open {#secret-file-wide}
+
+`apprafter doctor`, and the app's Doctor, warn about each of the target
+store's secret files that another account on this computer may be able to
+open: a target's `credentials.yaml` (on its own row for the target checked)
+and `state.json`, the age key, and the vault of a locked store. They read
+the file's permissions only, never its contents, and change nothing.
+
+- **Linux and macOS:** `<file> mode 0600 (got 644)`, with the
+  `chmod 600 <path>` that fixes it. AppRafter writes these files 0600; a
+  wider mode comes from a copy, a restore or a hand edit.
+- **Windows:** `<file> not restricted to your account`. A file AppRafter
+  wrote before it gave these files a DACL of their own, or one widened
+  since, keeps what its folder grants until AppRafter next reads it; each
+  read then restricts it to your account. Run a command that reads it —
+  with the target active, `apprafter whoami` reads its token and
+  `apprafter status` its state file and the age key; `apprafter lock
+  status` reads the vault — or use the app, and the warning goes. When the
+  fix says your account may not change who can open the file, another
+  account owns it, or its permissions keep even its owner from changing
+  them: an administrator can make your account its owner with full
+  control, and AppRafter restricts it at its next read.
+
+## Doctor: a store folder or a secret file another account owns or can write {#store-folder-foreign}
+
+`apprafter doctor`, and the app's Doctor, warn about each folder of the
+target store that another account owns or can write to — the store itself,
+`targets` and each target's folder, `state` and each folder under it — and
+about each secret file another account owns: a target's `credentials.yaml`
+and `state.json`, the age key, and on Windows the vault. They read owners and
+permissions only, and change nothing.
+
+- `Target store folder belongs to another account`, or
+  ``Target store folder `targets/prod` belongs to another account``.
+- ``Target store folder `targets` can be changed by other accounts``, with
+  the folder's mode on Linux and macOS (`(mode 777)`).
+- ``Credentials file of target `prod` belongs to another account``, and the
+  same for a state file, the age key or the vault file.
+- ``Target store folder `state/prod`: who can change the folders in it is
+  unknown``, when the folders in it cannot be listed: one another account
+  owns is usually closed to you too. The store's secrets are not used until
+  they can be.
+
+While a folder is listed, the store's secrets are not used: the token and
+Kubernetes API rows are skipped with the refusal
+[`store_not_private`](#store-not-private), so doctor neither sends a token
+another account may have put there to the provider nor runs a kubeconfig it
+may have put there. The fix for a folder is that refusal's; a file another
+account owns can be given back to your account by an administrator, or
+replaced with a copy of your own.
+
+## Every way into a locked store is lost {#locked-store-lost}
+
+AppRafter cannot open a locked store without its lock password or its
+recovery key, and the recovery key opens nothing without the vault file.
+There is no reset. If you have a backup of the store's `vault` and either
+secret, restore the vault and unlock. Otherwise rebuild the store's secrets
+from their sources; the clusters themselves keep running. How to keep this
+from happening: [Back it up](protecting-secrets-from-agents.md#backup).
+
+1. Move the vault and `store.yaml` aside. Keep them: a password found later
+   still opens them. `STORE` is the target store's root, which the
+   `Target store:` line of `apprafter lock status` names (write a leading `~`
+   as `$HOME`: inside quotes the shell does not expand it):
+
+   ```sh
+   STORE="$HOME/.config/apprafter"   # the root `apprafter lock status` names
+   mkdir -p ~/apprafter-locked-store
+   mv "$STORE/vault" "$STORE/store.yaml" ~/apprafter-locked-store/
+   ```
+
+   The store is in files again, and each target's `credentials.yaml` still
+   names the old vault, so its token is not used.
+
+2. For each target, create a new API token in the Hetzner Console (open the
+   project, then Security → API tokens), and at a terminal store it:
+
+   ```sh
+   apprafter target add prod --renew
+   ```
+
+   It asks for the token without showing it (in a script, `--token`). The
+   old token was only in the vault; delete it in the Console once the new
+   one works. Until step 4, the new tokens are in files, in clear.
+
+3. For each target, fetch the kubeconfig again from its node — this needs SSH
+   access to the node, with the key the target was provisioned with — and
+   then the Argo CD password from the cluster:
+
+   ```sh
+   apprafter kubeconfig --refresh --target prod
+   apprafter argocd-password --refresh --target prod
+   ```
+
+   With no shared age key on this computer yet, the first refresh asks
+   before it creates one, as
+   [`age_key_missing`](#age-key-missing) describes. It says the cached
+   secrets were encrypted to the key of the vault you moved aside, which no
+   key at the shared key's path opens: answer `y`.
+
+4. Lock the store again with `apprafter lock on`: a new lock password, and a
+   new recovery key to keep somewhere other than this computer. A cached
+   secret still encrypted to the vault you moved aside — one whose refresh
+   did not run — is named so in its plan and dropped; its refresh fetches it
+   again.
 
 ## Common failures found in end-to-end runs
 
@@ -355,12 +930,17 @@ If you see `> 60 s` consistently on `k3s-ready`:
   nothing, and because `RUST_LOG` **replaces** the default filter
   rather than adding to it, such a directive on its own turns the
   logging off instead of up.
-- Confirm the Hetzner Cloud Firewall has port 22 open
-  (`apprafter doctor` sanity-checks DNS + reachability, not
-  port-level connectivity).
-- Try `apprafter kubeconfig --refresh` once the cluster reports
-  ready in the Hetzner Cloud Console (the Web Console gives you
-  out-of-band access to the boot log).
+- Confirm the Hetzner Cloud Firewall has port 22 open:
+  `apprafter doctor`'s **`Node reachable over SSH`** check connects
+  to port 22 of the node's public IPv4, and FAILs naming the address
+  when nothing accepts the connection.
+- Read the node's boot log in the Hetzner Console: its Web Console
+  gives you out-of-band access to it.
+- If the step gives up after five minutes, it fails with
+  [`apprafter::cluster::k3s_not_ready`](#k3s-not-ready): the server
+  exists and bills, and cluster-bootstrap has not run. Once the node
+  is up, run the same `up` command again. It finds the server instead
+  of creating another and goes on with cluster-bootstrap.
 
 ### Cilium pods did not pick up a config change
 
@@ -384,9 +964,10 @@ The common ones:
   `(region × SKU)` pair is invalid or unavailable. See the section
   above for the four `UnavailableKind` variants and their fixes.
 - A `403 forbidden` with a quota message — your Hetzner project
-  has hit its server / IP / volume limit. Raise the limit in the
-  Hetzner Cloud Console (Project → Limits) or free up resources,
-  then re-run. `apprafter destroy --yes` clears any half-built
+  has hit its server / IP / volume limit. Request a higher limit
+  from the [limits overview](https://console.hetzner.com/limits) in
+  the Hetzner Console (Request change → Limit increase) or free up
+  resources, then re-run. `apprafter destroy --yes` clears any half-built
   resources before you retry — but it removes **every** resource
   tagged `apprafter=true` in that project, running clusters included,
   so only reach for it when the project holds nothing else
@@ -397,37 +978,54 @@ The common ones:
 Point `--ssh-key` at a real **public** key file (e.g.
 `~/.ssh/id_ed25519.pub`, not the private key). The key is injected into
 the node at provision time, so a change only takes effect on the next
-`apply` / `up` — re-add the target with `--force --ssh-key <path>`
-first.
+`apply` / `up` — set it first with
+`apprafter target add <name> --renew --ssh-key <path>`, which changes
+the key and keeps everything else, the token included.
 
-**What checks what, exactly** — because the obvious check does less
-than it looks:
+**What checks what, exactly**
 
-- `apprafter target add --ssh-key <path>` **refuses at add time** if
-  the path does not exist: `SSH key path '<path>' does not exist`
-  (code `apprafter::cli::other`). So a bad path never gets stored in
-  the first place.
-- `apprafter doctor`'s check is named **`SSH key readable`** — not
-  "SSH public key readable" — and that is all it verifies. It FAILs
-  when the stored path has since disappeared or cannot be read, and
-  otherwise PASSes, printing the file's first whitespace-delimited
-  token as the algorithm. It does **not** validate that the file is a
-  public key: pointed at a file containing `not-a-key` it reports
+The key file is sent to Hetzner as it is, so every place that takes it
+checks that it holds one OpenSSH public key line, `<type> <base64>
+[comment]`, of type `ssh-ed25519`, `ssh-rsa`, an `ecdsa-sha2` curve, or
+a security-key (`sk-`) type. A private key is refused by name, and its
+contents are never printed.
+
+- `apprafter target add --ssh-key <path>` (and `--renew --ssh-key`)
+  **refuses at add time** if the path does not exist (`SSH key path
+  '<path>' does not exist`, code `apprafter::target::ssh_key_unreadable`)
+  or if the file is not a public key (`SSH key '<path>' is a private
+  key: …` or `… is not an OpenSSH public key`, code
+  `apprafter::target::ssh_key_not_public`). So neither a bad path nor a
+  private key gets stored in the first place.
+- `apprafter apply` / `up` check the key body again before anything is
+  sent to the provider: the stored path's file, an inline
+  `APPRAFTER_SSH_PUBLIC_KEY`, or a manifest's `sshKeys` entry. A target
+  stored before this check existed can still name a private key; `apply`
+  then stops with `apprafter::target::ssh_key_not_public` and sends
+  nothing.
+- `apprafter doctor`'s **`SSH key readable`** row FAILs when the stored
+  path has disappeared, cannot be read, or does not hold a public key (a
+  private key is named as one), and otherwise PASSes, printing the key
+  type:
 
     ```text
-      ✓ SSH key readable (/path/to/fake.pub (not-a-key))
+      ✓ SSH key readable (/home/you/.ssh/id_ed25519.pub (ssh-ed25519))
     ```
 
-    and pointed at a *private* key it passes just as happily, printing
-    `✓ SSH key readable (…/id_ed25519 (-----BEGIN))`. A green tick here
-    means "a file is there", not "the key is right".
 - With no key configured at all the check is a **WARN**, `SSH key path
   configured`, not a FAIL — provisioning is what refuses.
 
-So if provisioning fails on SSH and `doctor` is green, compare the
-stored path's contents against the key the node actually has: `head -c
-20 <path>` should start with `ssh-ed25519` / `ssh-rsa` / `ecdsa-`, not
-`-----BEGIN`.
+A private key's public half is the `.pub` file next to it; `ssh-keygen
+-y -f <private key>` prints it again if the `.pub` is lost.
+
+Fix the key where the message says it came from, as its help does. A
+manifest's `sshKeys[i]`: replace that entry's `public_key` with the
+public line. `APPRAFTER_SSH_PUBLIC_KEY`: set it to the public line, or
+unset it. A target's key file:
+`apprafter target add <name> --renew --ssh-key <path>.pub`, or, on a
+first `target add`, the same command with the `.pub`. `apply` takes the
+manifest's keys first, then the variable, then the target's key, so
+changing one further down does not change what is sent.
 
 ### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
 
@@ -579,19 +1177,18 @@ Error: apprafter::target::token_rejected
 
         × hetzner-cloud GET /v1/locations failed (status 401):
         │ unauthorized: the token you have provided is invalid
-        help: The Hetzner Cloud API returned a non-2xx response. …
+        help: The Hetzner Cloud API refused the request:
               • 401 unauthorized — …
               • 403 forbidden — …
               • 429 rate limit — …
               • 5xx — …
 
-  help: The provider's read-only credential check returned 401 /
-        unauthorized. …
-        • Verify the token at https://console.hetzner.cloud/projects → …
-        • Copy the token again …
-        • If you're rotating, run `apprafter target add <name>
-        --renew --token <new>` …
-        • Pass `--no-ping` to skip the check …
+  help: The provider's read-only credential check returned 401
+        unauthorized: the token was mistyped, or it was revoked or
+        rotated, or its project was deleted.
+        • A token is shown only once, when it is created: …
+        • If you're rotating, run `apprafter target add <name> --renew`
+        instead of re-creating the target …
 ```
 
 The OUTER `Error:` line names the operator-facing scenario. The

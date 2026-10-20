@@ -1,7 +1,10 @@
 $ apprafter target add prod --provider hetzner-cloud --token bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --ssh-key <SANDBOX>/home/id_ed25519.pub --region hel1 --force --no-ping --no-interactive
 [exit 0]
 [stdout]
-target `prod` saved (active target unchanged — use `apprafter target use prod` to switch) (token NOT verified against the API — `--no-ping` was passed)
+target `prod` overwritten (it stays the active target) (token NOT verified against the API — `--no-ping` was passed)
+  updated region: nbg1 → hel1
+  kept tier: solo
+  kept ssh key: ~/id_ed25519.pub
 [stderr]
 <ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mtrue
 $ apprafter target show
@@ -11,7 +14,7 @@ Target: prod (active)
   Provider:    hetzner-cloud
   Region:      hel1
   Server type: not set
-  Default tier: not set
+  Default tier: solo
   Cluster name: not set
   SSH key:     <SANDBOX>/home/id_ed25519.pub
   Hetzner token: set (64 chars; read credentials.yaml for the raw value)

@@ -37,7 +37,8 @@
 # NOT need local-operator mode for 2.6d itself: the PUBLISHED operator + chart
 # (which already carries the 2.6c SharedVolume CRD + the 2.6b/2.12 surface this
 # walk's app uses) suffices. The walk runs the WORKING-TREE CLI via the
-# `apprafter()` wrapper (`cd cli && cargo run`), which is what's under test.
+# `apprafter()` wrapper (it builds cli/ and runs the binary on the walk's store),
+# which is what's under test.
 #
 # Two clusters — RESOURCE-GATED SOFT skip
 # ---------------------------------------
@@ -204,7 +205,7 @@ printf 'restic: %s\n' "$(command -v restic)"
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 SRC_KUBECONFIG="${TMPDIR_WORK}/kubeconfig-src"
 DST_KUBECONFIG="${TMPDIR_WORK}/kubeconfig-dst"
 EXPORT_DIR="${TMPDIR_WORK}/export"

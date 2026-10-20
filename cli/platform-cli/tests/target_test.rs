@@ -11,17 +11,21 @@
 //! Cold-fetch interactive wizard path lives in Track A.4 and is
 //! out of scope here — Track A.3 ships pure flag-driven mode only.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::Path;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 /// 64-char synthetic Hetzner token (canonical alphanumeric, no
-/// prefix — matches what Hetzner Cloud Console actually issues
+/// prefix — matches what the Hetzner Console actually issues
 /// per `cli-dx-task.md` §11 as amended in v0.1.74). Lets tests
 /// stay 100 % offline — no Hetzner API ping happens until Track
 /// A.4 validator integration.
@@ -41,11 +45,10 @@ fn write_fake_ssh_pubkey(dir: &Path) -> std::path::PathBuf {
 #[test]
 fn target_add_writes_config_and_credentials_and_promotes_first_target_to_active() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -89,10 +92,9 @@ fn target_add_writes_config_and_credentials_and_promotes_first_target_to_active(
 fn target_add_credentials_file_is_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -119,9 +121,9 @@ fn target_add_credentials_file_is_mode_0600() {
 #[test]
 fn target_add_uses_hcloud_token_env_var_as_fallback() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .env("HCLOUD_TOKEN", &token)
         .args([
@@ -140,10 +142,9 @@ fn target_add_uses_hcloud_token_env_var_as_fallback() {
 #[test]
 fn target_add_errors_when_token_missing_entirely() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "ci", "--provider", "hetzner-cloud"])
         .assert()
         .failure()
@@ -153,10 +154,9 @@ fn target_add_errors_when_token_missing_entirely() {
 #[test]
 fn target_add_errors_on_unknown_provider() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -174,10 +174,9 @@ fn target_add_errors_on_unknown_provider() {
 #[test]
 fn target_add_errors_on_malformed_hetzner_token() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -189,16 +188,16 @@ fn target_add_errors_on_malformed_hetzner_token() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::invalid_token"))
         .stderr(contains("invalid Hetzner Cloud token"));
 }
 
 #[test]
 fn target_add_errors_on_invalid_target_name() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -216,12 +215,11 @@ fn target_add_errors_on_invalid_target_name() {
 #[test]
 fn target_add_refuses_to_overwrite_existing_target_without_force() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
     for _ in 0..1 {
-        cli()
-            .env("APPRAFTER_CONFIG_DIR", dir.path())
+        cli(&sp)
             .env("APPRAFTER_NO_PING", "1")
-            .env_remove("HCLOUD_TOKEN")
             .args([
                 "target",
                 "add",
@@ -235,10 +233,8 @@ fn target_add_refuses_to_overwrite_existing_target_without_force() {
             .success();
     }
     // Second invocation: must refuse.
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -258,16 +254,15 @@ fn target_add_refuses_to_overwrite_existing_target_without_force() {
 #[test]
 fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token1 = synthetic_hetzner_token();
     // 64 'b's so it passes the strict alphanumeric validator and
     // differs byte-for-byte from token1 (all 'a's) so the rotation
     // assertion can detect either-or.
     let token2 = "b".repeat(64);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -278,14 +273,14 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
             &token1,
             "--region",
             "nbg1",
+            "--tier",
+            "solo",
         ])
         .assert()
         .success();
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -300,14 +295,16 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
         ])
         .assert()
         .success()
-        // Second save is not the first target → message must NOT
-        // claim it became active. Pre-existing global config is
-        // preserved.
-        .stdout(contains("active target unchanged"));
+        // `work` is the active target and stays it: the line says so and does not advise
+        // switching to it (bug 1). Pre-existing global config is preserved.
+        .stdout(contains("it stays the active target"))
+        .stdout(contains("target use").not());
 
     // Region flag in the overwrite must land in the on-disk config.
     let cfg = std::fs::read_to_string(dir.path().join("targets/work/config.yaml")).unwrap();
     assert!(cfg.contains("region: fsn1"), "{cfg}");
+    // Bug 8: a field the overwrite did not pass keeps its stored value.
+    assert!(cfg.contains("default_tier: solo"), "{cfg}");
     // Token in the overwrite is the new one.
     let creds = std::fs::read_to_string(dir.path().join("targets/work/credentials.yaml")).unwrap();
     assert!(creds.contains(&token2));
@@ -317,15 +314,14 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
 #[test]
 fn target_add_renew_rotates_credentials_without_touching_config() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token1 = synthetic_hetzner_token();
     // 64 'c's — different from token1 (all 'a's) so the rotation
     // assertion can prove old credentials were really overwritten.
     let token2 = "c".repeat(64);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -342,10 +338,8 @@ fn target_add_renew_rotates_credentials_without_touching_config() {
         .assert()
         .success();
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "prod", "--token", &token2, "--renew"])
         .assert()
         .success()
@@ -362,10 +356,9 @@ fn target_add_renew_rotates_credentials_without_touching_config() {
 #[test]
 fn target_add_renew_on_missing_target_errors_with_hint() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -376,7 +369,8 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
         ])
         .assert()
         .failure()
-        .stderr(contains("does not exist"))
+        .stderr(contains("apprafter::target::not_found"))
+        .stderr(contains("not found"))
         .stderr(contains("drop `--renew`"));
 }
 
@@ -385,15 +379,14 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
     // The v0.1.77 walk surfaced that `--renew` happily "rotated"
     // a target to the exact same token bytes — green checkmark,
     // zero actual change in Hetzner. v0.1.78 makes that case
-    // fail loudly so the operator hits the Hetzner Cloud Console
-    // and generates a fresh token instead of having a silent
+    // fail loudly so the operator generates a new token in the
+    // Hetzner Console instead of having a silent
     // no-op.
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -407,15 +400,20 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
         .success();
 
     // Same token supplied to --renew → reject.
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "rotate-me", "--token", &token, "--renew"])
         .assert()
         .failure()
-        .stderr(contains("requires a NEW token"))
-        .stderr(contains("Hetzner Cloud Console"));
+        .stderr(contains("apprafter::target::renew_token_unchanged"))
+        // Where a new token is created (WI-454), with miette's wrapping taken out.
+        .stderr(predicates::function::function(|stderr: &str| {
+            stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(cli_core::target::HETZNER_API_TOKENS_PAGE)
+        }));
 
     // On-disk credentials must still reflect the original token,
     // not be wiped or corrupted by the failed renew attempt.
@@ -430,14 +428,13 @@ fn target_add_renew_rejects_identical_token_with_rotation_hint() {
 #[test]
 fn target_add_renew_accepts_genuinely_new_token() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let old = synthetic_hetzner_token();
     let new = "b".repeat(64);
     assert_ne!(old, new, "test fixtures must differ");
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -450,10 +447,8 @@ fn target_add_renew_accepts_genuinely_new_token() {
         .assert()
         .success();
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "rotate-me", "--token", &new, "--renew"])
         .assert()
         .success()
@@ -468,11 +463,10 @@ fn target_add_renew_accepts_genuinely_new_token() {
 #[test]
 fn target_add_renew_rejects_config_flags() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -484,10 +478,8 @@ fn target_add_renew_rejects_config_flags() {
         ])
         .assert()
         .success();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target", "add", "live", "--token", &token, "--region", "hel1", "--renew",
         ])
@@ -501,10 +493,9 @@ fn target_add_force_and_renew_are_mutually_exclusive() {
     // clap's `conflicts_with` should reject both flags up front
     // before the handler runs.
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -524,14 +515,12 @@ fn target_add_force_and_renew_are_mutually_exclusive() {
 #[test]
 fn target_add_with_ssh_key_path_verifies_file_exists() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
     let pubkey = write_fake_ssh_pubkey(dir.path());
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_SSH_PUBLIC_KEY_PATH")
         .args([
             "target",
             "add",
@@ -553,11 +542,9 @@ fn target_add_with_ssh_key_path_verifies_file_exists() {
 #[test]
 fn target_add_errors_when_ssh_key_path_missing() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_SSH_PUBLIC_KEY_PATH")
         .args([
             "target",
             "add",
@@ -571,18 +558,18 @@ fn target_add_errors_when_ssh_key_path_missing() {
         ])
         .assert()
         .failure()
+        .stderr(contains("apprafter::target::ssh_key_unreadable"))
         .stderr(contains("does not exist"));
 }
 
 #[test]
 fn second_target_save_keeps_first_as_active_and_reports_so() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -596,10 +583,8 @@ fn second_target_save_keeps_first_as_active_and_reports_so() {
         .success()
         .stdout(contains("saved and set as active"));
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -629,16 +614,14 @@ fn second_target_save_keeps_first_as_active_and_reports_so() {
 // store.
 // ---------------------------------------------------------------
 
-/// Seed `dir` with two targets so list/show/rename/remove have
+/// Seed `sp`'s store with two targets so list/show/rename/remove have
 /// something to operate on. The first one becomes active by the
 /// `first-on-fresh-store` rule.
-fn seed_two_targets(dir: &Path) {
+fn seed_two_targets(sp: &Spawn) {
     let token = synthetic_hetzner_token();
     for (name, region) in &[("first", "nbg1"), ("second", "fsn1")] {
-        cli()
-            .env("APPRAFTER_CONFIG_DIR", dir)
+        cli(sp)
             .env("APPRAFTER_NO_PING", "1")
-            .env_remove("HCLOUD_TOKEN")
             .args([
                 "target",
                 "add",
@@ -660,8 +643,8 @@ fn seed_two_targets(dir: &Path) {
 #[test]
 fn target_list_on_empty_store_prints_onboarding_hint() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "list"])
         .assert()
@@ -673,10 +656,10 @@ fn target_list_on_empty_store_prints_onboarding_hint() {
 #[test]
 fn target_list_renders_table_with_active_marker_and_columns() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "list"])
         .assert()
@@ -699,10 +682,10 @@ fn target_list_renders_table_with_active_marker_and_columns() {
 #[test]
 fn target_use_switches_active_pointer_and_reports_the_swap() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "use", "second"])
         .assert()
@@ -718,10 +701,10 @@ fn target_use_switches_active_pointer_and_reports_the_swap() {
 #[test]
 fn target_use_on_already_active_is_a_polite_noop() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "use", "first"])
         .assert()
@@ -732,10 +715,10 @@ fn target_use_on_already_active_is_a_polite_noop() {
 #[test]
 fn target_use_on_missing_target_surfaces_available_hint() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "use", "ghost"])
         .assert()
@@ -749,10 +732,10 @@ fn target_use_on_missing_target_surfaces_available_hint() {
 #[test]
 fn target_show_with_no_args_renders_active_target_with_masked_token() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "show"])
         .assert()
@@ -768,10 +751,10 @@ fn target_show_with_no_args_renders_active_target_with_masked_token() {
 #[test]
 fn target_show_with_explicit_name_renders_named_target_without_active_marker() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "show", "second"])
         .assert()
@@ -783,8 +766,8 @@ fn target_show_with_explicit_name_renders_named_target_without_active_marker() {
 #[test]
 fn target_show_on_empty_store_errors_with_onboarding_hint() {
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "show"])
         .assert()
@@ -796,10 +779,10 @@ fn target_show_on_empty_store_errors_with_onboarding_hint() {
 #[test]
 fn target_rename_moves_files_and_updates_active_pointer() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "rename", "first", "primary"])
         .assert()
@@ -818,10 +801,10 @@ fn target_rename_moves_files_and_updates_active_pointer() {
 #[test]
 fn target_rename_non_active_target_leaves_active_pointer_alone() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "rename", "second", "backup"])
         .assert()
@@ -837,10 +820,10 @@ fn target_rename_non_active_target_leaves_active_pointer_alone() {
 #[test]
 fn target_rename_refuses_when_destination_exists() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "rename", "first", "second"])
         .assert()
@@ -855,10 +838,10 @@ fn target_rename_refuses_when_destination_exists() {
 #[test]
 fn target_rename_rejects_invalid_destination_name() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "rename", "first", "with space"])
         .assert()
@@ -869,26 +852,26 @@ fn target_rename_rejects_invalid_destination_name() {
 #[test]
 fn target_rename_refuses_identical_source_and_destination() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "rename", "first", "first"])
         .assert()
         .failure()
-        .stderr(contains("identical"));
+        .stderr(contains("apprafter::target::same_name"));
 }
 
 #[test]
 fn target_remove_with_yes_flag_deletes_and_reassigns_active_alphabetically() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
     // Remove the active target (`first`); active should move to
     // the alphabetically next remaining target (`second`).
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "remove", "first", "--yes"])
         .assert()
@@ -904,11 +887,10 @@ fn target_remove_with_yes_flag_deletes_and_reassigns_active_alphabetically() {
 #[test]
 fn target_remove_last_target_clears_active_pointer() {
     let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
     let token = synthetic_hetzner_token();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -920,8 +902,7 @@ fn target_remove_last_target_clears_active_pointer() {
         ])
         .assert()
         .success();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "remove", "only-one", "--yes"])
         .assert()
@@ -936,10 +917,10 @@ fn target_remove_last_target_clears_active_pointer() {
 #[test]
 fn target_remove_non_active_target_keeps_active_pointer_intact() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "remove", "second", "--yes"])
         .assert()
@@ -952,10 +933,10 @@ fn target_remove_non_active_target_keeps_active_pointer_intact() {
 #[test]
 fn target_remove_non_interactive_without_yes_refuses() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "remove", "second"])
         .assert()
@@ -970,10 +951,10 @@ fn target_remove_non_interactive_without_yes_refuses() {
 #[test]
 fn target_remove_on_missing_target_surfaces_available_hint() {
     let dir = tempfile::tempdir().unwrap();
-    seed_two_targets(dir.path());
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
 
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
         .args(["target", "remove", "ghost", "--yes"])
         .assert()
@@ -981,14 +962,120 @@ fn target_remove_on_missing_target_surfaces_available_hint() {
         .stderr(contains("target `ghost` not found"));
 }
 
+/// The code of a target file that cannot be parsed. miette prints it on a line of its own,
+/// which it never wraps; the path is in the `×` message, which it wraps at 80 columns — and a
+/// Windows path (`\` allows no line break before a letter) is split inside a word, so asserting
+/// on the path would fail on the Windows runner only.
+const UNREADABLE_CODE: &str = "apprafter::target::invalid_config";
+/// What the error for a `credentials.yaml` that does not parse says, path-free: which file was
+/// read. It never quotes the file (the D.3d review's #5: that text is the token), so the
+/// phrase is matched with miette's wrapping (a line break and the `│` gutter between two words)
+/// taken out.
+fn says_the_credentials_do_not_parse() -> impl predicates::Predicate<str> {
+    predicates::function::function(|stderr: &str| {
+        stderr
+            .split_whitespace()
+            .filter(|word| *word != "│")
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("not a valid target credentials map")
+    })
+}
+
+/// `use` finds its target by reading both of its files, as it always has: a target whose
+/// credentials file cannot be parsed is refused and left in place, and the CLI default does not
+/// move onto it. (The core checks only that a target exists; the CLI keeps this check so moving
+/// onto the core changes nothing here.) `remove` takes that target (WI-458): it says which file
+/// cannot be read, never what it holds, and deletes it; the default stays where it was.
+#[test]
+fn target_use_refuses_and_remove_removes_a_target_whose_files_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
+    std::fs::write(
+        dir.path().join("targets/second/credentials.yaml"),
+        "hetzner_token: [unclosed",
+    )
+    .unwrap();
+
+    cli(&sp)
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "second"])
+        .assert()
+        .failure()
+        .stderr(contains(UNREADABLE_CODE))
+        .stderr(says_the_credentials_do_not_parse());
+    assert!(dir.path().join("targets/second/config.yaml").exists());
+
+    cli(&sp)
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "second", "--yes"])
+        .assert()
+        .success()
+        .stderr(says_the_credentials_do_not_parse())
+        .stderr(contains("[unclosed").not())
+        .stdout(contains("target `second` removed"));
+    assert!(!dir.path().join("targets/second").exists());
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: first"), "{global}");
+}
+
+/// `add` (with `--force` or without) and `add --renew` refuse a target whose credentials file
+/// cannot be parsed with that file's error, as they always have — never "already exists",
+/// never an overwrite — and `--renew` reports it before the config-flag refusal (today's
+/// order: the target is read first).
+#[test]
+fn target_add_and_renew_refuse_a_target_whose_credentials_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(dir.path());
+    seed_two_targets(&sp);
+    let creds = dir.path().join("targets/second/credentials.yaml");
+    std::fs::write(&creds, "hetzner_token: [unclosed").unwrap();
+    let token = "b".repeat(64);
+
+    for extra in [
+        &[][..],
+        &["--force"][..],
+        &["--renew", "--region", "hel1"][..],
+    ] {
+        let mut args = vec![
+            "target",
+            "add",
+            "second",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+            "--no-interactive",
+        ];
+        if extra.first() == Some(&"--renew") {
+            // `--renew` refuses `--provider` too; keep `--region` as the one config flag.
+            args.retain(|a| *a != "--provider" && *a != "hetzner-cloud");
+        }
+        args.extend_from_slice(extra);
+        cli(&sp)
+            .env("APPRAFTER_NO_PING", "1")
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains(UNREADABLE_CODE))
+            .stderr(says_the_credentials_do_not_parse())
+            .stderr(contains("already exists").not())
+            .stderr(contains("only updates credentials").not());
+    }
+    assert_eq!(
+        std::fs::read_to_string(&creds).unwrap(),
+        "hetzner_token: [unclosed"
+    );
+}
+
 #[test]
 fn target_alias_t_subcommand_resolves_to_target() {
     // Smoke for the `apprafter t add …` alias declared in clap.
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "t",
             "add",
@@ -1037,11 +1124,9 @@ fn target_add_pings_provider_by_default_and_announces_verified_status() {
         .create();
 
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .args([
             "target",
             "add",
@@ -1075,11 +1160,9 @@ fn target_add_surfaces_typed_error_on_hetzner_401() {
         .create();
 
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .args([
             "target",
             "add",
@@ -1120,11 +1203,9 @@ fn target_add_surfaces_helpful_error_when_api_is_unreachable() {
     // No mockito server — point at a known-closed port so ureq
     // returns a transport-class error.
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .args([
             "target",
             "add",
@@ -1153,11 +1234,9 @@ fn target_add_no_ping_flag_skips_validator_and_announces_unverified() {
     // No mockito server set up — would fail any actual ping. The
     // --no-ping flag must short-circuit before that.
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_NO_PING")
         .args([
             "target",
             "add",
@@ -1179,11 +1258,10 @@ fn target_add_no_ping_flag_skips_validator_and_announces_unverified() {
 fn target_add_no_ping_env_var_also_skips_validator() {
     // Equivalent to the --no-ping flag via env-var binding.
     let dir = tempfile::tempdir().unwrap();
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", dir.path())
+    let sp = Spawn::new().with_store(dir.path());
+    cli(&sp)
         .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
         .env("APPRAFTER_NO_PING", "1")
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -1196,4 +1274,185 @@ fn target_add_no_ping_env_var_also_skips_validator() {
         .assert()
         .success()
         .stdout(contains("token NOT verified"));
+}
+
+/// The `target add` wizard at a terminal of its own (`common::terminal`, stdout there too, as a
+/// shell runs it), with every input but the SSH key given: `--no-ping`, so nothing is sent.
+#[cfg(unix)]
+fn ssh_key_conversation(sp: &Spawn, steps: &[common::terminal::Step]) -> common::terminal::Ended {
+    let token = synthetic_hetzner_token();
+    let args = [
+        "target",
+        "add",
+        "dev",
+        "--provider",
+        "hetzner-cloud",
+        "--token",
+        &token,
+        "--region",
+        "nbg1",
+        "--tier",
+        "solo",
+        "--no-ping",
+    ];
+    common::terminal::converse_at_terminal(sp, &args, steps)
+}
+
+/// d4a-h F8 (matrix C-17, C-12 step 2): Ctrl-C at the renewal wizard's token prompt is the
+/// person's decision — the typed `apprafter::op::cancelled`, as Ctrl-C at the lock prompt
+/// reads — never the catch-all that asks to file an issue; the target is left as it was.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_at_the_renewal_token_prompt_reads_as_cancelled() {
+    use common::terminal::Step;
+    let sp = Spawn::new();
+    cli(&sp)
+        .env("APPRAFTER_NO_PING", "1")
+        .args([
+            "target",
+            "add",
+            "walk",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    let creds = sp.store().join("targets/walk/credentials.yaml");
+    let before = std::fs::read(&creds).unwrap();
+    let end = common::terminal::converse_at_terminal(
+        &sp,
+        &["target", "add", "walk", "--renew", "--no-ping"],
+        &[
+            Step::Expect("Hetzner Cloud API token"),
+            // Ctrl-C, as the raw-mode prompt reads it.
+            Step::Type(vec![0x03]),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("apprafter::op::cancelled"), "{shown}");
+    assert!(!shown.contains("apprafter::cli::other"), "{shown}");
+    assert!(!shown.contains("catch-all"), "{shown}");
+    assert!(end.restored, "the terminal was not put back");
+    assert_eq!(
+        std::fs::read(&creds).unwrap(),
+        before,
+        "a cancelled renewal changed the token"
+    );
+}
+
+/// d4a-h F12 (harness self-test H-0; matrix C-18): the wizard under `--no-ping` with
+/// `--server-type cpx22` saves that server type, and says so — never that no server type was
+/// chosen; its not-validated line follows.
+#[cfg(unix)]
+#[test]
+fn the_wizard_under_no_ping_names_the_server_type_it_saves() {
+    use common::terminal::Step;
+    let sp = Spawn::new();
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_dir.path().join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA test@host\n").unwrap();
+    let token = synthetic_hetzner_token();
+    let key_arg = key.display().to_string();
+    let end = common::terminal::converse_at_terminal(
+        &sp,
+        &[
+            "target",
+            "add",
+            "dev",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--server-type",
+            "cpx22",
+            "--ssh-key",
+            &key_arg,
+            "--no-ping",
+        ],
+        &[Step::Expect("target `dev` saved and set as active")],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("no server type chosen"), "{shown}");
+    assert!(
+        shown
+            .contains("machine picker skipped (--no-ping); server type `cpx22` from --server-type"),
+        "{shown}"
+    );
+    assert!(shown.contains("NOT validated"), "{shown}");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(config.contains("server_type: cpx22"), "{config}");
+}
+
+/// WI-480: with no SSH key under `~/.ssh` (a scratch home without `.ssh`) the wizard asks for
+/// a path, "leave empty to skip"; Enter on the empty line skips the key and the wizard goes on
+/// and saves. It used to submit a default `~/.ssh/id_ed25519.pub` that was not there, refuse
+/// it ("does not exist"), and keep asking until a path was typed: this conversation then ran
+/// into its deadline.
+#[cfg(unix)]
+#[test]
+fn the_wizard_skips_the_ssh_key_on_an_empty_answer_when_there_is_no_key() {
+    use common::terminal::{line, Step};
+    let sp = Spawn::new();
+    assert!(!sp.home().join(".ssh").exists());
+    let end = ssh_key_conversation(
+        &sp,
+        &[
+            Step::Expect("SSH public key path (leave empty to skip):"),
+            line(""),
+            Step::Expect("target `dev` saved and set as active"),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("does not exist"), "{shown}");
+    assert!(
+        !shown.contains("id_ed25519.pub"),
+        "a default was offered:\n{shown}"
+    );
+    assert!(end.restored, "the terminal was not put back");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(config.contains("ssh_key_path: null"), "{config}");
+}
+
+/// WI-480: with `~/.ssh/id_ed25519.pub` holding a public key, the picker lists it; its "Other"
+/// row's path prompt offers that file as the default, and Enter on the empty line takes it.
+#[cfg(unix)]
+#[test]
+fn the_wizards_path_prompt_takes_the_default_key_on_an_empty_answer_when_it_is_there() {
+    use common::terminal::{line, Step};
+    let sp = Spawn::new();
+    let ssh = sp.home().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let key = ssh.join("id_ed25519.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAA test@host\n").unwrap();
+    let end = ssh_key_conversation(
+        &sp,
+        &[
+            Step::Expect("Other (type a path)"),
+            // Down to "Other", then the path prompt and its default.
+            Step::Type(b"\x1b[B".to_vec()),
+            line(""),
+            Step::Expect("SSH public key path (leave empty to skip):"),
+            line(""),
+            Step::Expect("target `dev` saved and set as active"),
+        ],
+    );
+    let shown = &end.terminal;
+    assert_eq!(end.status.code(), Some(0), "{shown}");
+    assert!(end.restored, "the terminal was not put back");
+    let config = std::fs::read_to_string(sp.store().join("targets/dev/config.yaml")).unwrap();
+    assert!(
+        config.contains(&format!("ssh_key_path: {}", key.display())),
+        "{config}"
+    );
 }

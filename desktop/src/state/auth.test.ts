@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 import { describe, expect, jest, test } from 'bun:test';
 import { act, renderHook } from '@testing-library/react';
+import { CORE_ERROR_CODES } from '../ipc/generated/core-errors';
 import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { JsonValue } from '../ipc/generated/serde_json/JsonValue';
 import type { UiError } from '../ipc/generated/UiError';
@@ -249,5 +250,54 @@ describe('authRefusal, for either way', () => {
       const error = refused(DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE, { reason });
       expect(authRefusal(error, false)).toEqual({ lines: [error.message], retryInMs: null });
     }
+  });
+});
+
+describe("the store's secret (D.4a T75, D19)", () => {
+  const failed = (fields: UiError['fields'] = {}): UiError => ({
+    code: DESKTOP_ERROR_CODES.AUTH_FAILED,
+    message: 'authentication failed',
+    help: null,
+    causes: [],
+    fields: { exhausted: false, ...fields },
+  });
+  test('a wrong secret says it is neither the lock password nor the recovery key', () => {
+    expect(authRefusal(failed(), true, 'store')).toEqual({
+      lines: ['That is not the lock password or the recovery key.'],
+      retryInMs: null,
+    });
+    expect(authRefusal(failed(), true).lines).toEqual(['That password is not right.']);
+  });
+  test('a mistyped recovery key is said where it is wrong, as the Protect dialog says it', () => {
+    // The gate refuses it as `recovery_key_invalid` with the core's fields (Task 13).
+    const mistyped: UiError = {
+      code: CORE_ERROR_CODES.SECRETS_RECOVERY_KEY_INVALID,
+      message: 'that recovery key is mistyped',
+      help: null,
+      causes: [],
+      fields: { reason: 'checksum', group: 7 },
+    };
+    expect(authRefusal(mistyped, true, 'store')).toEqual({
+      lines: ['That key is mistyped near group 7.'],
+      retryInMs: null,
+    });
+  });
+  test("the system's prompt, refused on a protected store, points at the field", () => {
+    const refused: UiError = {
+      code: DESKTOP_ERROR_CODES.AUTH_UNAVAILABLE,
+      message: 'x',
+      help: null,
+      causes: [],
+      fields: { reason: 'use_password_field' },
+    };
+    expect(authRefusal(refused, false, 'store').lines).toEqual([
+      'Type the lock password or the recovery key here.',
+    ]);
+  });
+  test('the back-off holds the store secret as it holds the password', () => {
+    expect(authRefusal(failed({ exhausted: true, retryInMs: 30_000 }), true, 'store')).toEqual({
+      lines: [],
+      retryInMs: 30_000,
+    });
   });
 });

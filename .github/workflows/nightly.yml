@@ -81,8 +81,9 @@ jobs:
           APPRAFTER_SSH_PRIVATE_KEY: ${{ secrets.APPRAFTER_SSH_PRIVATE_KEY }}
         run: |
           # The mvp walk provisions the Hetzner server with the PUBLIC key, then
-          # SSHes in to fetch the k3s kubeconfig using the DEFAULT identity
-          # (~/.ssh/id_ed25519). The runner has no private key, so materialise
+          # fetches the k3s kubeconfig over SSH with the private one, which it
+          # takes by path (APPRAFTER_E2E_SSH_KEY) into the home it runs the CLI
+          # with. The runner has no private key, so materialise
           # the matching one from a secret. ADD `APPRAFTER_SSH_PRIVATE_KEY` (the
           # private half of APPRAFTER_SSH_PUBLIC_KEY) to the repo secrets.
           if [ -z "${APPRAFTER_SSH_PRIVATE_KEY:-}" ]; then
@@ -99,4 +100,6 @@ jobs:
           APPRAFTER_SSH_PUBLIC_KEY: ${{ secrets.APPRAFTER_SSH_PUBLIC_KEY }}
           APPRAFTER_E2E_REGION: nbg1
         run: |
-          ./e2e/mvp.sh
+          # e2e/lib.sh runs the CLI with a scratch home of its own (D.4a T9): hand mvp.sh the
+          # private key the step above wrote, by path.
+          APPRAFTER_E2E_SSH_KEY="$HOME/.ssh/id_ed25519" ./e2e/mvp.sh

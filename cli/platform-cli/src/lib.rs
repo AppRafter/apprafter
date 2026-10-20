@@ -7,15 +7,29 @@
 //! instead of re-implementing either.
 //!
 //! The modules themselves stay crate-private: the only surface a
-//! consumer may rely on is [`docs_api`] plus [`run`]. Publishing
+//! consumer may rely on is [`docs_api`] plus [`run`] (`holder` is
+//! public and hidden, for its own integration tests only). Publishing
 //! `commands` wholesale would export ~45 modules' worth of
 //! functions and make the facade decorative.
 
 pub(crate) mod cli;
 pub(crate) mod commands;
+mod context;
 mod dispatch;
 pub(crate) mod examples;
+/// The per-terminal unlock holder (D.4a §3.10): the `apprafter __holder` process, its client and
+/// its wire protocol. Public for the integration tests only (`tests/holder_*.rs`); nothing
+/// outside this crate is meant to use it.
+#[doc(hidden)]
+pub mod holder;
+mod holder_window;
+mod limits_client;
+mod prompt;
+mod render;
+mod sandbox;
 mod startup;
+mod token;
+mod vault_access;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli_core::logging;
@@ -67,8 +81,8 @@ pub fn run() -> Result<()> {
     // No backtrace is rendered, and there is no knob that turns one
     // on: nothing below enables it, `CliError` captures no
     // `Backtrace`, and `miette::set_panic_hook()` is deliberately
-    // not called (a wizard abort should print "wizard aborted", not
-    // a trace). `RUST_BACKTRACE` therefore does NOT affect rendered
+    // not called (a wizard abort should print "operation cancelled",
+    // not a trace). `RUST_BACKTRACE` therefore does NOT affect rendered
     // diagnostics — an earlier version of this comment said it did,
     // and that claim reached the published docs before being caught.
     // If backtraces are ever wanted, they need a real implementation
@@ -96,10 +110,18 @@ pub fn run() -> Result<()> {
     // is what `parse()` does internally.
     let mut command = examples::attach(Cli::command());
     let mut matches = command.get_matches_mut();
+    // Before `from_arg_matches_mut`, which takes the values (and their sources) out.
+    let typed = dispatch::Typed::of(&matches);
+    // What a secret prompt names: the clap path, never argv (D.4a T61).
+    vault_access::set_command(&dispatch::command_path(&matches));
     let args = match Cli::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
         Err(error) => error.format(&mut command).exit(),
     };
+
+    // APPRAFTER_SANDBOX (tests, e2e walks, automated agents): refuse a location outside it
+    // before anything reads or writes the store, the startup checks included. Inert unless set.
+    sandbox::enforce(&context::ProcessEnv, &args.command)?;
 
     // The newer-release notice and the node-disk banner, both of which reach
     // outside this machine. Only now, after parsing: `--help`, `--version`
@@ -108,5 +130,9 @@ pub fn run() -> Result<()> {
     // command that goes beyond this machine itself (`startup`).
     startup::run_startup_checks(&args.command);
 
-    dispatch(args).map_err(miette::Report::new)
+    let result = dispatch(args, typed);
+    // D.4a T46: the store's key and the items this command opened go now, zeroed — the
+    // process's access is a static, which is never dropped (critic finding 13).
+    vault_access::forget_all();
+    result
 }

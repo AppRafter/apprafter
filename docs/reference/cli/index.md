@@ -60,11 +60,12 @@ specific release rather than scraping these pages.
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter db`](db.md) | — | Manage SharedDatabase CRs — a PostgreSQL database or a Redis keyspace several Applications bind, each with its own credential and its own access level. |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
-| [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
+| [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config and credentials, its cluster (the cached kubeconfig, the Kubernetes API, the node's SSH port) and this computer (restic, kubectl, helm, git, ssh, cue, DNS). |
 | [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, persistent-redis snapshots and JetStream stream snapshots to a plain local folder + `manifest.json`. |
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |
 | [`apprafter kubeconfig`](kubeconfig.md) | `kc` | Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. |
+| [`apprafter lock`](lock.md) | — | Lock this target store's secrets in an encrypted vault, or put them back in files. |
 | [`apprafter login`](login.md) | — | Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing. |
 | [`apprafter migration`](migration.md) | — | Inspect and approve / reject MigrationPlans. |
 | [`apprafter node`](node.md) | — | Node-level operations on the active target's cluster node. |
@@ -77,6 +78,7 @@ specific release rather than scraping these pages.
 | [`apprafter status`](status.md) | — | Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |
 | [`apprafter top`](top.md) | — | Where the cluster's CPU, memory and disk have gone |
+| [`apprafter unlock`](unlock.md) | — | Open an unlock window in this terminal: for `--timeout` minutes, restarted by each command that uses it, commands started from this terminal use the target store's secrets without asking. |
 | [`apprafter up`](up.md) | `bootstrap-all` | Stand a cluster up in one command: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap`. |
 | [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. |
 | [`apprafter volume`](volume.md) | — | Manage SharedVolume CRs — persistent volumes shared across multiple Applications. |

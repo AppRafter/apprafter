@@ -142,7 +142,7 @@ printf 'restic: %s\n' "$(command -v restic)"
 # Temp workspace
 # ---------------------------------------------------------------
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 SRC_KUBECONFIG="${TMPDIR_WORK}/kubeconfig-src"
 DST_KUBECONFIG="${TMPDIR_WORK}/kubeconfig-dst"
 CRED_FILE="${TMPDIR_WORK}/backup-creds.env"

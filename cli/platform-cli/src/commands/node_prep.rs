@@ -38,7 +38,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::user_data::{
     k3s_reservation_config, swap_enable_script, swap_kubelet_dropin, K3S_CONFIG_PATH,
     K3S_OOM_DROPIN, K3S_OOM_DROPIN_PATH, SKIP_NODE_SWAP_ENV, SWAP_KUBELET_DROPIN_PATH,
@@ -662,14 +662,13 @@ pub fn node_prep(yes: bool) -> Result<()> {
 
     let resolved = resolve_state_paths(None)?;
     let paths = resolved.paths;
-    let store = resolved.store;
     let state = State::load_or_default(&paths)?;
 
     let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
         return Err(no_provisioned_server_error());
     };
 
-    let token = resolve_hetzner_token(None, &store, None)?;
+    let token = crate::token::hetzner_token(None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
     let host = v4.ok_or_else(no_public_ipv4_error)?;
@@ -1286,14 +1285,13 @@ fn classify_state(
 pub fn status() -> Result<()> {
     let resolved = resolve_state_paths(None)?;
     let paths = resolved.paths;
-    let store = resolved.store;
     let state = State::load_or_default(&paths)?;
 
     let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
         return Err(no_provisioned_server_error());
     };
 
-    let token = resolve_hetzner_token(None, &store, None)?;
+    let token = crate::token::hetzner_token(None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
     let host = v4.ok_or_else(no_public_ipv4_error)?;

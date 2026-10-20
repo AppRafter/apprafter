@@ -2,17 +2,22 @@
 //! Integration tests for `apprafter volume` — help text and
 //! argument parsing without a cluster (offline-safe).
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 #[test]
 fn volume_help_lists_subcommands() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["volume", "--help"])
         .assert()
         .success()
@@ -23,7 +28,8 @@ fn volume_help_lists_subcommands() {
 
 #[test]
 fn volume_create_requires_size_flag() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["volume", "create", "my-vol"])
         .assert()
         .failure()
@@ -32,7 +38,8 @@ fn volume_create_requires_size_flag() {
 
 #[test]
 fn volume_list_help_shows_namespace_flag() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["volume", "list", "--help"])
         .assert()
         .success()
@@ -41,7 +48,8 @@ fn volume_list_help_shows_namespace_flag() {
 
 #[test]
 fn volume_rm_help_shows_yes_flag() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["volume", "rm", "--help"])
         .assert()
         .success()
@@ -50,7 +58,8 @@ fn volume_rm_help_shows_yes_flag() {
 
 #[test]
 fn volume_status_help_shows_name() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["volume", "status", "--help"])
         .assert()
         .success()

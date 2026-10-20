@@ -26,11 +26,12 @@ use cli_core::target::{
     default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
     TargetStorePaths,
 };
-use cli_core::{CliError, Result};
+use cli_core::{CliError, ProvisionStop, ProvisionedBy, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
-use crate::commands::{apply, cluster_bootstrap, kubeconfig};
+use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::{age_cache, apply, cluster_bootstrap, kubeconfig};
 
 /// Maximum time we wait for k3s + SSH to come up after `apply`
 /// before giving up on Phase 2. Hetzner Cloud cloud-init on a
@@ -42,7 +43,14 @@ const KUBECONFIG_POLL_TIMEOUT: Duration = Duration::from_secs(300);
 /// SSH with reconnects.
 const KUBECONFIG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&str>) -> Result<()> {
+/// `by` is the command running it, `up` itself or `restore --reprovision`: the one a stop on a
+/// lost age key tells the user to run again, before phase 1 or after it (review #6).
+pub fn run(
+    target_override: Option<&str>,
+    dry_run: bool,
+    server_type: Option<&str>,
+    by: ProvisionedBy,
+) -> Result<()> {
     info!(target_override, dry_run, "bootstrap-all invoked");
     let total_start = Instant::now();
 
@@ -62,6 +70,29 @@ pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&st
         &[&cli_core::tools::KUBECTL, &cli_core::tools::HELM],
         "apprafter bootstrap-all",
     )?;
+
+    // WI-457, D.4a T46: phase 0. Phase 2/3 caches the new kubeconfig and never replaces a
+    // lost key, so a lost key would stop this run there, after phase 1/3 created a server
+    // that bills; on a locked store the token and the store's recipient are asked for now,
+    // once. Same lesson again: check before spending anything.
+    let resolved = resolve_state_paths(target_override)?;
+    age_cache::check_before_provisioning(
+        &crate::context::legacy_context()?,
+        &resolved.target_name,
+        by,
+    )?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
+
+    // `restore --reprovision` says it is provisioning here, past every check, and not before
+    // it calls this: a run the check refuses says nothing was created, so it must not have
+    // said it started (WI-457).
+    if by == ProvisionedBy::RestoreReprovision {
+        println!(
+            "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
+            resolved.target_name
+        );
+    }
 
     // Phase 1/3 — apply. No spinner: apply itself spends most of
     // its time inside `provider.apply()` calling the Hetzner REST
@@ -84,7 +115,7 @@ pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&st
     // Phase 2/3 — kubeconfig poll. Our retry loop, no inner
     // subcommand output, so we get a clean indicatif spinner with
     // a live attempt counter + truncated last error.
-    let p2 = run_kubeconfig_phase(target_override)?;
+    let p2 = run_kubeconfig_phase(target_override, &resolved.target_name, by)?;
 
     // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
     // helm/kubectl print release notes, would clobber a spinner.
@@ -132,7 +163,12 @@ fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
     err
 }
 
-fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
+/// Phase 2 for `target` (`target_override` resolved), which `by` provisioned in phase 1.
+fn run_kubeconfig_phase(
+    target_override: Option<&str>,
+    target: &str,
+    by: ProvisionedBy,
+) -> Result<Duration> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} [2/3] k3s-ready    {wide_msg}")
@@ -155,8 +191,61 @@ fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
         Err(e) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
-            Err(failed(2, "k3s-ready", elapsed, e))
+            Err(failed(
+                2,
+                "k3s-ready",
+                elapsed,
+                after_provision(e, target, by),
+            ))
         }
+    }
+}
+
+/// Why phase 2's wait for the node ended without a kubeconfig.
+#[derive(Debug)]
+enum Unready {
+    /// An error waiting does not cure: a lost age key (WI-457).
+    Failed(CliError),
+    /// The wait ran out, after `attempts` fetches; `last_error` is the last one's.
+    TimedOut {
+        waited: Duration,
+        attempts: u32,
+        last_error: String,
+    },
+}
+
+/// Phase 2's error once `by` has provisioned `target` in phase 1 (the target `run` resolved,
+/// which the fetch resolves too). Each says what that leaves (a server that bills, no
+/// cluster-bootstrap) and names `by` to run again (review #6):
+///
+/// - a lost age key, once the key is back or `kubeconfig --refresh` has made a new one. The
+///   check before phase 1 refuses a key lost before the run, so this is a key that went
+///   missing during it;
+/// - a wait that ran out ([`CliError::K3sNotReady`]), once the node is up.
+///
+/// Any other error is unchanged.
+fn after_provision(unready: Unready, target: &str, by: ProvisionedBy) -> CliError {
+    match unready {
+        Unready::Failed(CliError::AgeKeyMissing {
+            path, lost_vault, ..
+        }) => CliError::AgeKeyMissing {
+            path,
+            target: target.to_string(),
+            stopped: Some(ProvisionStop::After { by }),
+            lost_vault,
+        },
+        Unready::Failed(other) => other,
+        Unready::TimedOut {
+            waited,
+            attempts,
+            last_error,
+        } => CliError::K3sNotReady {
+            target: target.to_string(),
+            by,
+            waited_secs: waited.as_secs(),
+            attempts,
+            last_error,
+        },
     }
 }
 
@@ -297,8 +386,51 @@ fn print_target_block(
 /// systemd unit is still coming up). Returns `Ok(())` on the first
 /// success — the YAML itself is cached in state by `fetch_and_cache`,
 /// so no further plumbing is needed for Phase 3.
-fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Result<()> {
-    let deadline = Instant::now() + KUBECONFIG_POLL_TIMEOUT;
+fn wait_for_kubeconfig(
+    target_override: Option<&str>,
+    pb: &ProgressBar,
+) -> std::result::Result<(), Unready> {
+    poll_kubeconfig(
+        pb,
+        KUBECONFIG_POLL_TIMEOUT,
+        KUBECONFIG_POLL_INTERVAL,
+        &mut || kubeconfig::fetch_and_cache(true, target_override),
+        &|addr| apiserver_listening(addr),
+        &SystemClock,
+    )
+}
+
+/// Where [`poll_kubeconfig`] reads the time and how it waits: [`SystemClock`] in the product; a
+/// clock its tests move themselves, so the attempts a wait allows are exact on any runner.
+trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, d: Duration);
+}
+
+/// `Instant::now` and `std::thread::sleep`.
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// [`wait_for_kubeconfig`]'s loop, with the fetch, the apiserver probe, the timings and the
+/// clock given, so a test drives it without a node or a real wait.
+fn poll_kubeconfig(
+    pb: &ProgressBar,
+    timeout: Duration,
+    interval: Duration,
+    fetch: &mut dyn FnMut() -> Result<String>,
+    listening: &dyn Fn(&str) -> bool,
+    clock: &dyn Clock,
+) -> std::result::Result<(), Unready> {
+    let deadline = clock.now() + timeout;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -310,35 +442,36 @@ fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Resul
         // NOT "the cluster is reachable". Without the second gate, [3/3]
         // cluster-bootstrap races a slow-booting node and fails
         // "Kubernetes cluster unreachable … :6443 connect: connection refused".
-        let err = match kubeconfig::fetch_and_cache(true, target_override) {
+        let err = match fetch() {
             Ok(yaml) => match apiserver_addr(&yaml) {
-                Some(addr) if apiserver_listening(&addr) => return Ok(()),
+                Some(addr) if listening(&addr) => return Ok(()),
                 Some(addr) => format!("apiserver {addr} not accepting connections yet"),
                 None => "fetched kubeconfig has no server URL yet".to_string(),
             },
+            // A lost age key does not come back by waiting: its help names
+            // `apprafter kubeconfig --refresh`, which asks before it makes a new one (WI-457).
+            Err(e @ CliError::AgeKeyMissing { .. }) => return Err(Unready::Failed(e)),
             Err(e) => format!("{e}"),
         };
         warn!(attempt, error = %err, "kubeconfig fetch failed; retrying");
         pb.set_message(format!(
             "attempt {attempt} — k3s not ready yet ({}); next retry in {}s",
             short_error(&err),
-            KUBECONFIG_POLL_INTERVAL.as_secs(),
+            interval.as_secs(),
         ));
-        if Instant::now() >= deadline {
-            return Err(timeout_error(attempt, &err));
+        let timed_out = |last_error| Unready::TimedOut {
+            waited: timeout,
+            attempts: attempt,
+            last_error,
+        };
+        if clock.now() >= deadline {
+            return Err(timed_out(err));
         }
-        std::thread::sleep(KUBECONFIG_POLL_INTERVAL);
-        if Instant::now() >= deadline {
-            return Err(timeout_error(attempt, &err));
+        clock.sleep(interval);
+        if clock.now() >= deadline {
+            return Err(timed_out(err));
         }
     }
-}
-
-fn timeout_error(attempt: u32, last_err: &str) -> CliError {
-    CliError::Other(format!(
-        "kubeconfig did not become reachable within {}s ({attempt} attempts); last error: {last_err}. Run `apprafter kubeconfig --refresh` once the cluster reports ready.",
-        KUBECONFIG_POLL_TIMEOUT.as_secs(),
-    ))
 }
 
 /// Parse `HOST:PORT` from the kubeconfig's `server: https://HOST:PORT` line.
@@ -404,7 +537,222 @@ fn short_error(msg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// A clock that moves only when [`poll_kubeconfig`] sleeps or a fetch says it took time, so
+    /// the attempts a wait allows are counted, never sampled from a runner's speed.
+    struct FakeClock {
+        start: Instant,
+        now: Cell<Instant>,
+        sleeps: Cell<u32>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            let start = Instant::now();
+            Self {
+                start,
+                now: Cell::new(start),
+                sleeps: Cell::new(0),
+            }
+        }
+
+        /// A fetch that takes `d`.
+        fn advance(&self, d: Duration) {
+            self.now.set(self.now.get() + d);
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.now.get() - self.start
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, d: Duration) {
+            self.sleeps.set(self.sleeps.get() + 1);
+            self.advance(d);
+        }
+    }
+
+    /// WI-457: `up` never replaces a lost age key, and does not wait it out either — the first
+    /// attempt ends the phase with the error whose help names `kubeconfig --refresh`.
+    #[test]
+    fn a_lost_age_key_ends_the_wait_at_once() {
+        let mut calls = 0;
+        let mut fetch = || {
+            calls += 1;
+            Err(CliError::AgeKeyMissing {
+                path: "/k/age.key".into(),
+                target: "prod".into(),
+                stopped: None,
+                lost_vault: None,
+            })
+        };
+        let clock = FakeClock::new();
+        let err = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            &mut fetch,
+            &|_| true,
+            &clock,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Unready::Failed(CliError::AgeKeyMissing { .. })),
+            "{err:?}"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(clock.sleeps.get(), 0, "a lost key is not waited out");
+    }
+
+    /// Review #6: phase 2's lost key names the target and the command that provisioned it, so
+    /// its help says what is left and what to run again; any other error passes through as it
+    /// was.
+    #[test]
+    fn a_lost_age_key_after_phase_1_names_the_command_to_run_again() {
+        for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
+            let err = after_provision(
+                Unready::Failed(CliError::AgeKeyMissing {
+                    path: "/k/age.key".into(),
+                    target: "prod".into(),
+                    stopped: None,
+                    lost_vault: None,
+                }),
+                "prod",
+                by,
+            );
+            assert!(
+                matches!(&err, CliError::AgeKeyMissing { path, target, stopped, .. }
+                    if path == "/k/age.key" && target == "prod"
+                        && *stopped == Some(ProvisionStop::After { by })),
+                "{err:?}"
+            );
+        }
+        let other = after_provision(
+            Unready::Failed(CliError::Other("ssh: refused".into())),
+            "prod",
+            ProvisionedBy::Up,
+        );
+        assert!(
+            matches!(&other, CliError::Other(m) if m == "ssh: refused"),
+            "{other:?}"
+        );
+    }
+
+    #[test]
+    fn any_other_failure_is_retried_until_the_apiserver_listens() {
+        let mut calls = 0;
+        let mut fetch = || {
+            calls += 1;
+            if calls < 3 {
+                Err(CliError::Other("ssh: connection refused".into()))
+            } else {
+                Ok("    server: https://10.0.0.5:6443\n".to_string())
+            }
+        };
+        let clock = FakeClock::new();
+        poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+            &mut fetch,
+            &|addr| addr == "10.0.0.5:6443",
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(clock.sleeps.get(), 2, "one sleep between two attempts");
+    }
+
+    /// WI-457 follow-up: a wait that runs out keeps the wait, the count of attempts and the
+    /// last error, and phase 2 then names the target and the command that provisioned it, whose
+    /// help says the server bills, cluster-bootstrap did not run, and to run the command again.
+    #[test]
+    fn a_wait_that_runs_out_names_the_target_the_command_and_the_last_error() {
+        let mut calls = 0u32;
+        let mut fetch = || {
+            calls += 1;
+            Err(CliError::Other("ssh: connection refused".into()))
+        };
+        let clock = FakeClock::new();
+        let unready = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+            &mut fetch,
+            &|_| true,
+            &clock,
+        )
+        .unwrap_err();
+        // Attempts at 0, 10, 20, 30, 40 and 50 ms; the sleep after the sixth reaches the
+        // deadline, and no attempt starts at it.
+        assert_eq!(calls, 6, "one attempt per interval until the wait ran out");
+        assert_eq!(clock.elapsed(), Duration::from_millis(60));
+        assert!(
+            matches!(&unready, Unready::TimedOut { waited, attempts, last_error }
+                if *waited == Duration::from_millis(60) && *attempts == calls
+                    && last_error == "ssh: connection refused"),
+            "{unready:?}"
+        );
+        for by in [ProvisionedBy::Up, ProvisionedBy::RestoreReprovision] {
+            let err = after_provision(
+                Unready::TimedOut {
+                    waited: Duration::from_secs(300),
+                    attempts: 30,
+                    last_error: "ssh: connection refused".into(),
+                },
+                "prod",
+                by,
+            );
+            assert!(
+                matches!(&err, CliError::K3sNotReady {
+                    target, by: named, waited_secs: 300, attempts: 30, last_error,
+                } if target == "prod" && *named == by && last_error == "ssh: connection refused"),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// The deadline's other side: an attempt that itself ends at the deadline is the last, and
+    /// no sleep follows it.
+    #[test]
+    fn an_attempt_that_ends_at_the_deadline_is_the_last_and_no_sleep_follows_it() {
+        let clock = FakeClock::new();
+        let mut calls = 0u32;
+        let mut fetch = || {
+            calls += 1;
+            clock.advance(Duration::from_millis(20));
+            Err(CliError::Other("ssh: connection refused".into()))
+        };
+        let unready = poll_kubeconfig(
+            &ProgressBar::hidden(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &mut fetch,
+            &|_| true,
+            &clock,
+        )
+        .unwrap_err();
+        // Attempt 1 from 0 to 20 ms, a sleep to 30; attempt 2 from 30 to 50 ms, the deadline.
+        assert_eq!(calls, 2);
+        assert_eq!(
+            clock.sleeps.get(),
+            1,
+            "no sleep after the attempt that met the deadline"
+        );
+        assert_eq!(clock.elapsed(), Duration::from_millis(50));
+        assert!(
+            matches!(&unready, Unready::TimedOut { attempts: 2, .. }),
+            "{unready:?}"
+        );
+    }
 
     #[test]
     fn apiserver_addr_parses_https_server_line() {

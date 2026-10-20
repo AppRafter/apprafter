@@ -4,6 +4,24 @@
 
 `Accepted` (2026-10-08). ADR for `plan.md` Phase D (sub-phase D.0).
 
+**Amended by [ADR 0068](0068-target-store-lock.md) (2026-10-12).**
+Four parts of the record below no longer describe the plan:
+
+- §5, the fourth bullet (the age identity and provider tokens move into the OS keyring): replaced.
+  Secrets stay in files by default; `apprafter lock on` moves one target store's secrets into an
+  encrypted vault, opened per terminal or by the desktop's unlock through a slot. There is no OS
+  keyring backend and no migration command, and the supersession of ADR 0030's "encryption out of
+  scope" note now covers locked stores only.
+- §5, the first bullet (the desktop locks behind OS authentication): on a locked store the same
+  unlock opens the vault through a slot, and on Linux the app's own password field replaces the
+  polkit prompt there, because polkit yields no key.
+- Alternatives, "Keep secrets as they are and lock the UI only": this is now the state of a store
+  that is not locked. The desktop says the lock then covers only the app's window, and
+  *Protect secrets* (`lock on`) encrypts the secrets, so the lock screen does not promise
+  protection the storage lacks.
+- Risks, "macOS Keychain and unsigned binaries": signing no longer decides where secrets are
+  stored; the Touch ID slot is staged after it.
+
 ## Context
 
 The `apprafter` CLI is the operator's interface to the platform. Its 86 visible leaf commands

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // One walk through the shell on the mock IPC: the lock screen, Unlock, the Targets view, a
-// target's every section, Settings and its theme switch, and Mod+L back to the lock screen.
+// target's every section (the Target section a screen, the rest planned), Settings and its theme
+// switch, and Mod+L back to the lock screen.
 import { expect, type Page, type TestInfo, test } from '@playwright/test';
 
 const SECTIONS = [
@@ -38,14 +39,20 @@ test('the shell, from the lock screen to the lock again', async ({ page }, info)
   await expect(page.getByRole('heading', { name: 'Open a cluster' })).toBeVisible();
   await shot(page, info, 'targets');
 
-  await page.getByRole('button', { name: /prod-eu/ }).click();
+  await page.getByRole('button', { name: 'Open prod-eu' }).click();
   await expect(page.getByRole('tab', { name: 'prod-eu' })).toHaveAttribute('aria-selected', 'true');
   for (const section of SECTIONS) {
     await page.getByRole('button', { name: section, exact: true }).click();
     await expect(page.getByRole('heading', { level: 1, name: section })).toBeVisible();
-    await expect(page.getByRole('heading', { name: /arrives? in D\.\d+\.$/ })).toBeVisible();
+    if (section === 'Target') {
+      // The Target section is a screen of its own (D.3): the target's card.
+      await expect(page.getByRole('region', { name: 'Target' })).toBeVisible();
+    } else {
+      await expect(page.getByRole('heading', { name: /arrives? in D\.\d+\.$/ })).toBeVisible();
+      if (section === 'Nodes') await shot(page, info, 'a planned section');
+    }
   }
-  await shot(page, info, 'a planned section');
+  await shot(page, info, 'the Target screen');
 
   await page.getByRole('button', { name: /^Settings/ }).click();
   const settings = page.getByRole('dialog', { name: 'Settings' });

@@ -1,5 +1,9 @@
 $ apprafter target ip
-[exit 0]
+[exit 1]
 [stdout]
-No provisioned server for the active target — run `apprafter up` first.
 [stderr]
+Error: apprafter::target::not_provisioned
+
+  × target `prod` has no provisioned server
+  help: Target `prod` has no server yet: `apprafter up` provisions one.
+

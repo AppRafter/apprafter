@@ -5,6 +5,9 @@
 //! comment in `state.rs` for the full rationale and the migration
 //! helper that smooths upgrades.
 
+pub mod seam;
 pub mod state;
 
-pub use state::{migrate_legacy_state_if_present, HetznerCloudState, State, StatePaths};
+pub use state::{
+    migrate_legacy_state_if_present, HetznerCloudState, SealedTo, State, StatePaths, Write,
+};

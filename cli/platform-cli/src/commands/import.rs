@@ -5,14 +5,16 @@
 //! location from per-cwd to per-target (see
 //! `commands::state_paths`).
 
-use cli_core::target::load_active_target_config;
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use std::path::PathBuf;
+
+use cli_core::target::{load_active_target_config, TargetStorePaths};
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
-use cli_state::{HetznerCloudState, State};
+use cli_state::{HetznerCloudState, State, StatePaths, Write};
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::{resolve_state_paths, write_state, write_state_recovering};
 
 pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<()> {
     info!(force, dry_run, target_override, "import invoked");
@@ -25,14 +27,13 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
     // `--force` is the rebuild-from-live flag, so it must also reach
     // the case where the file itself is unreadable. Without it the
     // behaviour is unchanged: an unparseable state.json is an error.
-    let (mut state, quarantined) = State::load_or_recover(&paths, force)?;
-    if let Some(backup) = &quarantined {
-        eprintln!(
-            "warning: state.json was unreadable and has been moved to {}. \
-             Rebuilding from the live provider objects.",
-            backup.display()
-        );
-    }
+    // Here such a file reads as empty; it is moved aside only when the
+    // rebuilt state is written, under the store lock (WI-487).
+    let (mut state, unreadable) = match State::load_or_default(&paths) {
+        Ok(state) => (state, false),
+        Err(_) if force => (State::default(), true),
+        Err(e) => return Err(e),
+    };
 
     let target_config = load_active_target_config(&target_store, target_override);
 
@@ -56,13 +57,11 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
         )));
     }
 
-    // Credential resolution chain (cli-dx-task.md §7).
-    let token = resolve_hetzner_token(None, &target_store, target_override)?;
+    // Credential resolution chain (cli-dx-task.md §7), through the core (D.4a b).
+    let token = crate::token::hetzner_token(target_override)?;
 
     if state.hetzner_cloud.is_some() && !force {
-        return Err(CliError::Other(
-            "state already contains hetzner_cloud; pass --force to overwrite".to_string(),
-        ));
+        return Err(already_imported());
     }
 
     // cluster_name precedence: state.json → target_config →
@@ -96,15 +95,80 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
         }
     };
 
-    print_summary(dry_run, &cluster, &snapshot);
-
     if dry_run {
+        if unreadable {
+            eprintln!(
+                "warning: {} is unreadable. Without --dry-run, `import --force` moves it \
+                 aside and rebuilds it from the live provider objects.",
+                paths.state_file().display()
+            );
+        }
+        print_summary(true, &cluster, &snapshot);
         return Ok(());
     }
 
-    state.hetzner_cloud = Some(snapshot);
-    state.save(&paths)?;
+    let moved = record_snapshot(&target_store, &paths, &state, snapshot.clone(), force)?;
+    if let Some(backup) = &moved {
+        eprintln!(
+            "warning: state.json was unreadable and has been moved to {}. \
+             Rebuilt from the live provider objects.",
+            backup.display()
+        );
+    }
+    print_summary(false, &cluster, &snapshot);
     Ok(())
+}
+
+fn already_imported() -> CliError {
+    CliError::Other("state already contains hetzner_cloud; pass --force to overwrite".to_string())
+}
+
+/// `import`'s fields, written into the state read again under the store lock (WI-487): the
+/// cluster's record rebuilt from the live provider objects (`snapshot`), and the provider,
+/// cluster name and region where the state records none (`seeds`, what this run resolved).
+/// The caches of the same server, and what sealed them, stay — a `kubeconfig --refresh` that
+/// landed while this run listed the project is not lost; those of another server go with that
+/// server's record. Without `force`, a cluster recorded meanwhile is refused, as one recorded
+/// before the run. With `force`, a state that does not parse is moved aside first, and where it
+/// went is returned.
+fn record_snapshot(
+    store: &TargetStorePaths,
+    paths: &StatePaths,
+    seeds: &State,
+    snapshot: HetznerCloudState,
+    force: bool,
+) -> Result<Option<PathBuf>> {
+    let change = |state: &mut State| {
+        if state.hetzner_cloud.is_some() && !force {
+            return Err(already_imported());
+        }
+        if state.provider.is_none() {
+            state.provider = seeds.provider.clone();
+        }
+        if state.cluster_name.is_none() {
+            state.cluster_name = seeds.cluster_name.clone();
+        }
+        if state.region.is_none() {
+            state.region = seeds.region.clone();
+        }
+        let mut rebuilt = snapshot;
+        let server_id = rebuilt.server_id;
+        rebuilt.carry_caches_from(
+            state
+                .hetzner_cloud
+                .as_ref()
+                .filter(|recorded| recorded.server_id == server_id),
+        );
+        state.hetzner_cloud = Some(rebuilt);
+        Ok(Write::Save)
+    };
+    if force {
+        let (_, moved) = write_state_recovering(store, paths, change)?;
+        Ok(moved)
+    } else {
+        write_state(store, paths, change)?;
+        Ok(None)
+    }
 }
 
 fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<HetznerCloudState>> {
@@ -159,6 +223,8 @@ fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<H
         kubeconfig_yaml: None,
         kubeconfig_age: None,
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     }))
 }
 
@@ -414,6 +480,114 @@ mod tests {
         assert!(snap.floating_ip_ids.is_empty());
     }
 
+    // ── WI-487: import's save beside a cache write ───────────────────────
+
+    use crate::commands::state_paths::testing::{
+        cache_kubeconfig, interleave, server, Scratch, YAML,
+    };
+    use cli_state::seam::WritePoint;
+
+    /// What `build_snapshot` makes of server `id`: its record, rebuilt, nothing cached.
+    fn snapshot_of(id: u64) -> HetznerCloudState {
+        HetznerCloudState {
+            ssh_key_ids: vec![7],
+            network_id: Some(100),
+            ..server(id)
+        }
+    }
+
+    /// WI-487: a cache written after import's first read, before its save, stays when import
+    /// records the same server — and goes with the old record when it records another.
+    #[test]
+    fn import_keeps_a_cache_of_the_same_server_written_while_it_listed() {
+        for (id, kept) in [(42, true), (43, false)] {
+            let s = Scratch::new();
+            let early = s.state();
+            let ctx = s.ctx.clone();
+            let other = interleave(WritePoint::BeforeLock, move |signal| {
+                cache_kubeconfig(&ctx, signal)
+            });
+            let moved = record_snapshot(&s.store, &s.paths, &early, snapshot_of(id), true).unwrap();
+            other.result().unwrap();
+            assert_eq!(moved, None);
+            let h = s.hetzner();
+            assert_eq!(
+                (h.server_id, h.ssh_key_ids, h.network_id),
+                (id, vec![7], Some(100))
+            );
+            let yaml = s.cached_kubeconfig(&s.ctx);
+            assert_eq!(yaml.as_deref(), kept.then_some(YAML), "server {id}");
+        }
+    }
+
+    /// WI-487: without `--force`, a cluster recorded after import's first read — an `apply`
+    /// in another terminal — is refused under the lock, as one recorded before, and stays.
+    #[test]
+    fn import_refuses_a_cluster_recorded_while_it_listed() {
+        let s = Scratch::new();
+        crate::commands::state_paths::write_state(&s.store, &s.paths, |state| {
+            state.hetzner_cloud = None;
+            Ok(Write::Save)
+        })
+        .unwrap();
+        let early = s.state();
+        let (store, paths) = (s.store.clone(), s.paths.clone());
+        let other = interleave(WritePoint::BeforeLock, move |_| {
+            crate::commands::state_paths::write_state(&store, &paths, |state| {
+                state.hetzner_cloud = Some(server(41));
+                Ok(Write::Save)
+            })
+        });
+        let err = record_snapshot(&s.store, &s.paths, &early, snapshot_of(42), false).unwrap_err();
+        other.result().unwrap();
+        assert!(err.to_string().contains("pass --force"), "{err}");
+        assert_eq!(s.hetzner(), server(41));
+    }
+
+    /// WI-487: import reads the state again and saves it while holding the store lock: a cache
+    /// write started then waits, and its cache lands in what import saved.
+    #[test]
+    fn a_cache_write_waits_for_import_s_save() {
+        let s = Scratch::new();
+        let early = s.state();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::Reread, move |signal| {
+            cache_kubeconfig(&ctx, signal)
+        });
+        record_snapshot(&s.store, &s.paths, &early, snapshot_of(42), true).unwrap();
+        other.result().unwrap();
+        let h = s.hetzner();
+        assert_eq!((h.ssh_key_ids, h.network_id), (vec![7], Some(100)));
+        assert_eq!(s.cached_kubeconfig(&s.ctx).as_deref(), Some(YAML));
+    }
+
+    /// WI-487: `import --force` moves a state that does not parse aside under the store lock,
+    /// and records the seeds and the snapshot in a fresh one.
+    #[test]
+    fn import_force_moves_an_unparsable_state_aside_under_the_lock() {
+        let s = Scratch::new();
+        std::fs::write(s.paths.state_file(), b"{ not json").unwrap();
+        let store = s.store.clone();
+        let held = interleave(WritePoint::Reread, move |_| {
+            cli_core::StoreLock::try_exclusive_for(&store, std::time::Duration::ZERO, |_| {})
+                .unwrap()
+                .is_none()
+        });
+        let seeds = State {
+            provider: Some("hetzner-cloud".into()),
+            cluster_name: Some("platform-1".into()),
+            ..Default::default()
+        };
+        let moved = record_snapshot(&s.store, &s.paths, &seeds, snapshot_of(42), true)
+            .unwrap()
+            .expect("moved aside");
+        assert!(held.result(), "the store lock was not held");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"{ not json");
+        let after = s.state();
+        assert_eq!(after.cluster_name.as_deref(), Some("platform-1"));
+        assert_eq!(after.hetzner_cloud, Some(snapshot_of(42)));
+    }
+
     #[test]
     fn print_summary_dry_run_branch_does_not_panic() {
         // Trivial smoke for the non-dry-run + dry-run branches and
@@ -431,6 +605,8 @@ mod tests {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         };
         print_summary(true, "cl", &s);
         print_summary(false, "cl", &s);

@@ -99,6 +99,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0065 | [two gaps in the manifest — probes, and JetStream tuning](./0065-probes-and-jetstream-tuning.md) | Accepted |
 | 0066 | [`SharedDatabase` — one database, one credential per consumer](./0066-shared-database.md) | Accepted |
 | 0067 | [AppRafter Desktop — the CLI's GUI twin over a shared `apprafter-core`](./0067-desktop-app-and-apprafter-core.md) | Accepted |
+| 0068 | [Target-store lock — a store's secrets in an encrypted vault, opened per terminal](./0068-target-store-lock.md) | Accepted |
 
 ## Writing a new record
 

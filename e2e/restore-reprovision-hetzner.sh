@@ -23,6 +23,8 @@
 # Env:
 #   HCLOUD_TOKEN_OLD                 — Hetzner token (project). REQUIRED.
 #   APPRAFTER_DR_SSH_PUBLIC_KEY_PATH — ssh public key path. REQUIRED.
+#   APPRAFTER_E2E_SSH_KEY            — the private half of that public key (the
+#                                      CLI's SSH fetch of the kubeconfig uses it). REQUIRED.
 #   APPRAFTER_DR_REGION              — region (default nbg1).
 #   APPRAFTER_HETZNER_SKIP_DESTROY=1 — keep the cluster up (debug; destroy by hand).
 #
@@ -246,11 +248,9 @@ deploy_cms() {
         --from-literal "${CMS_SECRET_KEY}=${CMS_SECRET_VALUE}" --namespace "$CMS_NS"
     wait_jsonpath secret "$CMS_NS" "$CMS_SECRET_NAME" '{.metadata.name}' "$CMS_SECRET_NAME" 180
     printf '  ok: FAKE PAYLOAD_SECRET sealed into ns %s\n' "$CMS_NS"
-    local bin="${REPO_ROOT}/cli/target/debug/apprafter"
-    [ -x "$bin" ] || ( cd "${REPO_ROOT}/cli" && cargo build --quiet --bin apprafter )
-    ( cd "${REPO_ROOT}/landing/cms" && "$bin" app add "$CMS_REPO" \
+    apprafter_in "${REPO_ROOT}/landing/cms" app add "$CMS_REPO" \
         --name "$CMS_APP" --branch master --path "$CMS_PATH" \
-        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive )
+        --namespace "$CMS_NS" --env "$CMS_ENV" --no-ping --no-interactive
     printf '  ok: CMS registered (public repo, --env %s)\n' "$CMS_ENV"
     wait_cms_ready
 }
@@ -265,7 +265,8 @@ unset HCLOUD_TOKEN || true
 unset APPRAFTER_SSH_PUBLIC_KEY || true
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"; mkdir -p "$APPRAFTER_CONFIG_DIR"
+e2e_isolate_store "${TMPDIR_WORK}"
+e2e_require_ssh_key --file "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH"
 export APPRAFTER_CONFIG_DIR
 RESTIC_REPO="${TMPDIR_WORK}/restic-repo"   # ON THE HOST — survives the destroy
 KC_FILE="${TMPDIR_WORK}/kubeconfig"
@@ -291,7 +292,7 @@ cleanup() {
             if [ "$n" = "0" ]; then
                 printf 'ok: project has ZERO servers after destroy (API-verified)\n' >&2
             else
-                printf 'LEAK WARNING: project reports %s server(s) after destroy — INSPECT https://console.hetzner.cloud AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
+                printf 'LEAK WARNING: project reports %s server(s) after destroy — INSPECT https://console.hetzner.com AND DELETE STRAGGLERS BY HAND\n' "$n" >&2
             fi
         fi
         rm -rf "$TMPDIR_WORK"
@@ -300,6 +301,7 @@ cleanup() {
         printf '\nAPPRAFTER_HETZNER_SKIP_DESTROY set — leaving the cluster UP.\n' >&2
         [ "$RR_CREATED" -eq 1 ] && printf 'Destroy by hand: APPRAFTER_CONFIG_DIR=%s apprafter destroy --yes --target %s\n' "$APPRAFTER_CONFIG_DIR" "$RR_TARGET" >&2
     fi
+    e2e_isolation_cleanup
     exit "$exit_code"
 }
 trap cleanup EXIT

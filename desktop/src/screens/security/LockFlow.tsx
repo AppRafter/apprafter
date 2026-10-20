@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// The store lock's flows (D.4a §3.14; WI-476): Protect, Finish and Stop protecting, on the IPC
+// calls. The Security page opens each as the app's own overlay (shell/AppOverlays.tsx): over
+// every view, outside every view's <Activity> (GOTCHA-158), under a scope its close ends — and
+// the lock, which unmounts the Shell. A plan a flow holds goes with that scope, never on an
+// effect's cleanup. A run's failure Stop protecting and Finish show in their place (WI-484 for
+// Finish) is kept for after the unlock when a lock comes while it shows (WI-483,
+// state/shownFailure.ts); Protect's is too.
+import { useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { ErrorPanel } from '../../components/ErrorPanel';
+import { Modal } from '../../components/Modal';
+import { useToast } from '../../components/Toast';
+import * as api from '../../ipc/api';
+import { uiErrorOf } from '../../ipc/api';
+import type { PlanView } from '../../ipc/generated/PlanView';
+import { holdPlan } from '../../ipc/heldPlans';
+import { rereadLock } from '../../state/lockInfo';
+import { type ProtectAction, STOP_TITLE, stopOutcome, stoppedSummary } from '../../state/lockText';
+import { usePlatform } from '../../state/platform';
+import { useScope } from '../../state/scope';
+import { useShownFailure } from '../../state/shownFailure';
+import { FinishProtectDialog } from './FinishProtectDialog';
+import { ProtectDialog } from './ProtectDialog';
+import { StopProtectingDialog } from './StopProtectingDialog';
+
+export interface LockFlowProps {
+  readonly action: ProtectAction;
+  readonly onClose: () => void;
+}
+
+/**
+ * The flow `action` opens: Protect (a store in files; or an interrupted Protect that wrote no
+ * vault, started over — its recovery key void); Finish (an interrupted Protect with its vault:
+ * both secrets); Stop protecting, or the finish of an interrupted one.
+ */
+export function LockFlow({ action, onClose }: LockFlowProps) {
+  const info = usePlatform();
+  const client = useQueryClient();
+  const done = () => rereadLock(client);
+  const { mode, protected: vault, store } = info.secrets;
+  if (action === 'protect' || (action === 'finish' && mode === 'locking' && !vault)) {
+    return (
+      <ProtectDialog
+        store={store}
+        restart={action === 'finish'}
+        plan={(password) => api.opPlanLockOn(password, null)}
+        keySaved={api.opRecoveryKeySaved}
+        confirmKey={api.opConfirmRecoveryKey}
+        copyKey={api.copyRecoveryKey}
+        onDone={done}
+        onClose={onClose}
+      />
+    );
+  }
+  if (action === 'finish' && mode === 'locking') {
+    return (
+      <FinishProtectDialog
+        store={store}
+        auth={info.auth}
+        plan={api.opPlanLockFinish}
+        onDone={done}
+        onClose={onClose}
+      />
+    );
+  }
+  return <StopFlow finishing={action === 'finish'} onDone={done} onClose={onClose} />;
+}
+
+/**
+ * Stop protecting: its plan asked once, held by its overlay's scope, confirmed with the store's
+ * secret.
+ */
+function StopFlow({
+  finishing,
+  onDone,
+  onClose,
+}: {
+  finishing: boolean;
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const scope = useScope();
+  const info = usePlatform();
+  const toast = useToast();
+  const [view, setView] = useState<PlanView | null>(null);
+  // The plan uses the shared age key (only for a cache, d4a-f Task 3): the dialog names it then.
+  const [needsKey, setNeedsKey] = useState(false);
+  // The plan refused (nothing ran), or the run's failure, in the dialog's place.
+  const [failure, showFailure] = useShownFailure();
+  // The run failed: the dialog's own close that follows leaves the failure shown.
+  const failed = useRef(false);
+  // One plan, however often the effect runs (StrictMode runs it twice).
+  const asked = useRef(false);
+  useEffect(() => {
+    if (asked.current) return;
+    asked.current = true;
+    api.opPlanLockOff().then(
+      ({ plan, needsKey: usesKey }) => {
+        if (scope.gone()) {
+          api.opDiscard(plan.opId).catch((e: unknown) => console.error('op_discard failed:', e));
+          return;
+        }
+        holdPlan(scope, plan.opId);
+        setNeedsKey(usesKey);
+        setView(plan);
+      },
+      (reason: unknown) => showFailure(uiErrorOf(reason)),
+    );
+  }, [scope, showFailure]);
+  if (failure !== null) {
+    return (
+      <Modal title={STOP_TITLE} width={520} onClose={onClose}>
+        <ErrorPanel error={failure.error} />
+      </Modal>
+    );
+  }
+  if (view === null) return null;
+  return (
+    <StopProtectingDialog
+      view={view}
+      needsKey={needsKey}
+      finishing={finishing}
+      auth={info.auth}
+      onDone={(result) => {
+        // What really happened: another run first, a back-out, a token kept, the key used (UI
+        // verifier M3; d4a-f Task 3).
+        toast({ message: stoppedSummary(stopOutcome(result)), end: 'done' });
+        onDone();
+      }}
+      onFailed={(error, change) => {
+        failed.current = true;
+        showFailure(error, change);
+        onDone();
+      }}
+      onClose={() => {
+        // A run that failed shows why, in the dialog's place.
+        if (!failed.current) onClose();
+      }}
+    />
+  );
+}

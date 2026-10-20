@@ -10,6 +10,12 @@ publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[features]
+# `StoreLock::unheld`, the guard of a store that cannot be locked, on demand: for the tests of
+# what refuses to write without the store's write lock (D.4a T28). Enabled only from
+# [dev-dependencies]; under resolver 2 it never reaches a shipped binary.
+test-support = []
+
 [dependencies]
 thiserror          = { workspace = true }
 miette             = { workspace = true }
@@ -34,6 +40,14 @@ tempfile           = { workspace = true }
 # locks" (ENOLCK, EOPNOTSUPP, ENOTSUP), which std reports uncategorised.
 # Already in the graph; no new crate.
 libc               = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `owner_only` (WI-472): the protected one-ACE DACL of every owner-only file
+# and directory — the token's user (Security, System_Threading), the DACL set
+# and read back (Security_Authorization), the file rights and the directory
+# open (Storage_FileSystem). The version apprafter-core and platform-cli take,
+# already in both locks (cli/, desktop/): an edge, no package.
+windows-sys        = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # Integration tests select a specific Application doc by name from a

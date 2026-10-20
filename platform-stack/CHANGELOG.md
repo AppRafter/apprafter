@@ -20,8 +20,8 @@
 ## Unreleased
 
 _Nothing pending. Note that this file has sections for 0.1.0,
-0.2.56 and 0.2.57 only — the versions between them were never
-written up here. Their operator-facing notes live in
+0.2.56, 0.2.57 and 0.2.82 only — the versions between them were
+never written up here. Their operator-facing notes live in
 `cue/compatibility.cue` (read by `PlatformController`, and the
 authoritative per-version record) and in
 `docs/changelog/history.md`._
@@ -43,6 +43,34 @@ authoritative per-version record) and in
   `compatibility: (currentVersion): #VersionRecord` — i.e. the
   current version MUST have a compatibility entry, caught at
   edit time before any CI runs.
+
+## 0.2.82 — operator rebuilt with rustls 0.23.46
+
+Classification **`safe`**. Operator + admission-webhook charts
+v0.2.53 → v0.2.54. No CLI release is needed for it, and the
+cue-cmp and backup-runner pins do not move.
+
+**What this release does.** The operator and the admission
+webhook are rebuilt with rustls 0.23.46 for RUSTSEC-2026-0346,
+-0347, -0348 and -0349. The operator source, its CRDs, RBAC and
+templates are those of v0.2.53; rustls (0.23.45 → 0.23.46) is the
+only Rust dependency that moves.
+
+**Which advisories apply.** RUSTSEC-2026-0349 does: the operator's
+TLS clients keep rustls' default session store, which recorded the
+key-exchange group a server picked before that server was
+authenticated. At worst a later connection loses its post-quantum
+key exchange, and only to a server that accepts a classical key
+share instead of asking for its preferred group. RUSTSEC-2026-0346
+needs a custom client session store and RUSTSEC-2026-0347 needs
+Encrypted Client Hello; neither is used. RUSTSEC-2026-0348 needs
+rustls' `brotli` feature, which is not enabled.
+
+**What an upgrading cluster sees.** The operator and the admission
+webhook restart once. No application, Postgres, Dragonfly or NATS
+pod restarts and no CRD moves. From 0.2.81 the upgrade applies
+without approval; from 0.2.80 or older it still waits for approval,
+because 0.2.81 on the way is `requires-restart`.
 
 ## 0.2.57 — shared backends can now shrink (2026-08-21)
 

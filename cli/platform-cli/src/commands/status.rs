@@ -37,6 +37,9 @@
 //! failing contract on a command people put in a shell prompt is a
 //! promise this does not make.
 
+use apprafter_core::lock::limits::{LimitClient, SshFacts};
+use apprafter_core::lock::{self, text, LockReport};
+use apprafter_core::secrets::SecretsMode;
 use cli_core::{CliError, Result, Tier};
 use cli_state::State;
 use serde_json::Value;
@@ -53,7 +56,7 @@ use crate::commands::platform::{
     backup_summary_lines, render_conditions_table, unhealthy_condition_rows, version_summary_line,
     PLATFORMSTACK_NAME, PLATFORMSTACK_NAMESPACE,
 };
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::resolve_state_paths_to_report;
 
 /// What the PlatformStack read produced. Three outcomes, not two: an
 /// unreachable cluster and a cluster with no PlatformStack are
@@ -70,7 +73,9 @@ pub(crate) enum PlatformRead<'a> {
 }
 
 pub fn run() -> Result<()> {
-    let resolved = resolve_state_paths(None)?;
+    // A report: a store other accounts can change is not refused here (WI-481); the cluster
+    // half below reads the kubeconfig as every cluster command does, and is refused there.
+    let resolved = resolve_state_paths_to_report(None)?;
     let state = State::load_or_default(&resolved.paths)?;
     // The target NAME, never the state. `?state` was inherited from the
     // skeleton this command replaced, where the whole struct was the
@@ -82,14 +87,18 @@ pub fn run() -> Result<()> {
 
     // The target's own configuration, for the fields the state file does
     // not carry. Best-effort: an unreadable target is not a reason to
-    // withhold the rest of the report.
-    let configured_tier = cli_core::target::load_target(&resolved.store, &resolved.target_name)
-        .ok()
-        .and_then(|t| t.config.default_tier);
+    // withhold the rest of the report. config.yaml only (D.4a b).
+    let configured_tier =
+        cli_core::target::load_target_config(&resolved.store, &resolved.target_name)
+            .ok()
+            .and_then(|c| c.default_tier);
 
     for line in target_header_lines(&resolved.target_name, &state, configured_tier.as_deref()) {
         println!("{line}");
     }
+    // D.4a T66, T73: where this store keeps its secrets, and this terminal's window. Never a
+    // prompt; the cluster half below asks as every cluster command does.
+    println!("{}", secrets_line(read_lock_report()));
 
     // The local half is already on screen, so from here every failure is
     // reported in place rather than returned. `?` on any of these would
@@ -192,6 +201,55 @@ pub(crate) fn target_header_lines(
         format!("  tier:     {}", text(tier)),
         format!("  provider: {}", text(state.provider.clone())),
     ]
+}
+
+/// The store's lock report for the `secrets:` line: this terminal's window as its holder says
+/// (`Status`, which restarts nothing), no limit asked for (so no ssh-agent is queried), and the
+/// error's own words when the store cannot be read. Never a prompt, never the vault opened.
+fn read_lock_report() -> std::result::Result<LockReport, String> {
+    let ctx = crate::context::diagnostic_context().map_err(|e| e.to_string())?;
+    let terminal = crate::holder_window::terminal_present();
+    let place = crate::holder_window::HolderPlace::of(&ctx);
+    let window =
+        crate::holder_window::window_state(&ctx, &place, terminal).map_err(|e| e.to_string())?;
+    let quiet = LimitClient::Cli {
+        terminal: None,
+        ssh: SshFacts::default(),
+    };
+    lock::status(&ctx, window, &quiet).map_err(|e| e.to_string())
+}
+
+/// The `secrets:` line under the header (D.4a §3.13): files, locked with its slots and this
+/// terminal's window, an interrupted lock (warn-styled), or why it cannot be read — a failed
+/// read never reads as a state.
+pub(crate) fn secrets_line(report: std::result::Result<LockReport, String>) -> String {
+    match report {
+        Ok(r) => match r.mode {
+            SecretsMode::Files => {
+                "  secrets:  in files (readable by any program running as you)".to_string()
+            }
+            SecretsMode::Locked => format!(
+                "  secrets:  locked ({}) · {}",
+                text::slot_kinds(&r.slots),
+                text::window_words(&r.window)
+            ),
+            SecretsMode::Locking => cli_core::style::warn(
+                "  secrets:  an earlier `apprafter lock on` did not finish — run it again, or \
+                 `apprafter lock off` to back out",
+            ),
+            SecretsMode::Unlocking => cli_core::style::warn(
+                "  secrets:  an earlier `apprafter lock off` did not finish — run it again",
+            ),
+        },
+        Err(why) => cannot_be_read(&why),
+    }
+}
+
+/// A lock state that cannot be read, as the `secrets:` line says it (never as a state).
+fn cannot_be_read(why: &str) -> String {
+    cli_core::style::warn(&format!(
+        "  secrets:  cannot be read ({why}) — `apprafter doctor` says more"
+    ))
 }
 
 /// The platform's own line, plus any condition a reader should look at.
@@ -487,6 +545,78 @@ mod tests {
         assert!(
             !lines[0].contains("none"),
             "a failed read must never render as nothing pending: {lines:?}"
+        );
+    }
+
+    use apprafter_core::lock::UnlockWindow;
+
+    fn report(mode: apprafter_core::secrets::SecretsMode, window: UnlockWindow) -> LockReport {
+        use apprafter_core::lock::SlotView;
+        use apprafter_core::secrets::LockSlotKind;
+        LockReport {
+            store: "~/.config/apprafter".into(),
+            store_id: Some("3f9c0a1b7d2e4c56".into()),
+            targets: vec!["prod".into()],
+            mode,
+            slots: vec![
+                SlotView {
+                    kind: LockSlotKind::Password,
+                    label: "lock password".into(),
+                    refused: None,
+                },
+                SlotView {
+                    kind: LockSlotKind::RecoveryKey,
+                    label: "recovery key".into(),
+                    refused: None,
+                },
+            ],
+            window_minutes: 5,
+            window,
+            limits: vec![],
+        }
+    }
+
+    /// D.4a §3.13: the `secrets:` line in every state; never a secret, never the vault.
+    #[test]
+    fn the_secrets_line_says_where_the_secrets_are() {
+        use apprafter_core::lock::HolderHardening;
+        use apprafter_core::secrets::SecretsMode as M;
+        let open = UnlockWindow::Open {
+            left_secs: 170,
+            minutes: 5,
+            holder_version: "0".into(),
+            hardening: HolderHardening {
+                non_dumpable: Some(true),
+                deny_attach: None,
+                core_off: true,
+                memory_locked: true,
+                process_dacl: None,
+            },
+        };
+        assert_eq!(
+            secrets_line(Ok(report(M::Files, UnlockWindow::NoTerminal))),
+            "  secrets:  in files (readable by any program running as you)"
+        );
+        assert_eq!(
+            secrets_line(Ok(report(M::Locked, open))),
+            "  secrets:  locked (password, recovery key) · unlocked in this terminal, 3 min left"
+        );
+        assert_eq!(
+            secrets_line(Ok(report(M::Locked, UnlockWindow::Closed))),
+            "  secrets:  locked (password, recovery key) · no unlock window in this terminal"
+        );
+        assert!(secrets_line(Ok(report(M::Locking, UnlockWindow::Closed)))
+            .contains("an earlier `apprafter lock on` did not finish — run it again, or `apprafter lock off` to back out"));
+        assert!(secrets_line(Ok(report(M::Unlocking, UnlockWindow::Closed)))
+            .contains("an earlier `apprafter lock off` did not finish — run it again"));
+        let unreadable = secrets_line(Err("the vault /s/vault is damaged: x".into()));
+        assert!(
+            unreadable.contains("cannot be read (the vault /s/vault is damaged: x)"),
+            "{unreadable}"
+        );
+        assert!(
+            !unreadable.contains("none") && !unreadable.contains("in files"),
+            "a failed read never reads as a state"
         );
     }
 }

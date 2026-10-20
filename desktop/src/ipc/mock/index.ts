@@ -9,25 +9,38 @@
 // each answer saying how long as `retryInMs`) — and Unlock finds no polkit agent (`no_agent`).
 // What the session tells the app (`?session=`): by default both its locks and its sleeps, as a
 // desktop session does; or one half, or nothing at all (no bus, as in WSL or a container), for
-// the settings' lock-on-sleep row.
-import type { InvokeArgs } from '@tauri-apps/api/core';
+// the settings' lock-on-sleep row. Operations run on ops.ts's engine (Rust's OperationManager):
+// a destructive plan asks the gesture the way unlocking does, by the same route and back-off.
+// The D.3 commands answer from targets.ts's store (three targets and an unreadable one), whose
+// verified-token drafts go on every lock and unlock, as Rust's do; flows.ts replaces four of its
+// read answers with richer data (the catalogue, the latencies, Doctor, the toolchain) and answers
+// the clipboard. The toolchain (`?tools=`): by default helm is missing; `found`, every tool is
+// (the panel with nothing to install). The target store's lock (`?secrets=`, lock.ts): in files
+// by default; a protected store's lock screen takes its lock password or recovery key, behind the
+// same back-off, and its Stop protecting asks for one. A test locks the store from a terminal under
+// the app (mockLockFromTerminal), or puts it back in files (mockUnlockFromTerminal), as Rust's
+// re-read then finds it and tells the page (STORE_CHANGED, D.4a F17); the Playwright smoke reaches
+// both through `window.__mockTerminal`.
 import { emit } from '@tauri-apps/api/event';
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import type { AppInfo } from '../generated/AppInfo';
 import type { AuthInfo } from '../generated/AuthInfo';
 import { ALLOWED_WHILE_LOCKED } from '../generated/commands';
 import { DESKTOP_ERROR_CODES } from '../generated/errors';
-import { LOCK_CHANGED } from '../generated/events';
+import { LOCK_CHANGED, STORE_CHANGED } from '../generated/events';
 import type { LockReason } from '../generated/LockReason';
 import type { LockState } from '../generated/LockState';
 import type { Os } from '../generated/Os';
+import type { SecretsMode } from '../generated/SecretsMode';
 import type { SessionEvents } from '../generated/SessionEvents';
 import type { Settings } from '../generated/Settings';
 import type { Theme } from '../generated/Theme';
 import type { UiError } from '../generated/UiError';
 import type { UnavailableReason } from '../generated/UnavailableReason';
-
-export { MOCK_TARGETS } from './fixtures';
+import { flowHandlers, MOCK_TOOLCHAIN_FOUND } from './flows';
+import { mockLock } from './lock';
+import { createMockOps, type Handler, type MockOps } from './ops';
+import { type MockStore, mockStore, namesIn, targetHandlers } from './targets';
 
 /** The one password the mock's password field accepts: a demo value, nobody's password. */
 export const MOCK_PASSWORD = 'apprafter';
@@ -51,18 +64,32 @@ export type MockAuth = 'os' | 'pam';
 /** Which of the session's signals reach the app: both, one of them, or none. */
 export type MockSession = 'both' | 'lock' | 'sleep' | 'none';
 
+/** The toolchain: a tool missing (the default), or every tool found. */
+export type MockTools = 'missing' | 'found';
+
 export interface MockOptions {
   readonly os?: Os;
   readonly theme?: Theme;
   /** `pam`: Linux's PAM route, whatever `os` says. */
   readonly auth?: MockAuth;
   readonly session?: MockSession;
+  readonly tools?: MockTools;
+  /** Where the target store keeps its secrets: files by default. */
+  readonly secrets?: SecretsMode;
+  /** `lost`: the store is locked and its vault is gone (O8; F20), whatever `secrets` says. */
+  readonly vault?: 'lost';
+  /**
+   * How long a mock operation takes before it reports, in milliseconds: long enough in dev
+   * mode (150 by default) to see it running; tests pass 0.
+   */
+  readonly opDelayMs?: number;
 }
 
 const OSES: readonly Os[] = ['windows', 'macos', 'linux'];
 const THEMES: readonly Theme[] = ['system', 'light', 'dark'];
 const AUTHS: readonly MockAuth[] = ['os', 'pam'];
 const SESSIONS: readonly MockSession[] = ['both', 'lock', 'sleep', 'none'];
+const TOOLS: readonly MockTools[] = ['missing', 'found'];
 
 const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
   both: { lock: true, sleep: true },
@@ -72,8 +99,9 @@ const SESSION_EVENTS: Record<MockSession, SessionEvents> = {
 };
 
 /**
- * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`;
- * an unknown value throws.
+ * `?os=windows|macos|linux&theme=system|light|dark&auth=os|pam&session=both|lock|sleep|none`
+ * `&tools=missing|found&secrets=files|locking|locked|unlocking&vault=lost`; an unknown value
+ * throws.
  */
 export function mockOptionsFromUrl(search: string): MockOptions {
   const params = new URLSearchParams(search);
@@ -89,11 +117,17 @@ export function mockOptionsFromUrl(search: string): MockOptions {
   const theme = pick('theme', THEMES);
   const auth = pick('auth', AUTHS);
   const session = pick('session', SESSIONS);
+  const tools = pick('tools', TOOLS);
+  const secrets = pick('secrets', ['files', 'locking', 'locked', 'unlocking'] as const);
+  const vault = pick('vault', ['lost'] as const);
   return {
     ...(os && { os }),
     ...(theme && { theme }),
     ...(auth && { auth }),
     ...(session && { session }),
+    ...(tools && { tools }),
+    ...(secrets && { secrets }),
+    ...(vault && { vault }),
   };
 }
 
@@ -163,6 +197,60 @@ const unavailable = (reason: UnavailableReason): UiError => ({
   fields: { reason },
 });
 
+/** The engine of the last installMockIpc. */
+let current: MockOps | null = null;
+
+/** The target store of the last installMockIpc. */
+let currentStore: MockStore | null = null;
+
+/** The terminal lock of the last installMockIpc (mockLockFromTerminal). */
+let currentTerminalLock: (() => Promise<LockState>) | null = null;
+
+/** The terminal `lock off` of the last installMockIpc (mockUnlockFromTerminal). */
+let currentTerminalUnlock: (() => Promise<LockState>) | null = null;
+
+/** The engine of the last installMockIpc; tests register plans and reads through it. */
+export function mockOps(): MockOps {
+  if (current === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return current;
+}
+
+/**
+ * The target store of the last installMockIpc: tests change a target there as the CLI would
+ * behind the app's back (a key path pointed elsewhere, a target removed).
+ */
+export function mockTargetStore(): MockStore {
+  if (currentStore === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentStore;
+}
+
+/**
+ * A terminal's `apprafter lock on` under the app (D.4a T74): the mock's store is protected from
+ * now, and the app locks as Rust's re-read locks it (`secrets_locked`), unless it is locked
+ * already. The answer is the lock state that results.
+ */
+export function mockLockFromTerminal(): Promise<LockState> {
+  if (currentTerminalLock === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentTerminalLock();
+}
+
+/**
+ * A terminal's `apprafter lock off` under the app (D.4a F17, D-5): the mock's store is in files
+ * from now, and Rust's re-read tells the page. A locked app stays locked while its lock is in
+ * effect — the system's way opens it now — and unlocks when it is not, as Rust's `set_protected`
+ * does. The answer is the lock state that results.
+ */
+export function mockUnlockFromTerminal(): Promise<LockState> {
+  if (currentTerminalUnlock === null) throw new Error('mock IPC: installMockIpc() has not run');
+  return currentTerminalUnlock();
+}
+
+/** What the Playwright smoke calls from the page: a terminal's `lock on` and `lock off`. */
+export interface MockTerminal {
+  readonly lockOn: () => Promise<LockState>;
+  readonly lockOff: () => Promise<LockState>;
+}
+
 export function installMockIpc(options: MockOptions = {}): void {
   const os = options.os ?? 'macos';
   const auth = options.auth === 'pam' ? PAM : AUTH[os];
@@ -182,6 +270,10 @@ export function installMockIpc(options: MockOptions = {}): void {
   let lock = stateOf('startup');
 
   const transition = async (reason: LockReason | null) => {
+    // Rust's lock hook, on every lock and unlock: plans dropped, reads cancelled, drafts
+    // dropped, every subscription ended.
+    engine.transition();
+    store.drafts.clear();
     seq += 1;
     lock = stateOf(reason);
     await emit(LOCK_CHANGED, lock);
@@ -197,32 +289,37 @@ export function installMockIpc(options: MockOptions = {}): void {
       ...uiError(DESKTOP_ERROR_CODES.AUTH_FAILED, 'authentication failed'),
       fields,
     });
-  const checkPassword = (password: unknown) => {
-    const now = performance.now();
-    // Turned away unchecked: nothing was said, and the right password does not help.
-    if (now < refusedUntil) return failed({ exhausted: true, retryInMs: refusedUntil - now });
-    if (password === MOCK_PASSWORD) {
+  /** A field's check against what `opens`, behind Rust's one back-off; a refusal says `said`. */
+  const verifyWith =
+    (opens: (password: unknown) => boolean, said: readonly string[]) =>
+    (password: unknown): Promise<void> => {
+      const now = performance.now();
+      // Turned away unchecked: nothing was said, and the right password does not help.
+      if (now < refusedUntil) return failed({ exhausted: true, retryInMs: refusedUntil - now });
+      if (opens(password)) {
+        failures = 0;
+        return Promise.resolve();
+      }
+      failures += 1;
+      if (failures < MOCK_BACKOFF.failures) {
+        return failed({ exhausted: false, messages: [...said] });
+      }
       failures = 0;
-      return transition(null);
-    }
-    failures += 1;
-    if (failures < MOCK_BACKOFF.failures) {
-      return failed({ exhausted: false, messages: [MOCK_PAM_SAYS] });
-    }
-    failures = 0;
-    refusedUntil = now + MOCK_BACKOFF.refusalMs;
-    return failed({
-      exhausted: true,
-      retryInMs: MOCK_BACKOFF.refusalMs,
-      messages: [MOCK_PAM_SAYS],
-    });
-  };
+      refusedUntil = now + MOCK_BACKOFF.refusalMs;
+      return failed({
+        exhausted: true,
+        retryInMs: MOCK_BACKOFF.refusalMs,
+        messages: [...said],
+      });
+    };
+  /** The PAM field's check, for unlocking and for a destructive plan's gesture alike. */
+  const verifyPassword = verifyWith((password) => password === MOCK_PASSWORD, [MOCK_PAM_SAYS]);
 
   const appInfo = (): AppInfo => ({
     os,
     desktopVersion: '0.0.0-mock',
     coreVersion: '0.0.0-mock',
-    secretBackend: 'file',
+    secrets: lockStore.secrets(),
     account: 'alex',
     host: 'workstation',
     auth,
@@ -239,14 +336,58 @@ export function installMockIpc(options: MockOptions = {}): void {
     return null;
   };
 
-  const notFound = (args: InvokeArgs | undefined) => {
-    const opId = (args as { opId?: number } | undefined)?.opId;
-    return Promise.reject(
-      uiError(DESKTOP_ERROR_CODES.PLAN_NOT_FOUND, `No plan or operation ${opId} (mock IPC).`),
-    );
+  // A destructive plan's gesture, by the unlock's route: on the PAM route the field (a prompt
+  // finds no agent), elsewhere the OS's own prompt (the field is refused). Each refusal here is
+  // one after which Rust keeps the plan.
+  const engine = createMockOps({
+    delayMs: options.opDelayMs ?? 150,
+    gesture: (password) => {
+      if (auth.passwordField) {
+        return password === undefined
+          ? Promise.reject(unavailable('no_agent'))
+          : verifyPassword(password);
+      }
+      return password === undefined
+        ? Promise.resolve()
+        : Promise.reject(unavailable('use_system_prompt'));
+    },
+    storeSecret: (password) =>
+      password === undefined
+        ? Promise.reject(unavailable('use_password_field'))
+        : verifyStoreSecret(password),
+  });
+  current = engine;
+  const store = mockStore();
+  currentStore = store;
+  const d3 = targetHandlers(engine, store);
+  const lockStore = mockLock(
+    engine,
+    options.secrets ?? 'files',
+    () => namesIn(store),
+    options.vault === 'lost',
+  );
+  // Rust's gate for the store's secret: one back-off with the PAM field's, no PAM words.
+  const verifyStoreSecret = verifyWith(lockStore.opens, []);
+  // As Rust's re-read: the lock follows the store first, then the page is told it changed.
+  currentTerminalLock = async () => {
+    lockStore.lockFromTerminal();
+    const state = lock.locked ? lock : await transition('secrets_locked');
+    await emit(STORE_CHANGED, null);
+    return state;
+  };
+  currentTerminalUnlock = async () => {
+    lockStore.unlockFromTerminal();
+    const inEffect = settings.lockEnabled && auth.available;
+    const state = lock.locked && !inEffect ? await transition(null) : lock;
+    await emit(STORE_CHANGED, null);
+    return state;
+  };
+  (window as unknown as { __mockTerminal?: MockTerminal }).__mockTerminal = {
+    lockOn: mockLockFromTerminal,
+    lockOff: mockUnlockFromTerminal,
   };
 
-  const handlers: Record<string, (args: InvokeArgs | undefined) => unknown> = {
+  const handlers: Record<string, Handler> = {
     app_info: appInfo,
     settings_get: () => settings,
     settings_set: async (args) => {
@@ -264,24 +405,31 @@ export function installMockIpc(options: MockOptions = {}): void {
     // As Rust: unlocked already, nothing is asked or checked.
     unlock: () => {
       if (!lock.locked) return lock;
+      // D.4a T75: on a protected store the OS opens nothing; the field is the way.
+      if (lockStore.secrets().protected) return Promise.reject(unavailable('use_password_field'));
       if (auth.passwordField) return Promise.reject(unavailable('no_agent'));
       return transition(null);
     },
     unlock_with_password: (args) => {
       if (!lock.locked) return lock;
+      const typed = (args as { password?: unknown } | undefined)?.password;
+      if (lockStore.secrets().protected)
+        return verifyStoreSecret(typed).then(() => transition(null));
       if (!auth.passwordField) return Promise.reject(unavailable('use_system_prompt'));
-      return checkPassword((args as { password?: unknown } | undefined)?.password);
+      return verifyPassword(typed).then(() => transition(null));
     },
     activity: () => null,
     quit: () => null,
-    op_list: () => [],
-    op_subscribe: notFound,
-    op_unsubscribe: () => null,
-    op_cancel: notFound,
-    op_discard: () => null,
-    op_execute: notFound,
+    ...engine.handlers,
     window_ready: () => null,
     theme_apply: () => null,
+    ...d3,
+    ...lockStore.handlers,
+    // Replaces exactly four of D.3d's read answers and adds the clipboard (flows.ts).
+    ...flowHandlers(engine, store, d3),
+    ...(options.tools === 'found' && {
+      toolchain_status: () => structuredClone(MOCK_TOOLCHAIN_FOUND),
+    }),
     'plugin:window|minimize': () => null,
     'plugin:window|toggle_maximize': toggleMaximize,
     'plugin:window|internal_toggle_maximize': toggleMaximize,

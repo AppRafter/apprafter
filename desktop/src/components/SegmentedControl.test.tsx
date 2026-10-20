@@ -89,4 +89,45 @@ describe('SegmentedControl', () => {
     expect(onChange).not.toHaveBeenCalled();
     expect((radio('Dark') as HTMLButtonElement).disabled).toBe(true);
   });
+
+  test('an option not offered is shown with its reason, and neither a click nor a key reaches it', async () => {
+    const onChange = mock();
+    function AutoLock() {
+      const [value, setValue] = useState<'5' | '30' | 'never'>('30');
+      return (
+        <SegmentedControl
+          ariaLabel="Auto-lock"
+          value={value}
+          options={[
+            { value: '5', label: '5 min' },
+            { value: '30', label: '30 min' },
+            {
+              value: 'never',
+              label: 'Never',
+              disabled: true,
+              title: 'Not while secrets are protected.',
+            },
+          ]}
+          onChange={(v) => {
+            setValue(v);
+            onChange(v);
+          }}
+        />
+      );
+    }
+    render(<AutoLock />);
+    const user = userEvent.setup();
+    const never = radio('Never');
+    expect(never.getAttribute('aria-disabled')).toBe('true');
+    expect(never.getAttribute('title')).toBe('Not while secrets are protected.');
+    await user.click(never);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(radio('30 min').getAttribute('aria-checked')).toBe('true');
+    // From 30 min, the next option is Never, not offered: the arrow wraps to 5 min.
+    radio('30 min').focus();
+    await user.keyboard('{ArrowRight}');
+    expect(onChange).toHaveBeenLastCalledWith('5');
+    await user.keyboard('{End}');
+    expect(onChange).toHaveBeenLastCalledWith('30');
+  });
 });

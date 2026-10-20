@@ -6,12 +6,16 @@
 //! these tests cover the dry-run plan output and the clap surface
 //! contract.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
 #[test]
@@ -23,11 +27,9 @@ fn bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls() {
     // developer's real `~/.config/apprafter/` target store.
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    cli()
+    let sp = Spawn::new().with_store(config_dir.path());
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", config_dir.path())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_HCLOUD_BASE_URL")
         .args(["bootstrap-all", "--dry-run"])
         .assert()
         .success()
@@ -45,10 +47,9 @@ fn bootstrap_all_dry_run_with_empty_store_prints_onboarding_hint() {
     // pointing at `apprafter target add`.
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    cli()
+    let sp = Spawn::new().with_store(config_dir.path());
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", config_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .args(["bootstrap-all", "--dry-run"])
         .assert()
         .success()
@@ -63,10 +64,9 @@ fn bootstrap_all_dry_run_with_target_override_labels_it_clearly() {
     // override label.
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    cli()
+    let sp = Spawn::new().with_store(config_dir.path());
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", config_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .args(["bootstrap-all", "--dry-run", "--target", "work"])
         .assert()
         .success()
@@ -80,10 +80,9 @@ fn bootstrap_all_dry_run_with_active_target_resolves_name_and_config() {
     // plan can pick up its name + provider/region/tier from disk.
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    cli()
+    let sp = Spawn::new().with_store(config_dir.path());
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", config_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
             "add",
@@ -102,10 +101,8 @@ fn bootstrap_all_dry_run_with_active_target_resolves_name_and_config() {
         .assert()
         .success();
 
-    cli()
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", config_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .args(["bootstrap-all", "--dry-run"])
         .assert()
         .success()
@@ -123,7 +120,8 @@ fn bootstrap_all_dry_run_with_active_target_resolves_name_and_config() {
 
 #[test]
 fn bootstrap_all_help_documents_dry_run_and_target_flags() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["bootstrap-all", "--help"])
         .assert()
         .success()
@@ -133,7 +131,8 @@ fn bootstrap_all_help_documents_dry_run_and_target_flags() {
 
 #[test]
 fn bootstrap_all_rejects_unknown_flag() {
-    cli()
+    let sp = Spawn::new();
+    cli(&sp)
         .args(["bootstrap-all", "--no-such-flag"])
         .assert()
         .failure()

@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { emit } from '@tauri-apps/api/event';
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, getConfig, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { App } from './App';
 import { DESKTOP_ERROR_CODES } from './ipc/generated/errors';
@@ -12,6 +12,7 @@ import type { Quitting } from './ipc/generated/Quitting';
 import type { Settings } from './ipc/generated/Settings';
 import { resetOperations } from './ipc/operations';
 import { appInfo, authInfo, lockState, settings } from './test/fixtures';
+import { settleIpc, until } from './test/settle';
 
 let calls: { cmd: string; args: unknown }[];
 let appInfoAnswer: () => unknown;
@@ -19,6 +20,9 @@ let lockAnswer: () => unknown;
 let settingsAnswer: () => unknown;
 /** The page theme when the page said it was ready. */
 let themeAtReveal: string | undefined;
+/** Settled once the page asks window_ready. */
+let windowShown: Promise<void>;
+let windowShows: () => void;
 
 beforeEach(() => {
   calls = [];
@@ -26,6 +30,9 @@ beforeEach(() => {
   lockAnswer = () => lockState({ locked: false });
   settingsAnswer = () => settings();
   themeAtReveal = undefined;
+  windowShown = new Promise((resolve) => {
+    windowShows = resolve;
+  });
   mockWindows('main');
   mockIPC(
     (cmd, args) => {
@@ -34,7 +41,12 @@ beforeEach(() => {
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
-      if (cmd === 'window_ready') themeAtReveal = document.documentElement.dataset.theme;
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
+      if (cmd === 'window_ready') {
+        themeAtReveal = document.documentElement.dataset.theme;
+        windowShows();
+      }
       return null;
     },
     { shouldMockEvents: true },
@@ -43,16 +55,28 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await settleIpc();
   resetOperations();
   clearMocks();
   delete document.documentElement.dataset.theme;
 });
 
 const paint = () => act(() => new Promise((resolve) => setTimeout(resolve, 50)));
-/** Long enough for anything the page would do on its own: answers, effects, their timers. */
+/**
+ * Long enough for anything the page would do on its own: answers, effects, their timers. Only
+ * before what must NOT have happened: a slow machine can only make such a check miss, never
+ * fail it. What must have happened is waited for as an event (`shown`).
+ */
 const idle = async () => {
   for (let turn = 0; turn < 4; turn += 1) await paint();
+};
+/**
+ * The page asked window_ready, then a turn passed in which nothing more was asked: the event
+ * itself, never a time (GOTCHA-332). Awaited as findBy* awaits, so React runs meanwhile.
+ */
+const shown = async () => {
+  await getConfig().asyncWrapper(() => windowShown);
+  await act(() => settleIpc());
 };
 const count = (cmd: string) => calls.filter((c) => c.cmd === cmd).length;
 
@@ -74,7 +98,7 @@ const refusal = (message: string) =>
 test('unlocked, the app opens on the Targets view and shows its window once', async () => {
   render(<App />);
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
-  await paint();
+  await shown();
   expect(count('app_info')).toBe(1);
   expect(count('window_ready')).toBe(1);
 });
@@ -85,7 +109,7 @@ test('locked at start, the app is the lock screen, in the chosen theme', async (
   render(<App />);
   expect(await screen.findByRole('heading', { name: 'AppRafter is locked' })).toBeDefined();
   expect(screen.queryByRole('heading', { name: 'Open a cluster' })).toBeNull();
-  await paint();
+  await shown();
   expect(document.documentElement.dataset.theme).toBe('light');
   expect(calls.find((c) => c.cmd === 'theme_apply')?.args).toEqual({ theme: 'light' });
   expect(calls.filter((c) => c.cmd === 'plugin:window|set_theme')).toEqual([]);
@@ -97,7 +121,7 @@ test('the window shows without an animation frame: WebKitGTK runs none while it 
   try {
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
-    await paint();
+    await shown();
     expect(count('window_ready')).toBe(1);
   } finally {
     globalThis.requestAnimationFrame = frame;
@@ -113,7 +137,7 @@ test('the window shows only once there is a first screen to show', async () => {
   expect(count('window_ready')).toBe(0);
   await act(async () => lock.resolve(lockState({ locked: false })));
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
-  await paint();
+  await shown();
   expect(count('window_ready')).toBe(1);
 });
 
@@ -126,7 +150,8 @@ test('the window shows only once the theme is applied: no dark page before a lig
   await idle();
   expect(count('window_ready')).toBe(0);
   await act(async () => stored.resolve(settings({ theme: 'light' })));
-  await waitFor(() => expect(count('window_ready')).toBe(1));
+  await shown();
+  expect(count('window_ready')).toBe(1);
   expect(themeAtReveal).toBe('light');
 });
 
@@ -134,7 +159,7 @@ test('settings that cannot be read leave the default theme, and the window shows
   settingsAnswer = () => refusal('settings.json is unreadable');
   render(<App />);
   expect(await screen.findByRole('heading', { name: 'Open a cluster' })).toBeDefined();
-  await paint();
+  await shown();
   expect(count('window_ready')).toBe(1);
 });
 
@@ -171,7 +196,7 @@ test('when app_info fails, the error shows under a title bar, and the window sho
   expect((await screen.findByRole('alert')).textContent).toContain('the shell has not started yet');
   // Without decorations (Windows) the bar is what moves the window and closes it.
   expect(document.querySelector('header.titlebar')).not.toBeNull();
-  await paint();
+  await shown();
   expect(count('window_ready')).toBe(1);
   // The theme applies above the platform gate, so the error has it too.
   expect(themeAtReveal).toBe('light');
@@ -210,6 +235,8 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
       if (cmd === 'lock_status') return lockAnswer();
       if (cmd === 'settings_get') return settingsAnswer();
       if (cmd === 'op_list') return [];
+      if (cmd === 'target_list')
+        return { targets: [], unreadable: [], cliDefault: { status: 'unset' } };
       return null;
     },
     { shouldMockEvents: true },
@@ -236,6 +263,11 @@ test('Linux without a polkit agent: the field comes after the refusal, and no lo
   expect(screen.queryByLabelText('System password')).toBeNull();
   await idle();
   expect(screen.queryByLabelText('System password')).toBeNull();
+  // What must have happened, waited for as such (GOTCHA-332), and nothing more after it.
+  await until('the lock read app_info again', () => count('app_info') === 4);
+  await act(() => settleIpc());
   expect(screen.getByRole('button', { name: 'Unlock' }).textContent).toBe('Unlock');
-  expect(count('app_info')).toBe(3);
+  // The start, the refusal, the unlock (D.4a F17: the first views after it read it again) and
+  // the lock.
+  expect(count('app_info')).toBe(4);
 });

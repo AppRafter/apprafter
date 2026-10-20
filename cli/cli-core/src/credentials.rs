@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! Credential resolution chain (cli-dx-task.md §7).
+//! The SSH public key a provisioning command sends (cli-dx-task.md §7):
+//! `APPRAFTER_SSH_PUBLIC_KEY` (the key body inline), else the key file the
+//! target's `config.yaml` names (`--target`, else the active target).
 //!
-//! Operational commands (`apprafter apply` / `destroy` / `import`
-//! / ...) need a Hetzner Cloud API token + (sometimes) an SSH
-//! public key. There are three places those values can come from,
-//! in priority order:
-//!
-//!   1. **CLI flag** — `--token <X>` / future `--ssh-key <path>`
-//!      flags. Highest priority: an operator typing the flag is
-//!      explicit about what they want for this one invocation.
-//!   2. **Env var** — `HCLOUD_TOKEN` / `APPRAFTER_SSH_PUBLIC_KEY`
-//!      (legacy). The pre-target-store workflow; preserved for CI
-//!      pipelines that already export these.
-//!   3. **Active target's credentials.yaml** — the post-target-
-//!      store path. Picks up the value the wizard or
-//!      `apprafter target add` wrote into
-//!      `~/.config/apprafter/targets/<active>/credentials.yaml`.
-//!      Honours `--target <name>` override.
-//!
-//! Resolution failure is a typed `CliError::Other` with a hint
-//! listing every path the user could take to fix it — no silent
-//! fallback to a placeholder. Future Track A.10 swaps the
-//! free-form messages for miette-shaped diagnostics; the
-//! resolver signatures stay the same.
+//! The Hetzner token is not resolved here any more: every command reads it
+//! through the shared core (`apprafter_core::target::hetzner_token`, through
+//! its secret store; D.4a b). `HCLOUD_TOKEN_ENV` stays the one name clap's
+//! `#[arg(env)]` annotations and the core's `Context` read.
 
 use std::path::Path;
 
-use crate::target::{load_global_config, load_target, TargetStorePaths};
+use crate::target::{load_global_config, load_target_config, TargetStorePaths};
 use crate::{CliError, Result};
 
 /// Env-var name clap uses for the Hetzner Cloud API token on the
@@ -39,55 +23,6 @@ pub const HCLOUD_TOKEN_ENV: &str = "HCLOUD_TOKEN";
 /// inline. Pre-target-store CI scripts export the literal `ssh-
 /// ed25519 AAAA…` string under this name.
 pub const SSH_PUBLIC_KEY_ENV: &str = "APPRAFTER_SSH_PUBLIC_KEY";
-
-/// Resolve the Hetzner Cloud API token through the §7 chain.
-///
-/// `cli_flag`: highest-priority override (e.g., future `--token`
-/// flag). Pass `None` when the command doesn't expose such a
-/// flag yet.
-///
-/// `paths`: target-store locator. Production callers build it
-/// from `default_config_root()?`; tests redirect via
-/// `APPRAFTER_CONFIG_DIR`.
-///
-/// `target_override`: per-invocation `--target <name>` override.
-/// `None` falls back to the active target.
-///
-/// Returns the resolved token string on success. When no token is
-/// found anywhere, the `CliError::Other` payload enumerates every
-/// path the user can take next (flag / env / `apprafter target
-/// add`); a target the store does not have is
-/// `CliError::TargetNotFound`.
-pub fn resolve_hetzner_token(
-    cli_flag: Option<&str>,
-    paths: &TargetStorePaths,
-    target_override: Option<&str>,
-) -> Result<String> {
-    if let Some(t) = cli_flag {
-        if !t.is_empty() {
-            return Ok(t.to_string());
-        }
-    }
-    if let Ok(t) = std::env::var(HCLOUD_TOKEN_ENV) {
-        if !t.is_empty() {
-            return Ok(t);
-        }
-    }
-    let Some(name) = resolve_target_name(paths, target_override)? else {
-        return Err(CliError::Other(format!(
-            "no Hetzner Cloud token available. Either pass `--token <X>`, set `{HCLOUD_TOKEN_ENV}` env var, or run `apprafter target add` to configure an active target."
-        )));
-    };
-    match load_target(paths, &name) {
-        Ok(t) => t.credentials.hetzner_token.ok_or_else(|| {
-            CliError::Other(format!(
-                "target `{name}` has no Hetzner Cloud token stored. Run `apprafter target add {name} --renew --token <X>` to add one, or pass `--token`/`{HCLOUD_TOKEN_ENV}` for this invocation."
-            ))
-        }),
-        // `TargetNotFound` among them: it carries its own code and help.
-        Err(e) => Err(e),
-    }
-}
 
 /// Resolve the SSH public key BODY (the `ssh-ed25519 AAAA… me@`
 /// string Hetzner expects) through the §7 chain.
@@ -108,23 +43,30 @@ pub fn resolve_hetzner_ssh_public_key(
     //    for both old + new CI scripts.
     if let Ok(body) = std::env::var(SSH_PUBLIC_KEY_ENV) {
         if !body.is_empty() {
+            // GOTCHA-149: whatever is returned here is sent to the provider as is.
+            crate::ssh_key::parse_public_key(&body).map_err(|e| {
+                e.refusal(
+                    format!("`{SSH_PUBLIC_KEY_ENV}`"),
+                    crate::ssh_key::KeySource::Env,
+                )
+            })?;
             return Ok(Some(body));
         }
     }
-    // 2. Target store path. Optional — apply works without one.
+    // 2. Target store path. Optional — apply works without one. The config alone: the
+    //    credentials file is the shared core's secret store's to read (D.4a b).
     let Some(name) = resolve_target_name(paths, target_override)? else {
         return Ok(None);
     };
-    let target = match load_target(paths, &name) {
-        Ok(t) => t,
-        // Missing target — caller already gets a clearer error
-        // from `resolve_hetzner_token` when it asks for the
-        // token first. Here we tolerate to keep the ssh-key
-        // path strictly optional.
+    let config = match load_target_config(paths, &name) {
+        Ok(c) => c,
+        // Missing target — the caller already gets a clearer error from
+        // the token read when it asks for the token first. Here we tolerate
+        // it to keep the ssh-key path strictly optional.
         Err(CliError::TargetNotFound { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let Some(path) = target.config.ssh_key_path.as_ref() else {
+    let Some(path) = config.ssh_key_path.as_ref() else {
         return Ok(None);
     };
     read_ssh_public_key_body(path).map(Some)
@@ -132,7 +74,10 @@ pub fn resolve_hetzner_ssh_public_key(
 
 /// Pure helper exposing the file read so callers wanting to
 /// validate the SSH key path without the full resolution chain
-/// (e.g. `apprafter doctor`) can reuse the same parser.
+/// (e.g. `apprafter doctor`) can reuse the same parser. The body is
+/// what the provider is sent, so it must be one OpenSSH public key
+/// line: a private key or anything else is refused before any upload
+/// (`CliError::SshKeyNotPublic`, GOTCHA-149), and never quoted.
 pub fn read_ssh_public_key_body(path: &Path) -> Result<String> {
     let body = std::fs::read_to_string(path).map_err(|e| {
         CliError::Other(format!(
@@ -147,6 +92,12 @@ pub fn read_ssh_public_key_body(path: &Path) -> Result<String> {
             path.display()
         )));
     }
+    crate::ssh_key::parse_public_key(&trimmed).map_err(|e| {
+        e.refusal(
+            crate::ssh_key::file_origin(path),
+            crate::ssh_key::KeySource::TargetFile,
+        )
+    })?;
     Ok(trimmed)
 }
 
@@ -181,31 +132,6 @@ mod tests {
         (dir, paths)
     }
 
-    fn seed_target(paths: &TargetStorePaths, name: &str, token: Option<&str>) {
-        save_target(
-            paths,
-            &Target {
-                name: name.into(),
-                config: TargetConfig {
-                    provider: "hetzner-cloud".into(),
-                    ..Default::default()
-                },
-                credentials: TargetCredentials {
-                    hetzner_token: token.map(String::from),
-                },
-            },
-        )
-        .unwrap();
-        save_global_config(
-            paths,
-            &GlobalConfig {
-                active_target: name.into(),
-                version: 1,
-            },
-        )
-        .unwrap();
-    }
-
     fn with_clean_env<F: FnOnce()>(body: F) {
         // Serialise with the crate-wide test mutex so other
         // modules (`target::tests`) that flip the same env vars
@@ -237,147 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_token_cli_flag_wins_over_env_and_store() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            std::env::set_var(HCLOUD_TOKEN_ENV, "env-token-value");
-            let resolved = resolve_hetzner_token(Some("flag-token-value"), &paths, None).unwrap();
-            assert_eq!(resolved, "flag-token-value");
-            std::env::remove_var(HCLOUD_TOKEN_ENV);
-        });
-    }
-
-    #[test]
-    fn resolve_token_env_wins_over_target_store_when_no_flag() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            std::env::set_var(HCLOUD_TOKEN_ENV, "env-token-value");
-            let resolved = resolve_hetzner_token(None, &paths, None).unwrap();
-            assert_eq!(resolved, "env-token-value");
-            std::env::remove_var(HCLOUD_TOKEN_ENV);
-        });
-    }
-
-    #[test]
-    fn resolve_token_falls_back_to_target_store_when_flag_and_env_absent() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("store-token-value"));
-            let resolved = resolve_hetzner_token(None, &paths, None).unwrap();
-            assert_eq!(resolved, "store-token-value");
-        });
-    }
-
-    #[test]
-    fn resolve_token_target_override_picks_named_target_not_active() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // Save TWO targets; active is `primary`, but the
-            // override asks for `secondary`.
-            save_target(
-                &paths,
-                &Target {
-                    name: "primary".into(),
-                    config: TargetConfig {
-                        provider: "hetzner-cloud".into(),
-                        ..Default::default()
-                    },
-                    credentials: TargetCredentials {
-                        hetzner_token: Some("primary-token".into()),
-                    },
-                },
-            )
-            .unwrap();
-            save_target(
-                &paths,
-                &Target {
-                    name: "secondary".into(),
-                    config: TargetConfig {
-                        provider: "hetzner-cloud".into(),
-                        ..Default::default()
-                    },
-                    credentials: TargetCredentials {
-                        hetzner_token: Some("secondary-token".into()),
-                    },
-                },
-            )
-            .unwrap();
-            save_global_config(
-                &paths,
-                &GlobalConfig {
-                    active_target: "primary".into(),
-                    version: 1,
-                },
-            )
-            .unwrap();
-
-            let resolved = resolve_hetzner_token(None, &paths, Some("secondary")).unwrap();
-            assert_eq!(resolved, "secondary-token");
-        });
-    }
-
-    #[test]
-    fn resolve_token_errors_with_three_paths_hint_when_nothing_configured() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // No target, no env, no flag.
-            let err = resolve_hetzner_token(None, &paths, None).expect_err("must error");
-            match err {
-                CliError::Other(msg) => {
-                    assert!(msg.contains("--token"), "{msg}");
-                    assert!(msg.contains("HCLOUD_TOKEN"), "{msg}");
-                    assert!(msg.contains("apprafter target add"), "{msg}");
-                }
-                other => panic!("expected Other, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn resolve_token_errors_when_target_exists_but_no_token_stored() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            // Target with no token (e.g., partially-configured
-            // dotfiles drop).
-            seed_target(&paths, "default", None);
-            let err = resolve_hetzner_token(None, &paths, None).expect_err("must error");
-            match err {
-                CliError::Other(msg) => {
-                    assert!(msg.contains("has no Hetzner Cloud token stored"), "{msg}");
-                    assert!(msg.contains("--renew"), "{msg}");
-                }
-                other => panic!("expected Other, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn resolve_token_with_override_for_missing_target_is_target_not_found() {
-        with_clean_env(|| {
-            let (_dir, paths) = make_paths();
-            seed_target(&paths, "default", Some("token"));
-            let err =
-                resolve_hetzner_token(None, &paths, Some("ghost")).expect_err("missing target");
-            match err {
-                CliError::TargetNotFound { name, available } => {
-                    assert_eq!(name, "ghost");
-                    assert_eq!(available, "default");
-                }
-                other => panic!("expected TargetNotFound, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
     fn resolve_ssh_public_key_env_wins_over_target_path() {
         with_clean_env(|| {
             let (_dir, paths) = make_paths();
             // Write a real key file but ALSO set the env var.
             let key_dir = tempdir().unwrap();
             let key_path = key_dir.path().join("file.pub");
-            std::fs::write(&key_path, "ssh-ed25519 AAAA-from-file me@file").unwrap();
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file").unwrap();
             save_target(
                 &paths,
                 &Target {
@@ -399,10 +191,10 @@ mod tests {
                 },
             )
             .unwrap();
-            std::env::set_var(SSH_PUBLIC_KEY_ENV, "ssh-ed25519 AAAA-from-env me@env");
+            std::env::set_var(SSH_PUBLIC_KEY_ENV, "ssh-ed25519 AAAAZW52 me@env");
 
             let resolved = resolve_hetzner_ssh_public_key(&paths, None).unwrap();
-            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAA-from-env me@env");
+            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAAZW52 me@env");
             std::env::remove_var(SSH_PUBLIC_KEY_ENV);
         });
     }
@@ -413,7 +205,7 @@ mod tests {
             let (_dir, paths) = make_paths();
             let key_dir = tempdir().unwrap();
             let key_path = key_dir.path().join("file.pub");
-            std::fs::write(&key_path, "ssh-ed25519 AAAA-from-file me@file\n").unwrap();
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file\n").unwrap();
             save_target(
                 &paths,
                 &Target {
@@ -438,7 +230,66 @@ mod tests {
 
             let resolved = resolve_hetzner_ssh_public_key(&paths, None).unwrap();
             // Trimmed — no trailing newline.
-            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAA-from-file me@file");
+            assert_eq!(resolved.unwrap(), "ssh-ed25519 AAAAZmlsZQ== me@file");
+        });
+    }
+
+    /// GOTCHA-149: what `apply` sends the provider as the target's SSH key is checked first. A
+    /// private key (the file next to the `.pub`) or anything that is not one OpenSSH public key
+    /// line is refused, by path, and its text is never quoted.
+    #[test]
+    fn the_body_sent_to_the_provider_must_be_a_public_key() {
+        let dir = tempdir().unwrap();
+        let private = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE=\n-----END OPENSSH PRIVATE KEY-----\n";
+        for (body, private_key) in [(private, true), ("not-a-key\n", false)] {
+            let path = dir.path().join("id_ed25519");
+            std::fs::write(&path, body).unwrap();
+            let err = read_ssh_public_key_body(&path).expect_err(body);
+            assert!(!err.to_string().contains(body.trim()), "{err}");
+            match err {
+                CliError::SshKeyNotPublic {
+                    origin,
+                    private_key: p,
+                    from,
+                } => {
+                    assert_eq!(origin, format!("SSH key `{}`", path.display()));
+                    assert_eq!(p, private_key, "{body}");
+                    // The stored path of an existing target (apply, doctor).
+                    assert_eq!(from, crate::ssh_key::KeySource::TargetFile);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let path = dir.path().join("id_ed25519.pub");
+        std::fs::write(&path, "ssh-ed25519 AAAA me@host\n").unwrap();
+        assert_eq!(
+            read_ssh_public_key_body(&path).unwrap(),
+            "ssh-ed25519 AAAA me@host"
+        );
+    }
+
+    /// The same for a body carried inline in `APPRAFTER_SSH_PUBLIC_KEY`.
+    #[test]
+    fn an_inline_key_body_must_be_a_public_key_too() {
+        with_clean_env(|| {
+            let (_dir, paths) = make_paths();
+            std::env::set_var(
+                SSH_PUBLIC_KEY_ENV,
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
+            );
+            match resolve_hetzner_ssh_public_key(&paths, None).expect_err("a private key") {
+                CliError::SshKeyNotPublic {
+                    origin,
+                    private_key,
+                    from,
+                } => {
+                    assert_eq!(origin, format!("`{SSH_PUBLIC_KEY_ENV}`"));
+                    assert!(private_key);
+                    assert_eq!(from, crate::ssh_key::KeySource::Env);
+                }
+                other => panic!("{other:?}"),
+            }
+            std::env::remove_var(SSH_PUBLIC_KEY_ENV);
         });
     }
 
@@ -488,6 +339,46 @@ mod tests {
                 }
                 other => panic!("expected Other, got {other:?}"),
             }
+        });
+    }
+
+    /// D.4a b: the key path comes from the target's config alone — a credentials file that
+    /// cannot be read (the secret store's to read) does not stop it.
+    #[test]
+    fn the_ssh_key_is_read_without_the_credentials() {
+        with_clean_env(|| {
+            let (_dir, paths) = make_paths();
+            let key_dir = tempdir().unwrap();
+            let key_path = key_dir.path().join("file.pub");
+            std::fs::write(&key_path, "ssh-ed25519 AAAAZmlsZQ== me@file\n").unwrap();
+            save_target(
+                &paths,
+                &Target {
+                    name: "default".into(),
+                    config: TargetConfig {
+                        provider: "hetzner-cloud".into(),
+                        ssh_key_path: Some(key_path),
+                        ..Default::default()
+                    },
+                    credentials: TargetCredentials::default(),
+                },
+            )
+            .unwrap();
+            save_global_config(
+                &paths,
+                &GlobalConfig {
+                    active_target: "default".into(),
+                    version: 1,
+                },
+            )
+            .unwrap();
+            std::fs::write(paths.target_credentials_file("default"), "{not yaml").unwrap();
+            assert_eq!(
+                resolve_hetzner_ssh_public_key(&paths, None)
+                    .unwrap()
+                    .as_deref(),
+                Some("ssh-ed25519 AAAAZmlsZQ== me@file")
+            );
         });
     }
 }

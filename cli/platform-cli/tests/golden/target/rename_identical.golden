@@ -1,0 +1,10 @@
+$ apprafter target rename prod prod
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target rename invoked <ESC>[3mfrom<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mto<ESC>[0m<ESC>[2m=<ESC>[0mprod
+Error: apprafter::target::same_name
+
+  × source and destination target names are both `prod` — nothing to rename
+  help: Name a different destination; nothing was renamed.
+

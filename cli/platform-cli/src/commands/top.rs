@@ -1049,6 +1049,8 @@ fn measure(nodes: &[NodeCapacity], kubeconfig: &Path) -> Measurements {
 /// `apprafter top`. Read-only throughout.
 pub fn run() -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     let nodes_json = kubectl_get_json("nodes", None, None, kc.path())?.ok_or_else(|| {
         CliError::Other("the cluster returned no node list — is the apiserver reachable?".into())

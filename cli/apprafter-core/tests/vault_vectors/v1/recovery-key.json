@@ -1,0 +1,135 @@
+{
+  "bytes": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "canonical": "APPRAFTER-RECOVERY-KEY-1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SY3K4UK",
+  "display": "APPRAFTER-RECOVERY-KEY-1\nQQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+  "other_key": {
+    "bytes": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "canonical": "APPRAFTER-RECOVERY-KEY-1QYPQXPQ9QCRSSZG2PVXQ6RS0ZQG3YYC5Z5TPWXQERGD3C8G7RUSQZNJUT8"
+  },
+  "cases": [
+    {
+      "name": "canonical",
+      "input": "APPRAFTER-RECOVERY-KEY-1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SY3K4UK",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "lower_case",
+      "input": "apprafter-recovery-key-1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sy3k4uk",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "display",
+      "input": "APPRAFTER-RECOVERY-KEY-1\nQQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "groups_only",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "spaces",
+      "input": "QQQSY QCYQ5 RQWZQ FPG9S CRGWP UGPZY SNZS2 3V9CC RYDPK 8QARC 0SY3K 4UK",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "mixed_case",
+      "input": "qqqsy-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "padded",
+      "input": "  APPRAFTER-RECOVERY-KEY-1\nQQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK \n",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "substitution",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPH9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "error": "checksum",
+        "group": 4
+      }
+    },
+    {
+      "name": "transposition",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UPGZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "error": "checksum",
+        "group": 6
+      }
+    },
+    {
+      "name": "dropped",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-YDPK8-QARC0-SY3K4-UK",
+      "expect": {
+        "error": "wrong_length"
+      }
+    },
+    {
+      "name": "extra",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UKQ",
+      "expect": {
+        "error": "wrong_length"
+      }
+    },
+    {
+      "name": "one_for_l",
+      "input": "QQQSY-QC1Q5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-0SY3K-4UK",
+      "expect": {
+        "error": "invalid_char",
+        "position": 7
+      }
+    },
+    {
+      "name": "o_for_zero",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-8QARC-OSY3K-4UK",
+      "expect": {
+        "error": "invalid_char",
+        "position": 50
+      }
+    },
+    {
+      "name": "b_for_eight",
+      "input": "QQQSY-QCYQ5-RQWZQ-FPG9S-CRGWP-UGPZY-SNZS2-3V9CC-RYDPK-BQARC-0SY3K-4UK",
+      "expect": {
+        "error": "invalid_char",
+        "position": 45
+      }
+    },
+    {
+      "name": "age_key",
+      "input": "AGE-SECRET-KEY-1YQSJYGEYY5NZW2PF9G4JCTFW9UCRZV3NXS6NVDEC8YARK0PA8CLSWXGG7Q",
+      "expect": {
+        "error": "wrong_prefix"
+      }
+    },
+    {
+      "name": "other_prefix",
+      "input": "APPRAFTER-RECOVERY-1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SY3K4UK",
+      "expect": {
+        "error": "wrong_prefix"
+      }
+    },
+    {
+      "name": "blank",
+      "input": " \n\t ",
+      "expect": {
+        "error": "empty"
+      }
+    }
+  ]
+}

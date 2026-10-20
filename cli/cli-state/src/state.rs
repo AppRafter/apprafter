@@ -49,13 +49,27 @@
 //! reuse the directory under a different target on their next
 //! shell).
 //!
+//! ## Writers (WI-487)
+//!
+//! Every writer of a `state.json` goes through [`State::update`]:
+//! under the store's write lock it reads the file again, writes the
+//! fields it owns into that fresh copy, and saves it. A writer never
+//! saves a copy it read before the lock — that copy would bring back
+//! what another writer replaced meanwhile: a cache `lock on` re-sealed
+//! to the store's own key, a cache `kubeconfig --refresh` fetched. Its
+//! slow work (a provider's calls) stays outside the lock. `State::save`
+//! is for tests and `update` alone (`apprafter-core/tests/guards.rs`).
+//!
 //! Encoding stays JSON for now — switching to CUE-encoded text
 //! lands in phase 1.x.
 
 use std::path::{Path, PathBuf};
 
-use cli_core::{target::TargetStorePaths, CliError, Result, Tier};
+use cli_core::secrets::CachedSecret;
+use cli_core::{target::TargetStorePaths, CliError, Result, StoreLock, Tier};
 use serde::{Deserialize, Serialize};
+
+use crate::seam::{self, WritePoint};
 
 const STATE_DIR: &str = ".apprafter";
 const STATE_FILE: &str = "state.json";
@@ -81,6 +95,9 @@ const KNOWN_HOSTS_FILE: &str = "known_hosts";
 #[derive(Debug, Clone)]
 pub struct StatePaths {
     root: PathBuf,
+    /// The target store's root, for a per-target state: the folders [`Self::create_state_dir`]
+    /// makes are made owner-only from it down. `None` when hand-rooted.
+    store_root: Option<PathBuf>,
 }
 
 impl StatePaths {
@@ -93,6 +110,7 @@ impl StatePaths {
     pub fn for_root(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            store_root: None,
         }
     }
 
@@ -109,11 +127,26 @@ impl StatePaths {
     pub fn for_active_target(store: &TargetStorePaths, name: &str) -> Self {
         Self {
             root: store.state_dir(name),
+            store_root: Some(store.root().to_path_buf()),
         }
     }
 
     pub fn state_dir(&self) -> PathBuf {
         self.root.join(STATE_DIR)
+    }
+
+    /// Makes [`Self::state_dir`] and the folders above it that are missing (WI-479): for a
+    /// per-target state, every folder from the store's root down — `state`, `state/<target>`,
+    /// its `.apprafter` — owner-only from its creation whatever the umask
+    /// ([`TargetStorePaths::create_dir_all`]); for a hand-rooted one, its `.apprafter` alone.
+    /// The folders above, and a folder already there, are left to the account's umask and as
+    /// they are.
+    pub fn create_state_dir(&self) -> std::io::Result<()> {
+        let dir = self.state_dir();
+        match &self.store_root {
+            Some(root) => TargetStorePaths::for_root(root.clone()).create_dir_all(&dir),
+            None => cli_core::owner_only::create_dir_all_from(&dir, &dir),
+        }
     }
 
     pub fn state_file(&self) -> PathBuf {
@@ -152,10 +185,17 @@ impl StatePaths {
 /// scheme on a freshly-created target should not have their state
 /// silently overwritten by stale per-cwd data; the legacy file is
 /// theirs to inspect and delete manually if they want to.
+///
+/// It moves files into the per-target `state.json`, so it runs under
+/// the store's write lock `held`, as every writer of that file does
+/// (WI-487): a writer saving the same file meanwhile is never
+/// replaced by the move, nor the move by it.
 pub fn migrate_legacy_state_if_present(
     legacy_root: &Path,
     target_paths: &StatePaths,
+    held: &StoreLock,
 ) -> Result<()> {
+    let _ = held;
     let legacy_state = legacy_root.join(STATE_DIR).join(STATE_FILE);
     if !legacy_state.exists() {
         return Ok(());
@@ -224,7 +264,7 @@ pub fn migrate_legacy_state_if_present(
         }
     }
 
-    std::fs::create_dir_all(target_paths.state_dir())?;
+    target_paths.create_state_dir()?;
     cross_fs_safe_rename(&legacy_state, &target_paths.state_file())?;
 
     // known_hosts is best-effort: a fresh cluster cache without
@@ -329,10 +369,10 @@ const EXDEV: i32 = 18;
 /// failure are absorbed into a `false` answer — corrupt state
 /// is treated as "empty" so the richer legacy file wins.
 fn read_has_hetzner_cloud(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(raw) = cli_core::owner_only::read_secret(path) else {
         return false;
     };
-    let Ok(state) = serde_json::from_str::<State>(&raw) else {
+    let Ok(state) = serde_json::from_slice::<State>(&raw) else {
         return false;
     };
     state.hetzner_cloud.is_some()
@@ -381,6 +421,74 @@ pub struct HetznerCloudState {
     /// Populated by `apprafter argocd-password` on first call.
     #[serde(default)]
     pub argocd_admin_password_age: Option<String>,
+    /// What sealed `kubeconfig_age`, when not the shared age key (F13): set and cleared with
+    /// the slot by every writer, so a lost key's words can say which key that was. Absent is
+    /// the shared age key — and what an older AppRafter wrote, which records nothing; an older
+    /// one that rewrites this file drops it, and the words fall back to the general ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_sealed_to: Option<SealedTo>,
+    /// What sealed `argocd_admin_password_age`, as `kubeconfig_sealed_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argocd_admin_password_sealed_to: Option<SealedTo>,
+}
+
+/// The key a cached secret was sealed to, when it was not the shared age key (F13). A store id
+/// only, never a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SealedTo {
+    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it, or
+    /// it was cached while that store was locked.
+    StoreVault { store_id: String },
+}
+
+impl HetznerCloudState {
+    /// `secret`'s cache slot and the record of what sealed it, together: a writer that changes
+    /// one has the other in hand (F13).
+    pub fn cache_mut(
+        &mut self,
+        secret: CachedSecret,
+    ) -> (&mut Option<String>, &mut Option<SealedTo>) {
+        match secret {
+            CachedSecret::Kubeconfig => (&mut self.kubeconfig_age, &mut self.kubeconfig_sealed_to),
+            CachedSecret::ArgocdPassword => (
+                &mut self.argocd_admin_password_age,
+                &mut self.argocd_admin_password_sealed_to,
+            ),
+        }
+    }
+
+    /// What sealed `secret`'s cache, as recorded (`None`: the shared age key, or not recorded).
+    pub fn sealed_to(&self, secret: CachedSecret) -> Option<&SealedTo> {
+        match secret {
+            CachedSecret::Kubeconfig => self.kubeconfig_sealed_to.as_ref(),
+            CachedSecret::ArgocdPassword => self.argocd_admin_password_sealed_to.as_ref(),
+        }
+    }
+
+    /// The secrets `kubeconfig` and `argocd-password` cached in `from`, with the record of what
+    /// sealed each (F13), carried into `self`: a writer that rebuilds the provider's objects
+    /// from the live API (`apply`, `import`) owns none of them. `from` is the state read again
+    /// under the store lock (WI-487), never a copy read before it; `None` carries nothing.
+    pub fn carry_caches_from(&mut self, from: Option<&HetznerCloudState>) {
+        let Some(from) = from else {
+            return;
+        };
+        self.kubeconfig_yaml = from.kubeconfig_yaml.clone();
+        self.kubeconfig_age = from.kubeconfig_age.clone();
+        self.argocd_admin_password_age = from.argocd_admin_password_age.clone();
+        self.kubeconfig_sealed_to = from.kubeconfig_sealed_to.clone();
+        self.argocd_admin_password_sealed_to = from.argocd_admin_password_sealed_to.clone();
+    }
+}
+
+/// What a change given to [`State::update`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// Save the state as the change left it.
+    Save,
+    /// Leave `state.json` as it is: the change found nothing to write.
+    Leave,
 }
 
 impl State {
@@ -389,7 +497,9 @@ impl State {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let bytes = std::fs::read(&path)?;
+        // WI-473: on Windows a file whose DACL is not owner-only (written before WI-472) is
+        // made owner-only on the handle it is read through.
+        let bytes = cli_core::owner_only::read_secret(&path)?;
         serde_json::from_slice(&bytes).map_err(|err| CliError::InvalidState {
             path,
             message: err.to_string(),
@@ -408,8 +518,11 @@ impl State {
     /// record of a field the rebuild cannot recover. The returned path
     /// is the caller's to report.
     ///
+    /// It moves `state.json`, so only [`State::update_recovering`]
+    /// calls it, under the store lock (WI-487).
+    ///
     /// [`load_or_default`]: Self::load_or_default
-    pub fn load_or_recover(paths: &StatePaths, force: bool) -> Result<(Self, Option<PathBuf>)> {
+    fn load_or_recover(paths: &StatePaths, force: bool) -> Result<(Self, Option<PathBuf>)> {
         match Self::load_or_default(paths) {
             Ok(state) => Ok((state, None)),
             Err(err) => {
@@ -436,15 +549,67 @@ impl State {
     /// file. A reader (another CLI process, AppRafter Desktop) sees the
     /// old version or the new one, never a truncated file it would
     /// report as `state::corrupt`. The temp file, and so `state.json`,
-    /// is created owner-only (0600 on Unix): it carries the encrypted
-    /// kubeconfig and, from older releases, a plaintext one. A reader
+    /// is created owner-only (0600 on Unix, the protected one-ACE DACL
+    /// on Windows): it carries the encrypted kubeconfig and, from older
+    /// releases, a plaintext one. A reader
     /// holding `state.json` open does not make the save fail, on Windows
     /// either ([`cli_core::atomic_replace`]).
+    ///
+    /// For tests and [`State::update`] alone: production code writes
+    /// through `update`, under the store lock, from a copy read under it
+    /// (WI-487; `apprafter-core/tests/guards.rs` keeps every other caller
+    /// out).
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
-        std::fs::create_dir_all(paths.state_dir())?;
+        paths.create_state_dir()?;
         let bytes = serde_json::to_vec_pretty(self)?;
         cli_core::atomic_replace(&paths.state_file(), &bytes, ".state.json.", None)?;
         Ok(())
+    }
+
+    /// The one way AppRafter writes a target's `state.json` (WI-487): under the store's write
+    /// lock `held`, the file is read again, `change` writes the fields its writer owns into
+    /// that fresh copy, and the copy is saved when `change` asks for it ([`Write::Save`]).
+    /// Every field the writer does not own — another writer's cache and the record of what
+    /// sealed it, another command's provider or region — is saved as it was just read, never
+    /// from a copy read before the lock. The caller takes the lock after its slow work (a
+    /// provider's calls), so that work never holds the store; `held` may hold nothing where
+    /// the store cannot be locked at all, as every lock-taking writer allows. A file that does
+    /// not parse fails the write, and nothing is written.
+    pub fn update<E: From<CliError>>(
+        paths: &StatePaths,
+        held: &StoreLock,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<Write, E> {
+        let _ = held;
+        let mut state = Self::load_or_default(paths)?;
+        Self::write(paths, &mut state, change)
+    }
+
+    /// [`State::update`] for `import --force`: a `state.json` that does not parse is renamed
+    /// aside first (`state.json.corrupt-<epoch>`, never deleted), under the same lock, and
+    /// `change` starts from an empty state. Returns where the file went, for the caller to say.
+    pub fn update_recovering<E: From<CliError>>(
+        paths: &StatePaths,
+        held: &StoreLock,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<(Write, Option<PathBuf>), E> {
+        let _ = held;
+        let (mut state, moved) = Self::load_or_recover(paths, true)?;
+        Ok((Self::write(paths, &mut state, change)?, moved))
+    }
+
+    /// `change` on `state`, just read under the lock, then the save it asks for.
+    fn write<E: From<CliError>>(
+        paths: &StatePaths,
+        state: &mut State,
+        change: impl FnOnce(&mut State) -> std::result::Result<Write, E>,
+    ) -> std::result::Result<Write, E> {
+        seam::reached(WritePoint::Reread);
+        let write = change(state)?;
+        if write == Write::Save {
+            state.save(paths)?;
+        }
+        Ok(write)
     }
 }
 
@@ -513,6 +678,44 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "state.json is {mode:o} after a save");
+    }
+
+    /// WI-472: on Windows a save leaves `state.json` owner-only by its DACL — protected, one
+    /// ACE, this user — even when the file it replaces inherited its folder's.
+    #[cfg(windows)]
+    #[test]
+    fn save_over_an_inherited_file_leaves_the_owner_only_dacl() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), b"{}").unwrap();
+        State::default().save(&paths).unwrap();
+        cli_core::owner_only::testing::of_path(&paths.state_file())
+            .unwrap()
+            .assert_owner_only_file("state.json after a save");
+    }
+
+    /// WI-473: a `state.json` other accounts can read — written before WI-472 into a folder
+    /// that hands its DACL down — is owner-only once loaded, and loads the same.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_state_file_is_owner_only_once_loaded() {
+        use cli_core::owner_only::testing;
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), br#"{"cluster_name":"wide"}"#).unwrap();
+        assert!(
+            !testing::of_path(&paths.state_file())
+                .unwrap()
+                .is_owner_only(),
+            "the test's premise"
+        );
+        let back = State::load_or_default(&paths).unwrap();
+        assert_eq!(back.cluster_name.as_deref(), Some("wide"));
+        testing::of_path(&paths.state_file())
+            .unwrap()
+            .assert_owner_only_file("state.json, loaded");
     }
 
     /// A reader holding `state.json` open — another CLI run, AppRafter
@@ -655,6 +858,181 @@ mod tests {
         );
     }
 
+    // ── WI-487: the one writer, under the store lock ─────────────────────
+
+    /// A store with a `prod` state, and its paths.
+    fn locked_state(state: &State) -> (tempfile::TempDir, TargetStorePaths, StatePaths) {
+        let (dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "prod");
+        state.save(&paths).unwrap();
+        (dir, store, paths)
+    }
+
+    fn cached(server_id: u64, kubeconfig: &str) -> HetznerCloudState {
+        HetznerCloudState {
+            server_id,
+            server_name: "n".into(),
+            server_type: None,
+            ssh_key_ids: Vec::new(),
+            network_id: None,
+            firewall_id: None,
+            floating_ip_ids: Vec::new(),
+            kubeconfig_yaml: None,
+            kubeconfig_age: Some(kubeconfig.into()),
+            argocd_admin_password_age: None,
+            kubeconfig_sealed_to: Some(SealedTo::StoreVault {
+                store_id: "3f9c0a1b7d2e4c56".into(),
+            }),
+            argocd_admin_password_sealed_to: None,
+        }
+    }
+
+    /// The change lands in the state as it is under the lock: what another writer saved after
+    /// this one first read the file stays (a cache `lock on` re-sealed, here).
+    #[test]
+    fn an_update_writes_its_change_into_the_state_read_again() {
+        let first = State {
+            provider: Some("hetzner-cloud".into()),
+            region: Some("nbg1".into()),
+            ..Default::default()
+        };
+        let (_dir, store, paths) = locked_state(&first);
+        let early = State::load_or_default(&paths).unwrap();
+        let resealed = State {
+            hetzner_cloud: Some(cached(42, "RESEALED")),
+            ..first.clone()
+        };
+        resealed.save(&paths).unwrap();
+
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update::<CliError>(&paths, &held, |s| {
+            s.tier = Some(Tier::Solo);
+            Ok(Write::Save)
+        })
+        .unwrap();
+        drop(held);
+
+        assert_eq!(wrote, Write::Save);
+        assert_eq!(early.hetzner_cloud, None, "the first read had no cache");
+        assert_eq!(
+            State::load_or_default(&paths).unwrap(),
+            State {
+                tier: Some(Tier::Solo),
+                ..resealed
+            }
+        );
+    }
+
+    /// `Write::Leave` writes nothing: the file is the one that was there.
+    #[test]
+    fn an_update_that_leaves_the_state_writes_nothing() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{\"cluster_name\": \"as written\"}").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let wrote = State::update::<CliError>(&paths, &held, |s| {
+            s.region = Some("fsn1".into());
+            Ok(Write::Leave)
+        })
+        .unwrap();
+        assert_eq!(wrote, Write::Leave);
+        assert_eq!(
+            std::fs::read(paths.state_file()).unwrap(),
+            b"{\"cluster_name\": \"as written\"}"
+        );
+    }
+
+    /// A state that does not parse fails the update before its change, and stays.
+    #[test]
+    fn an_update_refuses_a_state_that_does_not_parse() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let mut changed = false;
+        let err = State::update::<CliError>(&paths, &held, |_| {
+            changed = true;
+            Ok(Write::Save)
+        })
+        .unwrap_err();
+        assert!(matches!(err, CliError::InvalidState { .. }), "{err:?}");
+        assert!(!changed, "the change ran on a state that did not parse");
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), b"{ not json");
+    }
+
+    /// `import --force`'s update: a state that does not parse is moved aside under the lock,
+    /// and the change starts from an empty state.
+    #[test]
+    fn a_recovering_update_moves_a_state_that_does_not_parse_aside() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        let held = StoreLock::exclusive(&store).unwrap();
+        let (wrote, moved) = State::update_recovering::<CliError>(&paths, &held, |s| {
+            assert_eq!(*s, State::default());
+            s.cluster_name = Some("rebuilt".into());
+            Ok(Write::Save)
+        })
+        .unwrap();
+        assert_eq!(wrote, Write::Save);
+        let moved = moved.expect("the file was moved aside");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"{ not json");
+        assert_eq!(
+            State::load_or_default(&paths).unwrap().cluster_name,
+            Some("rebuilt".into())
+        );
+        // A state that parses is updated in place, nothing moved.
+        let (_, moved) =
+            State::update_recovering::<CliError>(&paths, &held, |_| Ok(Write::Save)).unwrap();
+        assert_eq!(moved, None);
+    }
+
+    /// `WritePoint::Reread` comes after the read and before the save: a write landing there
+    /// is not in the copy the update saves — which is why the lock must be held across it.
+    #[test]
+    fn the_reread_point_lies_between_the_read_and_the_save() {
+        let (_dir, store, paths) = locked_state(&State::default());
+        let at_reread = paths.clone();
+        let _armed = seam::testing::arm(move |point| {
+            assert_eq!(point, WritePoint::Reread);
+            State {
+                cluster_name: Some("landed between".into()),
+                ..Default::default()
+            }
+            .save(&at_reread)
+            .unwrap();
+        });
+        let held = StoreLock::exclusive(&store).unwrap();
+        State::update::<CliError>(&paths, &held, |s| {
+            assert_eq!(s.cluster_name, None, "read before the point");
+            s.region = Some("fsn1".into());
+            Ok(Write::Save)
+        })
+        .unwrap();
+        let after = State::load_or_default(&paths).unwrap();
+        assert_eq!(after.cluster_name, None);
+        assert_eq!(after.region, Some("fsn1".into()));
+    }
+
+    /// `apply` and `import` carry the caches and their records from the state read again.
+    #[test]
+    fn the_caches_are_carried_with_what_sealed_them() {
+        let from = cached(1, "K");
+        let mut into = HetznerCloudState {
+            kubeconfig_age: None,
+            kubeconfig_sealed_to: None,
+            ..cached(2, "unused")
+        };
+        into.carry_caches_from(Some(&from));
+        assert_eq!(
+            into,
+            HetznerCloudState {
+                server_id: 2,
+                ..from.clone()
+            }
+        );
+        let mut none = cached(3, "kept");
+        none.carry_caches_from(None);
+        assert_eq!(none, cached(3, "kept"));
+    }
+
     fn make_store() -> (tempfile::TempDir, TargetStorePaths) {
         let dir = tempdir().unwrap();
         let store = TargetStorePaths::for_root(dir.path().to_path_buf());
@@ -686,7 +1064,7 @@ mod tests {
         let (_dir, store) = make_store();
         let paths = StatePaths::for_active_target(&store, "default");
         let legacy_root = tempdir().unwrap();
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
         assert!(!paths.state_file().exists(), "no state must be created");
     }
 
@@ -702,7 +1080,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join(STATE_FILE), br#"{"cluster_name":"p"}"#).unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         assert!(paths.state_file().exists(), "new file must exist");
         assert!(
@@ -729,7 +1107,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join(STATE_FILE), br#"{"cluster_name":"legacy"}"#).unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         // New file kept verbatim.
         let body = std::fs::read_to_string(paths.state_file()).unwrap();
@@ -786,7 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         // Per-target state.json is now the migrated legacy
         // content (real hetzner_cloud block).
@@ -828,7 +1206,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         let body = std::fs::read_to_string(paths.state_file()).unwrap();
         assert!(body.contains("\"server_id\":999"), "{body}");
@@ -855,11 +1233,117 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+        migrate_legacy_state_if_present(legacy_root.path(), &paths, &StoreLock::unheld()).unwrap();
 
         assert!(paths.state_file().exists());
         assert!(paths.known_hosts_file().exists());
         let kh = std::fs::read_to_string(paths.known_hosts_file()).unwrap();
         assert!(kh.contains("1.2.3.4"), "{kh}");
+    }
+
+    // ---- WI-479: the state folders AppRafter makes are owner-only. ----
+
+    /// Each way a state folder is first made, on a fresh store `<base>/<way>/parent/store`
+    /// whose parents are missing too: a save, and the move of a legacy per-cwd state.
+    fn fresh_states(base: &Path) -> Vec<(&'static str, TargetStorePaths)> {
+        let fresh =
+            |way: &str| TargetStorePaths::for_root(base.join(way).join("parent").join("store"));
+        let saved = fresh("save");
+        State::default()
+            .save(&StatePaths::for_active_target(&saved, "prod"))
+            .unwrap();
+        let moved = fresh("migrate");
+        let legacy = base.join("migrate").join("project");
+        std::fs::create_dir_all(legacy.join(STATE_DIR)).unwrap();
+        std::fs::write(legacy.join(STATE_DIR).join(STATE_FILE), b"{}").unwrap();
+        migrate_legacy_state_if_present(
+            &legacy,
+            &StatePaths::for_active_target(&moved, "prod"),
+            &StoreLock::unheld(),
+        )
+        .unwrap();
+        assert!(StatePaths::for_active_target(&moved, "prod")
+            .state_file()
+            .exists());
+        vec![("a save", saved), ("a legacy state's move", moved)]
+    }
+
+    /// The store's folders a per-target state of `prod` sits in, from the root down.
+    fn state_folders(store: &TargetStorePaths) -> [PathBuf; 4] {
+        let target = store.state_dir("prod");
+        [
+            store.root().to_path_buf(),
+            store.root().join("state"),
+            target.clone(),
+            target.join(STATE_DIR),
+        ]
+    }
+
+    /// Unix, in a child per umask (a shared group's 002, and none): a save, or a legacy state's
+    /// move, makes every folder from the store's root down to `.apprafter` 0700, and the root's
+    /// missing parents with the umask's mode; a hand-rooted state's `.apprafter` is 0700 and
+    /// the folder it sits in is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn the_state_folders_are_0700_whatever_the_umask() {
+        for mask in [0o002, 0o000] {
+            let scratch = tempdir().unwrap();
+            cli_core::owner_only::under_umask::run(
+                "state::tests::state_folders_under_the_childs_umask",
+                mask,
+                scratch.path(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside the_state_folders_are_0700_whatever_the_umask"]
+    fn state_folders_under_the_childs_umask() {
+        use cli_core::owner_only::under_umask;
+        use std::os::unix::fs::PermissionsExt;
+        let (mask, scratch) = (under_umask::mask(), under_umask::scratch());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (what, store) in fresh_states(&scratch) {
+            for folder in state_folders(&store) {
+                assert_eq!(mode(&folder), 0o700, "{what}: {folder:?}, umask {mask:03o}");
+            }
+            let parent = store.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                assert_eq!(
+                    mode(above),
+                    0o777 & !mask,
+                    "{what}: {above:?}, umask {mask:03o}"
+                );
+            }
+            cli_core::store_privacy::ensure_private(&store).unwrap();
+        }
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        State::default().save(&StatePaths::for_root(&cwd)).unwrap();
+        assert_eq!(mode(&cwd.join(STATE_DIR)), 0o700);
+        assert_eq!(mode(&cwd), 0o777 & !mask, "left as it was");
+    }
+
+    /// Windows: a save, or a legacy state's move, gives every folder from the store's root
+    /// down the owner-only DACL, and the root's missing parents inherit theirs.
+    #[cfg(windows)]
+    #[test]
+    fn the_state_folders_are_owner_only() {
+        use cli_core::owner_only::testing;
+        let scratch = tempdir().unwrap();
+        for (what, store) in fresh_states(scratch.path()) {
+            for folder in state_folders(&store) {
+                testing::of_path(&folder)
+                    .unwrap()
+                    .assert_owner_only_dir(&format!("{what}: {}", folder.display()));
+            }
+            let parent = store.root().parent().unwrap();
+            for above in [parent, parent.parent().unwrap()] {
+                let dacl = testing::of_path(above).unwrap();
+                assert!(!dacl.protected, "{what}: {above:?} inherits: {dacl:?}");
+            }
+            cli_core::store_privacy::ensure_private(&store).unwrap();
+        }
     }
 }

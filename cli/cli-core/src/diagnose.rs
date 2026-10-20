@@ -92,6 +92,9 @@ pub fn classify_kubectl(stderr: &str) -> KubectlFailure {
         || s.contains("dial tcp")
         || s.contains("connect: network is unreachable")
         || s.contains("unable to connect to the server")
+        // kubectl's own words for a refused port: "The connection to the server <host:port>
+        // was refused - did you specify the right host or port?"
+        || (s.contains("the connection to the server") && s.contains("was refused"))
     {
         return KubectlFailure::Unreachable;
     }
@@ -232,6 +235,25 @@ pub fn classify_restic(stderr: &str) -> ResticFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What kubectl (v1.37, observed against a kind cluster in D.3c) prints when the
+    /// apiserver's port refuses the connection: neither "connection refused" nor "unable to
+    /// connect to the server", so it read as `Other` and lost the unreachable hint.
+    #[test]
+    fn a_refused_connection_in_kubectls_own_words_is_unreachable() {
+        for stderr in [
+            "The connection to the server 127.0.0.1:1 was refused - did you specify the right \
+             host or port?",
+            "The connection to the server localhost:8080 was refused - did you specify the \
+             right host or port?",
+        ] {
+            assert_eq!(
+                classify_kubectl(stderr),
+                KubectlFailure::Unreachable,
+                "{stderr}"
+            );
+        }
+    }
 
     #[test]
     fn it_reads_the_three_kubectl_shapes_that_actually_recur() {

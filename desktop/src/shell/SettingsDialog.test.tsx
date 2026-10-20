@@ -10,7 +10,9 @@ import { DESKTOP_ERROR_CODES } from '../ipc/generated/errors';
 import type { Settings } from '../ipc/generated/Settings';
 import { PlatformContext } from '../state/platform';
 import { createQueryClient } from '../state/queryClient';
-import { appInfo, authInfo, settings } from '../test/fixtures';
+import { appInfo, authInfo, STORE_NOT_PRIVATE, STORE_PROBLEMS, settings } from '../test/fixtures';
+import { toolchainReport, whoamiReport } from '../test/flows';
+import { settleIpc, until } from '../test/settle';
 import { PlatformGate } from './PlatformGate';
 import { SettingsDialog } from './SettingsDialog';
 
@@ -49,22 +51,23 @@ function answer(save: HeldSave) {
 }
 
 /**
- * Answers the held saves, the newest first, until none is left: what two saves in flight at
- * once would meet if the second reached Rust first.
+ * Answers the held saves, the newest first, until `saves` are answered: what two saves in
+ * flight at once would meet if the second reached Rust first. Each round waits for a save to be
+ * held (an event), then for the IPC to go quiet, so saves asked together are answered
+ * together; never for a time (GOTCHA-332). No save is left over.
  */
-async function answerHeld() {
-  for (let quiet = 0; quiet < 3; ) {
-    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+async function answerHeld(saves: number) {
+  for (let answered = 0; answered < saves; ) {
+    await until(`save ${answered + 1} of ${saves}`, () => held.length > 0);
+    await act(() => settleIpc());
     const batch = held.splice(0).reverse();
-    if (batch.length === 0) {
-      quiet += 1;
-      continue;
-    }
-    quiet = 0;
+    answered += batch.length;
     await act(async () => {
       for (const save of batch) answer(save);
     });
   }
+  await act(() => settleIpc());
+  expect(held).toEqual([]);
 }
 
 beforeEach(() => {
@@ -79,6 +82,8 @@ beforeEach(() => {
     calls.push({ cmd, args: args as Record<string, unknown> });
     if (cmd === 'app_info') return reads() > 1 && later !== null ? later : info;
     if (cmd === 'settings_get') return stored;
+    if (cmd === 'whoami') return whoamiReport({ status: 'skipped', reason: 'no_ping' });
+    if (cmd === 'toolchain_status') return toolchainReport();
     if (cmd === 'settings_set' && holding) {
       const request = (args as { settings: Settings }).settings;
       return new Promise((resolve, reject) => held.push({ request, resolve, reject }));
@@ -100,25 +105,27 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 
 async function open(info: AppInfo = appInfo()) {
   const onClose = mock();
+  const onSecurity = mock();
   render(
     <QueryClientProvider client={createQueryClient()}>
       <PlatformContext value={info}>
         <ToastProvider>
-          <SettingsDialog onClose={onClose} />
+          <SettingsDialog onClose={onClose} onSecurity={onSecurity} />
           <ToastViewport />
         </ToastProvider>
       </PlatformContext>
     </QueryClientProvider>,
   );
   await screen.findByRole('radiogroup', { name: 'Theme' });
-  return { user: userEvent.setup(), onClose };
+  return { user: userEvent.setup(), onClose, onSecurity };
 }
 
 /** Settings under the PlatformGate, as the app has it: app_info read by the gate. */
@@ -127,7 +134,7 @@ async function openInGate() {
     <QueryClientProvider client={createQueryClient()}>
       <PlatformGate>
         <ToastProvider>
-          <SettingsDialog onClose={mock()} />
+          <SettingsDialog onClose={mock()} onSecurity={mock()} />
           <ToastViewport />
         </ToastProvider>
       </PlatformGate>
@@ -318,7 +325,7 @@ describe('SettingsDialog', () => {
     const { user } = await open();
     await user.click(screen.getByRole('switch', { name: 'Require unlock' }));
     await user.click(screen.getByRole('radio', { name: 'Light' }));
-    await answerHeld();
+    await answerHeld(2);
     expect(stored).toEqual(settings({ lockEnabled: false, theme: 'light' }));
     expect(
       screen.getByRole('switch', { name: 'Require unlock' }).getAttribute('aria-checked'),
@@ -336,7 +343,7 @@ describe('SettingsDialog', () => {
     await user.click(screen.getByRole('radio', { name: 'Light' }));
     await user.click(screen.getByRole('radio', { name: 'System' }));
     await user.click(screen.getByRole('switch', { name: 'Require unlock' }));
-    await answerHeld();
+    await answerHeld(3);
     // The lock was refused; the theme the owner picked before it was not dragged down with it.
     expect(stored).toEqual(settings({ lockEnabled: false, theme: 'system' }));
     expect(saved().map((s) => [s.theme, s.lockEnabled])).toEqual([
@@ -354,7 +361,7 @@ describe('SettingsDialog', () => {
     await user.click(screen.getByRole('radio', { name: '30 min' }));
     // Optimistic meanwhile: the dialog shows the last choice at once.
     expect(screen.getByRole('radio', { name: '30 min' }).getAttribute('aria-checked')).toBe('true');
-    await answerHeld();
+    await answerHeld(2);
     expect(stored.autoLock).toBe('30');
     expect(screen.getByRole('radio', { name: '30 min' }).getAttribute('aria-checked')).toBe('true');
     // One at a time, each from the settings Rust confirmed plus its own change.
@@ -381,6 +388,31 @@ describe('SettingsDialog', () => {
     );
   });
 
+  test('About: This computer reads whoami without a ping', async () => {
+    await open();
+    expect(await screen.findByText('CLI default: prod-eu · hetzner-cloud · nbg1')).toBeDefined();
+    expect(screen.getByText('Not checked yet')).toBeDefined();
+    expect(calls.map((c) => c.cmd)).not.toContain('op_start_whoami');
+  });
+
+  test('About: Show opens the toolchain above Settings, which goes inert; Esc closes only it', async () => {
+    const { user, onClose } = await open();
+    const settingsDialog = screen.getByRole('dialog', { name: 'Settings' });
+    const toolchainRow = screen.getByText('Toolchain').closest('.row') as HTMLElement;
+    await user.click(within(toolchainRow).getByRole('button', { name: 'Show' }));
+    const toolchain = await screen.findByRole('dialog', { name: 'Toolchain' });
+    expect(await within(toolchain).findByText('Client Version: v1.34.1')).toBeDefined();
+    // Siblings, so the toolchain's layer covers the window and Settings cannot be reached.
+    expect(settingsDialog.isConnected).toBe(true);
+    expect(settingsDialog.closest('.modal-layer')?.hasAttribute('inert')).toBe(true);
+    expect(settingsDialog.contains(toolchain)).toBe(false);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Toolchain' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeDefined();
+    expect(settingsDialog.closest('.modal-layer')?.hasAttribute('inert')).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   test('opening Settings reads app_info again: what it says may have changed since', async () => {
     await openInGate();
     await waitFor(() => expect(reads()).toBe(2));
@@ -389,5 +421,48 @@ describe('SettingsDialog', () => {
   test('a notice about the settings file is shown when Rust has one', async () => {
     await open(appInfo({ settingsNotice: 'settings.json is newer than this app; using defaults' }));
     expect(screen.getByText('settings.json is newer than this app; using defaults')).toBeDefined();
+  });
+
+  test('the Security row asks for the Security page: the store’s protection is there (WI-476)', async () => {
+    const { user, onSecurity } = await open();
+    expect(screen.getByText('Target store protection')).toBeDefined();
+    await user.click(screen.getByRole('button', { name: 'Open Security' }));
+    expect(onSecurity).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'Protect…' })).toBeNull();
+  });
+
+  test.each(STORE_PROBLEMS)(
+    'a store whose lock state cannot be used: the Security row says so (%s)',
+    async (_state, secrets) => {
+      await open(appInfo({ secrets }));
+      expect(
+        screen.getByText(
+          "This target store's lock state cannot be used: the Security page says why.",
+        ),
+      ).toBeDefined();
+    },
+  );
+
+  // The controller's decision on critic M7 (WI-475): the row says what is wrong, and where.
+  test.each(STORE_NOT_PRIVATE)(
+    'a store other accounts can change: the Security row says so (%s)',
+    async (_state, secrets) => {
+      await open(appInfo({ secrets }));
+      expect(
+        screen.getByText(
+          'Other accounts on this computer can change this target store: the Security page says how to fix it.',
+        ),
+      ).toBeDefined();
+    },
+  );
+
+  test('an interrupted run: the Security row says where it finishes', async () => {
+    const files = appInfo().secrets;
+    await open(appInfo({ secrets: { ...files, mode: 'locking', protected: true } }));
+    expect(
+      screen.getByText(
+        "Changing this target store's protection was interrupted: the Security page offers to finish it.",
+      ),
+    ).toBeDefined();
   });
 });

@@ -243,12 +243,11 @@ pub fn build_choices(visible: &[MachineRow], sold_out_count: usize) -> Vec<Picke
 
 /// Map an `inquire::InquireError` to the crate's `CliError`. Mirrors the
 /// identical helper in `target_wizard.rs` — kept local to avoid cross-module
-/// coupling (the function is trivially small).
+/// coupling (the function is trivially small). Esc / Ctrl-C is the typed
+/// `apprafter::op::cancelled` (d4a-h F8).
 fn map_inquire_err(err: InquireError) -> CliError {
     match err {
-        InquireError::OperationCanceled | InquireError::OperationInterrupted => {
-            CliError::Other("machine picker aborted by user".to_string())
-        }
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => CliError::Cancelled,
         other => CliError::Other(format!("machine picker prompt failed: {other}")),
     }
 }
@@ -395,6 +394,30 @@ pub fn pick_machine(
 mod tests {
     use super::*;
     use cli_providers::machine::MachineOffer;
+
+    /// Esc / Ctrl-C at the machine picker — inside the `target add` wizard or `target
+    /// machine` — is the person's decision: the typed `apprafter::op::cancelled` (d4a-h F8),
+    /// never the catch-all that asks to file an issue; a genuine fault keeps its detail.
+    #[test]
+    fn cancelling_the_machine_picker_reads_as_cancelled() {
+        for cancel in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            let e = map_inquire_err(cancel);
+            assert_eq!(
+                miette::Diagnostic::code(&e).map(|c| c.to_string()),
+                Some("apprafter::op::cancelled".to_string()),
+                "{e:?}"
+            );
+            assert!(matches!(e, CliError::Cancelled), "{e:?}");
+        }
+        let other = map_inquire_err(InquireError::NotTTY).to_string();
+        assert!(
+            other.starts_with("machine picker prompt failed:"),
+            "{other}"
+        );
+    }
 
     /// Build a minimal `MachineOffer`. Split into two helpers to stay within
     /// clippy's 7-argument limit.

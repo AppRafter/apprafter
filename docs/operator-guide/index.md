@@ -24,6 +24,10 @@ Guide](../dev-guide/index.md) is the shorter path.
 - [Managing targets](target-store.md) — running more than one, and the
   rest of a target's life: inspecting, renaming, and removing one
   without stranding the servers it provisioned.
+- [Protecting secrets from agents](protecting-secrets-from-agents.md) —
+  locking a target store's tokens and cached credentials in an encrypted
+  vault, so that an AI agent that oversteps cannot read or use them without
+  you; what the lock does not stop; and giving an agent a store of its own.
 - [Private repos & registries](../dev-guide/private-repos-and-registries.md)
   — `apprafter repo creds add` registers one credential that Argo CD
   clones private repositories with and the node pulls private images

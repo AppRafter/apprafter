@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // The sections of a target tab (brief §2): their nav entries, the design's page copy, and the
-// slice that brings each screen — the slice coverage.toml plans for the CLI command behind it
+// slice that brings each screen — the slice coverage.toml gives the CLI command behind it
 // (sections.test.ts keeps the two equal).
 import {
   ArchiveIcon,
@@ -25,14 +25,15 @@ export interface SectionInfo {
   readonly sub?: (target: string) => string;
   /** The CLI command whose read view the screen is, and the slice that brings it. */
   readonly leaf: string;
-  /**
-   * The command takes the target's name. The others run on the CLI's active target, so the
-   * hint says to switch to the tab's first (sections.test.ts checks it against the reference).
-   */
-  readonly named?: true;
   readonly slice: string;
-  /** What the placeholder says until then. */
-  readonly planned: string;
+  /** The section has its screen: its leaf is a GUI action in coverage.toml. */
+  readonly screen?: true;
+  /**
+   * What the placeholder says until the screen arrives. A planned section's command runs on the
+   * CLI's active target, so the hint says to switch to the tab's first (sections.test.ts checks
+   * it against the reference).
+   */
+  readonly planned?: string;
 }
 
 export const SECTIONS: readonly SectionInfo[] = [
@@ -126,9 +127,8 @@ export const SECTIONS: readonly SectionInfo[] = [
     sub: (target) =>
       `How this computer reaches ${target} — provider credentials, the machine, and cached access to the cluster.`,
     leaf: 'target show',
-    named: true,
     slice: 'D.3',
-    planned: 'The target screen arrives in D.3.',
+    screen: true,
   },
 ];
 

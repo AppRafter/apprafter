@@ -84,6 +84,8 @@ pub fn open(
     workload: Option<String>,
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // D.4a T46: everything this command reads of the store is in hand; the store's key goes.
+    crate::vault_access::end_secret_phase();
 
     // Resolve by the LOGICAL name (the one shown in `app list` / typed into
     // `app add`), same as `app status`/`logs`/`rollback`: a single env

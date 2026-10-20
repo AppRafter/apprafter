@@ -232,6 +232,8 @@ nav:
       # 1-4: stand a cluster up.
       - Quickstart: operator-guide/quickstart.md
       - Managing targets: operator-guide/target-store.md
+      # 1-4 continued: once a target exists, keep its secrets from an agent.
+      - Protecting secrets from agents: operator-guide/protecting-secrets-from-agents.md
       # 5: firewall and domains. Both are about cluster-owned resources
       # (the zones on the platform Gateway and the certificate that
       # terminates TLS for them), which is operator work.
@@ -285,6 +287,7 @@ nav:
       - Declared disk dependencies: how-it-works/needs-disk.md
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
       - The target store on disk: how-it-works/the-target-store.md
+      - How the store lock works: how-it-works/the-store-lock.md
       - GitOps and the CUE plugin: how-it-works/gitops-and-the-cue-cmp.md
       - Node reservations and swap: how-it-works/node-reservations-and-swap.md
       - How the approval gate works: how-it-works/the-approval-gate.md

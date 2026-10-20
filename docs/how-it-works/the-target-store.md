@@ -21,8 +21,10 @@ way — is
 
 ```text
 $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
-├── .lock                            # the store lock; always empty
+├── .lock                            # the store's write lock; always empty
 ├── config.yaml                      # GlobalConfig
+├── store.yaml                       # whether the secrets are locked (after apprafter lock on)
+├── vault                            # a locked store's secrets, encrypted; mode 0600
 ├── targets/
 │   ├── default/
 │   │   ├── config.yaml              # TargetConfig (non-secret)
@@ -32,11 +34,12 @@ $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 │       └── credentials.yaml
 ├── auth/                            # reserved for `apprafter auth` (Managed; stub)
 │   └── .keep
-└── state/
-    └── <target>/
-        └── .apprafter/
-            ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
-            └── known_hosts          # per-cluster SSH known_hosts
+├── state/
+│   └── <target>/
+│       └── .apprafter/
+│           ├── state.json           # provisioned resource IDs + cached kubeconfig, mode 0600
+│           └── known_hosts          # per-cluster SSH known_hosts
+└── run/                             # private: decrypted kubeconfigs while a command uses them
 ```
 
 The `state/<target>/` half is not a scratch cache. It is the only
@@ -46,19 +49,60 @@ kubeconfig. Everything under it is keyed by target name, which is why
 [renaming a target](../operator-guide/target-store.md#inspecting-renaming-and-removing-a-target) moves
 it and removing one deletes it.
 
-Every command that changes the store locks `.lock` while it reads,
-changes and saves, so two processes editing one store never lose each
-other's change. One that finds the lock held waits for it, and says so
-on stderr:
+A store that `apprafter lock on` has locked keeps every token and its own
+age key in `vault`, and each `credentials.yaml` holds a marker naming it
+instead of a token: [How the store lock works](the-store-lock.md#layout).
+
+Every command that changes the store takes its write lock, `.lock`,
+while it reads, changes and saves, so two processes editing one store
+never lose each other's change. A command with slow work does it first:
+`apply` provisions, `destroy` tears down and `import` lists the provider's
+objects before they take the lock; then, under it, each reads its target's
+`state.json` again and saves its own fields into that copy. What another command saved
+meanwhile — a kubeconfig cached by `apprafter kubeconfig --refresh`, the
+caches `apprafter lock on` sealed to the store's own key — stays. One that
+finds the lock held waits for it, and says so on stderr:
 
 ```text
-waiting for another AppRafter process to release the target store (/home/operator/.config/apprafter/.lock)…
+waiting for another AppRafter process to finish writing the target store (/home/operator/.config/apprafter/.lock)…
 ```
 
-A store that cannot be locked at all — a read-only directory, a
-filesystem without locks — is used without the lock, after a
-`warning: cannot lock the target store (…): …; continuing without the
-lock` line. Each file is replaced whole: a save writes a temporary file
+A store whose write lock cannot be taken at all — a read-only directory, a
+filesystem without locks — is used without it, after a
+`warning: cannot take the target store's write lock (…): …; continuing without it` line.
+
+The store is used only while it is your account's alone. An account that
+owns one of its folders — the store itself, `targets` and each target's
+folder, `state` and each folder under it — or can write to one could put
+its own token, kubeconfig or vault there. So before a command uses or
+writes any of the store's secrets, and before any change under the write
+lock, AppRafter reads who owns each of those folders and who may write to
+it, and refuses the store if another account does
+([`store_not_private`](../operator-guide/troubleshooting.md#store-not-private)).
+`apprafter target add` and the commands that act on a target's state
+check this before they read any file of the store; the reports,
+`apprafter status` and `apprafter doctor`, show what they can read
+instead. A folder another account owns is often closed to you as well:
+whatever a command reads in it is then refused the same way, naming the
+folder.
+`apprafter doctor` names each such folder, and each secret file another
+account owns, and changes nothing
+([troubleshooting](../operator-guide/troubleshooting.md#store-folder-foreign)).
+
+Every folder AppRafter creates in the store — the store itself, `targets`
+and each target's folder, `auth`, `state` and each folder under it, `run` —
+is your account's alone from the moment it exists, whatever the umask: mode
+0700 on Linux and macOS, so a shared group's umask such as 002 does not make
+it group-writable, and on Windows a DACL that admits only your account and
+takes nothing from the folders above. A store AppRafter creates therefore
+passes the check above, and `apprafter target add` on a fresh store is not
+refused after it asked for a token. The folders the store sits in, such as
+`~/.config` when AppRafter has to create it, are created with your umask as
+any program creates them, and are not checked. A folder that is already
+there is never changed: one another account can change is refused, not
+fixed.
+`cli/cli-core/src/store_privacy.rs`, `cli/cli-core/src/owner_only.rs`.
+Each file is replaced whole: a save writes a temporary file
 beside it and renames that into place, so a reader sees the old version
 or the new one, never a partial write.
 
@@ -121,13 +165,32 @@ Field reference:
 hetzner_token: hxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Mode 0600 is enforced on every write. The CLI redacts the value
+Mode 0600 is enforced on every write. On Windows every write
+gives it instead a DACL that admits only your account and takes
+nothing from the folders above, so a store kept in a folder other
+accounts can read keeps the token from them. `state.json` and the
+vault get the same on every write, and the age key when it is
+created, along with its folder when AppRafter creates that too
+(`cli/cli-core/src/owner_only.rs`). The age key is written whole to
+a temporary file beside it and takes its name only if no key is there yet,
+so a write that fails leaves no part of a key behind, and two commands that
+make it at once end with the same key; a key file that does not parse is
+an error that names it, never replaced (`cli/cli-core/src/secrets.rs`). On
+Windows a file written
+before AppRafter gave it that DACL — or widened since — gets it the next
+time AppRafter reads the file: a command, or the app. `apprafter doctor`
+names any of these files another account may open — a mode wider than
+0600 on Linux and macOS, a DACL that is not yours alone on Windows — and
+changes nothing itself
+([troubleshooting](../operator-guide/troubleshooting.md#secret-file-wide)).
+The CLI redacts the value
 in `target show` / `whoami` output; read this file directly if
 you need the raw bytes for a one-off script.
 
-**Do not commit this file to dotfiles repos.** The token is a
-plaintext credential — the security boundary is filesystem
-permissions. The R1 mitigation in
+**Do not commit this file to dotfiles repos.** In a store in files the
+token is a plaintext credential, and the security boundary is filesystem
+permissions; `apprafter lock on` moves it into an encrypted vault, leaving
+a marker here. The R1 mitigation in
 [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md): `apprafter doctor`
 warns on mode != 0600.
 
@@ -143,6 +206,10 @@ Hetzner token in this order:
 2. **Environment variable `HCLOUD_TOKEN`**. Wins over the store.
 3. **Active target's `credentials.yaml`** — or `--target <name>`
    override for one-off runs against a non-active target.
+
+On a locked target store, rung 2 is refused — `HCLOUD_TOKEN` set is
+`apprafter::secrets::override_refused` — and rung 3 is the store's vault,
+opened as [How the store lock works](the-store-lock.md#opening) describes.
 
 SSH public key resolution is analogous (`APPRAFTER_SSH_PUBLIC_KEY`
 env → target store's `ssh_key_path` → read the file).
@@ -165,9 +232,10 @@ first run produces:
 With a target configured but no token in its `credentials.yaml`:
 
 ```text
-  × target `prod` has no Hetzner Cloud token stored. Run `apprafter target add
-  │ prod --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for
-  │ this invocation.
+  × target `prod` has no provider token stored
+  help: Run `apprafter target add prod --renew` to store one (at a terminal it
+        asks for the new token without showing it; in a script, `--token`), or
+        set `HCLOUD_TOKEN` for this invocation.
 ```
 
 And with `--target` pointing at a name that is not in the store — note
@@ -188,3 +256,5 @@ report.
   write what this page describes.
 - [Environment variables](../reference/environment.md) — every variable the
   chain above consults, with its default and the code that reads it.
+- [How the store lock works](the-store-lock.md) — what a locked store
+  keeps where, and how it is opened.

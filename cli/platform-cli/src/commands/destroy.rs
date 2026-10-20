@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 use std::collections::BTreeMap;
 
-use cli_core::{resolve_hetzner_token, CliError, Result};
+use cli_core::target::TargetStorePaths;
+use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
 use cli_providers::Provider;
-use cli_state::State;
+use cli_state::{State, StatePaths, Write};
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
-use crate::commands::state_paths::resolve_state_paths;
+use crate::commands::state_paths::{resolve_state_paths, write_state};
 
 pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
     info!(yes, target_override, "destroy invoked");
 
     // State now lives under `<config>/state/<active-target>/`
-    // (v0.1.154 migration). Resolve once and reuse the same
-    // `TargetStorePaths` handle for the credential resolution
-    // below, mirroring `apply` / `import`.
+    // (v0.1.154 migration).
     let resolved = resolve_state_paths(target_override)?;
     let paths = resolved.paths;
-    let target_store = resolved.store;
-    let mut state = State::load_or_default(&paths)?;
+    let store = resolved.store;
+    let state = State::load_or_default(&paths)?;
 
     let provider_id = state.provider.clone();
     let Some(provider_id) = provider_id else {
@@ -43,8 +42,8 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // Resolution chain (cli-dx-task.md §7).
-    let token = resolve_hetzner_token(None, &target_store, target_override)?;
+    // Resolution chain (cli-dx-task.md §7), through the core (D.4a b).
+    let token = crate::token::hetzner_token(target_override)?;
 
     if !yes {
         return Err(CliError::Other(
@@ -103,8 +102,7 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
         println!("  (destroyed server: {summary} — note for restore --reprovision)");
     }
 
-    state.hetzner_cloud = None;
-    state.save(&paths)?;
+    forget_cluster(&store, &paths)?;
 
     // Drop the per-cluster known_hosts file alongside the state.
     // The next `apply` against a fresh server (Hetzner happily
@@ -122,4 +120,78 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `destroy`'s one field: the cluster's record — the provider's objects, and the caches of that
+/// cluster with them — dropped from the state read again under the store lock (WI-487). The
+/// provider, tier, region and cluster name stay as they are on disk, whoever wrote them last.
+fn forget_cluster(store: &TargetStorePaths, paths: &StatePaths) -> Result<()> {
+    write_state(store, paths, |state| {
+        state.hetzner_cloud = None;
+        Ok(Write::Save)
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::state_paths::testing::{cache_kubeconfig, interleave, Scratch};
+    use cli_core::Tier;
+    use cli_state::seam::WritePoint;
+
+    /// WI-487: what `init` wrote after destroy's first read and before its save — while it
+    /// destroyed — stays; only the cluster's record goes.
+    #[test]
+    fn destroy_keeps_what_init_wrote_while_it_destroyed() {
+        let s = Scratch::new();
+        let (store, paths) = (s.store.clone(), s.paths.clone());
+        let other = interleave(WritePoint::BeforeLock, move |_| {
+            crate::commands::init::record(&store, &paths, "hetzner-cloud", Tier::Team, "fsn1")
+        });
+        forget_cluster(&s.store, &s.paths).unwrap();
+        other.result().unwrap();
+        let after = s.state();
+        assert_eq!(
+            (after.tier, after.region.as_deref(), after.hetzner_cloud),
+            (Some(Tier::Team), Some("fsn1"), None)
+        );
+    }
+
+    /// WI-487: destroy reads the state again and saves it while holding the store lock: an
+    /// `init` started then waits, and neither loses the other's fields.
+    #[test]
+    fn init_waits_for_destroy_s_save() {
+        let s = Scratch::new();
+        let (store, paths) = (s.store.clone(), s.paths.clone());
+        let other = interleave(WritePoint::Reread, move |_| {
+            crate::commands::init::record(&store, &paths, "hetzner-cloud", Tier::Team, "fsn1")
+        });
+        forget_cluster(&s.store, &s.paths).unwrap();
+        other.result().unwrap();
+        let after = s.state();
+        assert_eq!(
+            (after.tier, after.region.as_deref(), after.hetzner_cloud),
+            (Some(Tier::Team), Some("fsn1"), None)
+        );
+    }
+
+    /// WI-487: a cache write that waited for destroy's save finds the cluster gone and writes
+    /// nothing: a destroyed cluster's record never comes back with a cache.
+    #[test]
+    fn a_cache_write_that_waited_for_destroy_finds_no_cluster() {
+        let s = Scratch::new();
+        let ctx = s.ctx.clone();
+        let other = interleave(WritePoint::Reread, move |signal| {
+            cache_kubeconfig(&ctx, signal)
+        });
+        forget_cluster(&s.store, &s.paths).unwrap();
+        let err = other.result().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("state has no hetzner_cloud section"),
+            "{err}"
+        );
+        assert_eq!(s.state().hetzner_cloud, None);
+    }
 }

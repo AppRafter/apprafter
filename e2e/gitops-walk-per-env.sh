@@ -123,7 +123,7 @@ fi
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 GIT_REPOS_DIR="${TMPDIR_WORK}/git-repos"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 GIT_DAEMON_PID=""
@@ -175,21 +175,13 @@ trap cleanup EXIT
 # ---------------------------------------------------------------
 # Helper: apprafter CLI with cwd = fixture src dir.
 #
-# lib.sh's apprafter() always cd's to REPO_ROOT/cli; but `app add`
-# uses the cwd to locate apprafter/Application.cue (the scaffold gate
-# + the `--env` validation against the manifest's declared
-# environments). We cd into the fixture dir and pass --manifest-path
-# so cargo still picks up the CLI workspace.
+# `app add` uses the cwd to locate apprafter/Application.cue (the
+# scaffold gate + the `--env` validation against the manifest's
+# declared environments). lib.sh's apprafter_in runs the CLI with the
+# fixture dir as its working directory, on the walk's isolated store.
 # ---------------------------------------------------------------
 apprafter_from_fixture() {
-    (
-        cd "${FIXTURE_SRC}"
-        cargo run \
-            --manifest-path "${REPO_ROOT}/cli/Cargo.toml" \
-            --quiet \
-            --bin apprafter \
-            -- "$@"
-    )
+    apprafter_in "${FIXTURE_SRC}" "$@"
 }
 
 # ---------------------------------------------------------------

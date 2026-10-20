@@ -4,8 +4,8 @@
 //!
 //! The test process holds `cli_core::StoreLock` on a seeded store and runs
 //! one edit — `target use`, `rename`, `remove`, `machine`, `add --renew` —
-//! as a real process, in the cleared environment `target_concurrency_test.rs`
-//! uses. The edit must report the wait on stderr and still be running half a
+//! as a real process, through the spawn point (`tests/common/spawn.rs`).
+//! The edit must report the wait on stderr and still be running half a
 //! second later; released, it must finish, successfully, within 30 s. Each
 //! check fails if the command does not take the lock, and none depends on
 //! timing when it does: the wait is observed by its stderr line, not by a
@@ -15,8 +15,9 @@
 //! (read-only) is used without the lock, with a warning, instead of making
 //! a command that writes nothing fail.
 
+mod common;
+
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +27,7 @@ use cli_core::target::{
     save_global_config, save_target, GlobalConfig, StoreLock, Target, TargetConfig,
     TargetCredentials, TargetStorePaths, TARGET_STORE_VERSION,
 };
+use common::spawn::Spawn;
 
 /// 64 ASCII alphanumerics: the shape `cli_core::target` accepts.
 const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -38,18 +40,17 @@ const STILL_WAITING: Duration = Duration::from_millis(500);
 
 /// A scratch sandbox with a seeded store: targets `a` (active) and `b`.
 struct Sandbox {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
+    spawn: Spawn,
 }
 
 impl Sandbox {
     fn new() -> Sandbox {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        for sub in ["home", "config", "cache", "bin"] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
-        }
-        let sandbox = Sandbox { _dir: dir, root };
+        Sandbox::on(Spawn::new())
+    }
+
+    /// The seeded store in `spawn`'s sandbox: a mock API or a working directory of the test's.
+    fn on(spawn: Spawn) -> Sandbox {
+        let sandbox = Sandbox { spawn };
         let paths = sandbox.store();
         for name in ["a", "b"] {
             save_target(
@@ -80,42 +81,27 @@ impl Sandbox {
     }
 
     fn store(&self) -> TargetStorePaths {
-        TargetStorePaths::for_root(self.root.join("store"))
+        TargetStorePaths::for_root(self.spawn.store())
     }
 
     fn apprafter(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_apprafter"));
-        c.env_clear()
-            .env("PATH", self.root.join("bin"))
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("APPRAFTER_CONFIG_DIR", self.root.join("store"))
-            .env("APPRAFTER_SKIP_STARTUP_CHECKS", "1")
-            .env("KUBECONFIG", self.root.join("no-kubeconfig"))
-            .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
-            .current_dir(self.root.join("home"))
-            .stdin(Stdio::null())
+        let mut c = self.spawn.std(args);
+        c.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .args(args);
-        // Windows cannot start a process without its system root.
-        if let Some(root) = std::env::var_os("SYSTEMROOT") {
-            c.env("SYSTEMROOT", root);
-        }
+            .stderr(Stdio::piped());
         c
     }
 
     /// The line a command prints while it waits for the store lock.
     fn waiting_line(&self) -> String {
         format!(
-            "waiting for another AppRafter process to release the target store ({})…",
+            "waiting for another AppRafter process to finish writing the target store ({})…",
             self.store().lock_file().display()
         )
     }
 
     fn read(&self, rel: &str) -> String {
-        std::fs::read_to_string(self.root.join("store").join(rel)).unwrap()
+        std::fs::read_to_string(self.spawn.store().join(rel)).unwrap()
     }
 }
 
@@ -129,8 +115,10 @@ struct Running {
 }
 
 impl Running {
-    fn spawn(sandbox: &Sandbox, args: &[&str]) -> Running {
-        let mut child = sandbox.apprafter(args).spawn().expect("spawn apprafter");
+    fn spawn(sandbox: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Running {
+        let mut command = sandbox.apprafter(args);
+        command.envs(env.iter().copied());
+        let mut child = command.spawn().expect("spawn apprafter");
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let mut pipe = child.stderr.take().unwrap();
         let sink = Arc::clone(&stderr);
@@ -210,9 +198,30 @@ impl Running {
 /// and keep waiting; released, it must finish successfully. Returns its
 /// output.
 fn waits_for_the_lock(sandbox: &Sandbox, args: &[&str]) -> Output {
+    waits_for_the_lock_while(sandbox, args, || {})
+}
+
+/// [`waits_for_the_lock`], the command given `env` besides the sandbox's.
+fn waits_for_the_lock_env(sandbox: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Output {
+    waits_for_the_lock_with(sandbox, args, env, || {})
+}
+
+/// [`waits_for_the_lock`], running `meanwhile` while the command waits —
+/// another process's edit landing between the command's plan and its
+/// execution.
+fn waits_for_the_lock_while(sandbox: &Sandbox, args: &[&str], meanwhile: impl FnOnce()) -> Output {
+    waits_for_the_lock_with(sandbox, args, &[], meanwhile)
+}
+
+fn waits_for_the_lock_with(
+    sandbox: &Sandbox,
+    args: &[&str],
+    env: &[(&str, &str)],
+    meanwhile: impl FnOnce(),
+) -> Output {
     let held = StoreLock::exclusive(&sandbox.store()).unwrap();
     assert!(held.is_held());
-    let mut run = Running::spawn(sandbox, args);
+    let mut run = Running::spawn(sandbox, args, env);
     let waiting = sandbox.waiting_line();
 
     let deadline = Instant::now() + BOUND;
@@ -236,6 +245,7 @@ fn waits_for_the_lock(sandbox: &Sandbox, args: &[&str]) -> Output {
             "ended ({status}) while the test still held the store lock"
         ));
     }
+    meanwhile();
 
     drop(held);
     let out = run.finish();
@@ -296,6 +306,35 @@ fn target_remove_waits_for_the_store_lock() {
     assert!(!sb.store().target_dir("b").exists());
 }
 
+/// R6 under a race: `target remove` warns about the server it leaves running
+/// even when the server was recorded after its first look at the state —
+/// here while it waits for the lock, as an `apply` in another terminal that
+/// took the lock first would. The warning is the one `remove` prints before
+/// it asks, and it is printed once.
+#[test]
+fn target_remove_warns_about_a_server_recorded_while_it_waited() {
+    let sb = Sandbox::new();
+    let state = cli_state::StatePaths::for_active_target(&sb.store(), "b");
+    let out = waits_for_the_lock_while(&sb, &["target", "remove", "b", "--yes"], || {
+        std::fs::create_dir_all(state.state_dir()).unwrap();
+        std::fs::write(
+            state.state_file(),
+            r#"{"hetzner_cloud":{"server_id":42,"server_name":"b-node","server_type":"cx22"}}"#,
+        )
+        .unwrap();
+    });
+    assert!(
+        stdout(&out).contains("target `b` removed"),
+        "{}",
+        stdout(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warning = "warning: target `b` records server `b-node` (id 42); removing the target does \
+                   not delete it";
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    assert!(!sb.store().state_dir("b").exists());
+}
+
 #[test]
 fn target_machine_waits_for_the_store_lock() {
     let sb = Sandbox::new();
@@ -337,17 +376,107 @@ fn target_add_renew_waits_for_the_store_lock() {
     assert!(sb.read("targets/a/credentials.yaml").contains(TOKEN_B));
 }
 
-/// Restores a directory's mode on drop, so a failed test still lets its
-/// `TempDir` clean up.
-#[cfg(unix)]
-struct ModeGuard(PathBuf);
+// ── WI-487: every writer of a target's state.json waits for the store lock ──
 
-#[cfg(unix)]
-impl Drop for ModeGuard {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+/// The five listings `destroy` and `import` read, on a mock of the Hetzner API: `servers` as
+/// given, every other kind empty.
+fn hetzner_with(servers: &str) -> mockito::ServerGuard {
+    let mut api = mockito::Server::new();
+    for (path, body) in [
+        ("/v1/servers", format!(r#"{{"servers":[{servers}]}}"#)),
+        ("/v1/ssh_keys", r#"{"ssh_keys":[]}"#.to_string()),
+        ("/v1/networks", r#"{"networks":[]}"#.to_string()),
+        ("/v1/firewalls", r#"{"firewalls":[]}"#.to_string()),
+        ("/v1/floating_ips", r#"{"floating_ips":[]}"#.to_string()),
+    ] {
+        api.mock("GET", path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
     }
+    api
+}
+
+/// `a`'s state.json, as the store holds it.
+const A_STATE: &str = "state/a/.apprafter/state.json";
+
+fn write_a_state(sb: &Sandbox, body: &str) {
+    let state = cli_state::StatePaths::for_active_target(&sb.store(), "a");
+    std::fs::create_dir_all(state.state_dir()).unwrap();
+    std::fs::write(state.state_file(), body).unwrap();
+}
+
+#[test]
+fn init_waits_for_the_store_lock() {
+    let sb = Sandbox::new();
+    let out = waits_for_the_lock(
+        &sb,
+        &[
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "team",
+            "--region",
+            "fsn1",
+        ],
+    );
+    assert!(stdout(&out).contains("would init"), "{}", stdout(&out));
+    let state = sb.read(A_STATE);
+    assert!(
+        state.contains("\"fsn1\"") && state.contains("\"team\""),
+        "{state}"
+    );
+}
+
+#[test]
+fn destroy_waits_for_the_store_lock() {
+    let api = hetzner_with("");
+    let sb = Sandbox::on(Spawn::new().with_hcloud(api.url()));
+    write_a_state(
+        &sb,
+        r#"{"provider":"hetzner-cloud","cluster_name":"platform-1","region":"nbg1",
+            "hetzner_cloud":{"server_id":42,"server_name":"platform-1"}}"#,
+    );
+    let out = waits_for_the_lock_env(&sb, &["destroy", "--yes"], &[("HCLOUD_TOKEN", TOKEN_A)]);
+    assert!(
+        stdout(&out).contains("destroy complete: 0 resource(s) removed"),
+        "{}",
+        stdout(&out)
+    );
+    let state = sb.read(A_STATE);
+    assert!(state.contains("\"hetzner_cloud\": null"), "{state}");
+    assert!(state.contains("\"nbg1\""), "{state}");
+}
+
+#[test]
+fn import_waits_for_the_store_lock() {
+    let api = hetzner_with(
+        r#"{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}"#,
+    );
+    let sb = Sandbox::on(Spawn::new().with_hcloud(api.url()));
+    let out = waits_for_the_lock_env(&sb, &["import"], &[("HCLOUD_TOKEN", TOKEN_A)]);
+    assert!(
+        stdout(&out).contains("import: wrote state for cluster `platform-1`"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(sb.read(A_STATE).contains("\"server_id\": 42"));
+}
+
+/// The one-shot move of a legacy `<cwd>/.apprafter/state.json` writes the target's state, so
+/// it waits for the store lock too — here under `plan`, a command that writes nothing else.
+#[test]
+fn a_legacy_state_moves_in_under_the_store_lock() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy = project.path().join(".apprafter").join("state.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, r#"{"cluster_name":"legacy"}"#).unwrap();
+    let sb = Sandbox::on(Spawn::new().current_dir(project.path()));
+    waits_for_the_lock(&sb, &["plan"]);
+    assert!(!legacy.exists(), "the legacy state stayed");
+    assert!(sb.read(A_STATE).contains("\"legacy\""));
 }
 
 /// `target use` of the target that is already active writes nothing, so a
@@ -360,12 +489,10 @@ impl Drop for ModeGuard {
 #[cfg(unix)]
 #[test]
 fn target_use_on_a_read_only_store_warns_and_succeeds() {
-    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new();
     let root = sb.store().root().to_path_buf();
     assert!(!sb.store().lock_file().exists(), "seeding took no lock");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let _restore = ModeGuard(root.clone());
+    let _restore = cli_core::owner_only::testing::ModeGuard::set(&root, 0o555);
     if std::fs::write(root.join("probe"), b"").is_ok() {
         eprintln!(
             "SKIPPED target_use_on_a_read_only_store_warns_and_succeeds: a 0555 directory is \
@@ -387,13 +514,13 @@ fn target_use_on_a_read_only_store_warns_and_succeeds() {
         stdout(&out)
     );
     let warning = format!(
-        "warning: cannot lock the target store ({}): ",
+        "warning: cannot take the target store's write lock ({}): ",
         sb.store().lock_file().display()
     );
     let line = stderr
         .lines()
         .find(|l| l.starts_with(&warning))
         .unwrap_or_else(|| panic!("no `{warning}…` line:\n{stderr}"));
-    assert!(line.ends_with("; continuing without the lock"), "{line}");
+    assert!(line.ends_with("; continuing without it"), "{line}");
     assert!(!sb.store().lock_file().exists());
 }

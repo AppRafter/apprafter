@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use cli_core::style;
-use cli_core::target::{load_target, save_target, FirewallConfig, TargetConfig};
+use cli_core::target::{load_target_config, save_target_config, FirewallConfig, TargetConfig};
 use cli_core::Result;
 use cli_providers::hetzner_cloud::{
     Firewall, FirewallRule, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
@@ -316,13 +316,14 @@ pub(crate) fn apply_cloudflare_origin(
     let store = resolved.store;
 
     // 1. Persist the toggle FIRST (intent survives even if the live reconcile
-    //    can't run / the CF fetch fails), under the store lock.
-    let target = {
+    //    can't run / the CF fetch fails), under the store lock. config.yaml
+    //    only: the credentials file is neither read nor written here (D.4a b).
+    let config = {
         let _store_lock = crate::commands::target::store_lock_if_present(&store)?;
-        let mut target = load_target(&store, &resolved.target_name)?;
-        target.config = with_cloudflare_origin(target.config, enable);
-        save_target(&store, &target)?;
-        target
+        let config =
+            with_cloudflare_origin(load_target_config(&store, &resolved.target_name)?, enable);
+        save_target_config(&store, &resolved.target_name, &config)?;
+        config
     };
 
     // 1b. Record it in the cluster, where a backup can see it. Best-effort:
@@ -338,9 +339,9 @@ pub(crate) fn apply_cloudflare_origin(
     let state = State::load_or_default(&resolved.paths)?;
     let cluster = resolve_cluster_name(
         state.cluster_name.as_deref(),
-        target.config.cluster_name.as_deref(),
+        config.cluster_name.as_deref(),
     );
-    let token = cli_core::resolve_hetzner_token(None, &store, target_override)?;
+    let token = crate::token::hetzner_token(target_override)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
 
     // 3. Find the live firewall (cached id, else list+label+name).

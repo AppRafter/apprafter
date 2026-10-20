@@ -1,0 +1,23 @@
+$ apprafter target add prod --provider hetzner-cloud --token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-key <SANDBOX>/home/id_ed25519.pub --no-interactive
+[exit 1]
+[stdout]
+[stderr]
+<ESC>[2m<TS><ESC>[0m <ESC>[32m INFO<ESC>[0m target add invoked <ESC>[3mtarget<ESC>[0m<ESC>[2m=<ESC>[0mprod <ESC>[3mrenew<ESC>[0m<ESC>[2m=<ESC>[0mfalse <ESC>[3mforce<ESC>[0m<ESC>[2m=<ESC>[0mfalse
+Error: apprafter::target::provider_unreachable
+
+  × provider `hetzner-cloud` API was unreachable
+  ╰─▶   × transport error talking to <HCLOUD>/v1/locations:
+        │ Connection Failed: Connect error: Connection refused (os error <N>)
+      
+  help: The request could not complete because the provider's API was
+        unreachable. This is NOT a credentials problem — the token may still
+        be valid once the API recovers.
+        • Run `apprafter doctor` to confirm reachability + DNS.
+        • Check the provider's status page (https://status.hetzner.com/ for
+        hetzner-cloud).
+        • If you're behind a VPN / corporate proxy, ensure `https://
+        api.hetzner.cloud/` is reachable.
+        • Pass `--no-ping` to skip the provider round-trip and save offline
+        (`target add`, also with `--renew`, and `target machine` take it); you
+        can re-verify later with `apprafter doctor`.
+

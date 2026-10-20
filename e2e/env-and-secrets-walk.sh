@@ -159,7 +159,7 @@
 # Local-operator mode (FORCED)
 # ----------------------------
 # The D7 line asserted in leg 9 ships in the WORKING-TREE CLI, which lib.sh's
-# `apprafter()` already runs from source (`cargo run`), so the CLI half needs
+# `apprafter()` already builds from source (`cargo build`), so the CLI half needs
 # no side-load. The OPERATOR halves it depends on — the `EnvSecretMissing`
 # message naming the available keys, and `status.envConfig` — are 2.22c, so the
 # walk FORCES APPRAFTER_E2E_LOCAL_OPERATOR=1 (precedent:
@@ -212,7 +212,7 @@ source "$(dirname "$0")/lib.sh"
 export APPRAFTER_E2E_LOCAL_OPERATOR=1
 
 # The stale-pod row and its note go through cli-core::style, which honours
-# NO_COLOR lazily per format call. Exported globally so every `cargo run`
+# NO_COLOR lazily per format call. Exported globally so every CLI
 # child inherits it and every captured file is plain text.
 export NO_COLOR=1
 
@@ -293,7 +293,7 @@ fi
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 GIT_REPOS_DIR="${TMPDIR_WORK}/git-repos"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 OUT_DIR="${TMPDIR_WORK}/out"        # captured CLI output lives here
@@ -348,21 +348,13 @@ trap cleanup EXIT
 # ---------------------------------------------------------------
 # Helper: apprafter CLI with cwd = the fixture dir.
 #
-# lib.sh's apprafter() always cd's to REPO_ROOT/cli; `app add` however uses
-# the CWD to locate apprafter/Application.cue (the scaffold gate). We cd into
-# the fixture and pass --manifest-path so cargo still finds the CLI workspace.
-# Only `app add` needs this; `secret *` and `app status` use the plain
-# apprafter() from lib.sh.
+# `app add` uses the CWD to locate apprafter/Application.cue (the scaffold
+# gate). lib.sh's apprafter_in runs the CLI with the fixture dir as its
+# working directory, on the walk's isolated store. Only `app add` needs this;
+# `secret *` and `app status` use the plain apprafter() from lib.sh.
 # ---------------------------------------------------------------
 apprafter_from_fixture() {
-    (
-        cd "${FIXTURE_SRC}"
-        cargo run \
-            --manifest-path "${REPO_ROOT}/cli/Cargo.toml" \
-            --quiet \
-            --bin apprafter \
-            -- "$@"
-    )
+    apprafter_in "${FIXTURE_SRC}" "$@"
 }
 
 # ---------------------------------------------------------------

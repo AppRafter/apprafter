@@ -116,7 +116,7 @@ ensure_restic_on_path
 # ---------------------------------------------------------------
 
 TMPDIR_WORK="$(mktemp -d)"
-APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
+e2e_isolate_store "${TMPDIR_WORK}"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 EXPORT_DIR="${TMPDIR_WORK}/export-out"
 

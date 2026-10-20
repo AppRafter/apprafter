@@ -11,15 +11,20 @@
 //! the rendered stderr in a real subprocess matches what miette
 //! is supposed to produce.
 
+mod common;
+
+use common::spawn::Spawn;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 
-fn cli() -> Command {
-    Command::cargo_bin("apprafter").unwrap()
+fn cli(sp: &Spawn) -> Command {
+    sp.cmd(&[])
 }
 
-/// `apply` without any credentials → resolver fails through the
-/// 3-step chain → typed `Other` error with the chain mentioned.
+/// `apply` on a target that stores no token → the token read
+/// refuses with the core's typed `token_missing` (D.4a T15; the
+/// catch-all `Other` before).
 /// We assert the miette plumbing renders both the `help:` block
 /// and a recognisable diagnostic structure. Independent of which
 /// variant the underlying error is, miette's `fancy` reporter
@@ -29,12 +34,11 @@ fn cli() -> Command {
 fn unhandled_error_renders_with_miette_help_line() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    let sp = Spawn::new().with_store(cfg_dir.path());
     // Seed an active target without a token so the apply below
-    // fails at the credential resolver (the `Other` variant with
-    // the `apprafter::cli::other` code we're asserting on).
-    cli()
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
+    // fails at the token read (`TokenNotStored`, with the
+    // `apprafter::target::token_missing` code we're asserting on).
+    cli(&sp)
         .args([
             "target",
             "add",
@@ -53,10 +57,8 @@ fn unhandled_error_renders_with_miette_help_line() {
         .assert()
         .success();
     std::fs::remove_file(cfg_dir.path().join("targets/default/credentials.yaml")).unwrap();
-    cli()
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .args([
             "init",
             "--provider",
@@ -69,11 +71,8 @@ fn unhandled_error_renders_with_miette_help_line() {
         .assert()
         .success();
 
-    let assert = cli()
+    let assert = cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
-        .env_remove("APPRAFTER_HCLOUD_BASE_URL")
         // Disable color so the substring matches don't have to
         // navigate ANSI escape codes. miette honours NO_COLOR.
         .env("NO_COLOR", "1")
@@ -83,11 +82,11 @@ fn unhandled_error_renders_with_miette_help_line() {
 
     // The `help:` line is miette's signature output — its
     // presence is the proof we're going through the fancy
-    // reporter, not eyre / Debug. Catch-all `Other` variant
-    // ships with the `apprafter::cli::other` code.
+    // reporter, not eyre / Debug. `TokenNotStored` ships with
+    // the core's `apprafter::target::token_missing` code.
     assert
         .stderr(contains("help:"))
-        .stderr(contains("apprafter::cli::other"));
+        .stderr(contains("apprafter::target::token_missing"));
 }
 
 /// `apply --target ghost` against a populated store → typed
@@ -98,10 +97,9 @@ fn unhandled_error_renders_with_miette_help_line() {
 fn typed_target_not_found_renders_with_dedicated_code_and_help() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    cli()
+    let sp = Spawn::new().with_store(cfg_dir.path());
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         // Seed a real target so the "available" hint can list it.
         .args([
             "target",
@@ -127,10 +125,8 @@ fn typed_target_not_found_renders_with_dedicated_code_and_help() {
     // a state file. The `target show ghost` subcommand also
     // surfaces `TargetNotFound`; pick that, it's read-only and
     // doesn't touch the API.
-    cli()
+    cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .env("NO_COLOR", "1")
         .args(["target", "show", "ghost"])
         .assert()
@@ -151,10 +147,9 @@ fn typed_target_not_found_renders_with_dedicated_code_and_help() {
 fn no_color_env_yields_ansi_free_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let assert = cli()
+    let sp = Spawn::new().with_store(cfg_dir.path());
+    let assert = cli(&sp)
         .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .env_remove("HCLOUD_TOKEN")
         .env("NO_COLOR", "1")
         .args(["target", "show", "ghost"])
         .assert()

@@ -4,7 +4,7 @@
 // StrictMode's double mount too), every registration is followed by a read, and wherever the
 // ['lock'] entry is written — the read, an event, the answer of lock_now or unlock — a state
 // of an earlier transition (`seq`) than the one held is dropped, whatever its time says.
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { type QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { act, cleanup, renderHook } from '@testing-library/react';
@@ -12,7 +12,8 @@ import type { ReactNode } from 'react';
 import { LOCK_CHANGED } from '../ipc/generated/events';
 import type { LockState } from '../ipc/generated/LockState';
 import { lockState } from '../test/fixtures';
-import { useLockActions, useLockState } from './lock';
+import { settleIpc } from '../test/settle';
+import { lockOff, NO_AUTH_NOTICE, noAuthNotice, useLockActions, useLockState } from './lock';
 import { createQueryClient } from './queryClient';
 
 interface TauriInternals {
@@ -74,8 +75,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await settleIpc();
   clearMocks();
 });
 
@@ -260,4 +262,22 @@ test('a listener registered again is followed by a read: what changed meanwhile 
   expect(order.filter((cmd) => cmd === 'lock_status')).toHaveLength(2);
   await answerStatus(lockState({ locked: true, reason: 'idle', sinceMs: 2_000, seq: 2 }));
   expect(result.current.state.data?.locked).toBe(true);
+});
+
+describe('a protected store (D.4a T74)', () => {
+  test('its lock is in effect whatever the OS offers and whatever the saved switch says', () => {
+    expect(lockOff(false, true, true)).toBeNull();
+    expect(lockOff(true, false, true)).toBeNull();
+    expect(lockOff(false, false, true)).toBeNull();
+    // Unprotected, as before.
+    expect(lockOff(false, true)).toBe('no_auth');
+    expect(lockOff(true, false)).toBe('turned_off');
+  });
+  test('the banner says confirmations ask for the lock password (D25)', () => {
+    expect(noAuthNotice(true, true)).toBeNull();
+    expect(noAuthNotice(false, false)).toBe(NO_AUTH_NOTICE);
+    expect(noAuthNotice(false, true)).toBe(
+      'This computer offers no system authentication AppRafter can use: confirmations ask for the lock password.',
+    );
+  });
 });

@@ -4,7 +4,9 @@
 //! A slice registers a plan — what the webview shows ([`PlanParts`]) and what runs once it is
 //! confirmed ([`Executor`]) — and the webview gets a [`PlanView`] and an id. The plan never
 //! crosses IPC. [`OperationManager::execute`] consumes it exactly once, asks the device owner
-//! itself when the plan needs a gesture, and runs the executor on a thread of its own.
+//! itself when the plan needs a gesture, and runs the executor on a thread of its own. A plan's
+//! gesture is the OS's, or the target store's secret checked in Rust ([`SecretGesture`], D.4a
+//! T76).
 //!
 //! An operation's events go into its [`ReplayBuffer`] and to every subscribed
 //! [`EventSink`], both under the manager's lock, so a page that subscribes gets the replay
@@ -21,9 +23,20 @@
 //! try ([`OperationManager::execute`] says why), and its pages hear nothing until it runs or
 //! ends.
 //!
+//! A lock refuses an OS prompt still open, but not a secret the person typed into the app and
+//! submitted with the confirm, whose check (a key derivation, a PAM check) is still running:
+//! that change was confirmed at the click, and is judged on its answer (D.4a F18, the owner's
+//! O15). A cancel or a quit refuses either.
+//!
 //! A plan leaves the manager's maps under its lock and is dropped after the lock is released:
 //! what an executor captured may do anything when it goes, calling back into the manager
 //! included.
+//!
+//! A read needs no plan: [`start`](OperationManager::start) runs it at once, on a thread of
+//! its own like a confirmed plan, and the page follows it with the same subscriptions and
+//! replay, and can [`cancel`](OperationManager::cancel) it. A lock stops every read
+//! ([`cancel_reads`](OperationManager::cancel_reads)) but no plan already running: a running
+//! plan was confirmed, a read was not, and what a locked page cannot see it must not wait for.
 //!
 //! Quitting [`close`](OperationManager::close)s the manager first: from then on no operation
 //! starts, decided under the same lock hold that would start it, so nothing begins between the
@@ -40,7 +53,7 @@ use apprafter_core::{
     CancellationToken, CoreError, CoreResult, Outcome, PlanClass, PlannedChange, Reporter, UiError,
 };
 use apprafter_desktop_ipc::{
-    AuthOutcome, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
+    Gesture, OpEvent, OpId, OpState, OpSummary, PlanView, Subscribed, SubscriptionId,
     UnavailableReason,
 };
 
@@ -115,11 +128,36 @@ pub type Executor = Box<
     dyn FnOnce(&dyn Reporter, &CancellationToken) -> CoreResult<Outcome<serde_json::Value>> + Send,
 >;
 
+/// A plan's gesture that is the target store's secret (`Gesture::StoreSecret`, D.4a T76):
+/// typed into the confirm dialog's field and checked against the store's vault in Rust —
+/// always for Stop protecting (O11: a fresh slot secret, never a window), and for every
+/// destructive plan on a protected store with no OS authenticator.
+pub trait SecretGesture: Send + Sync {
+    /// Checks `secret` (blocking: a key derivation). `Ok` confirms the plan; a refusal the
+    /// person may retry (`auth_failed`, `auth_busy`) keeps it waiting, as a wrong password
+    /// does.
+    fn check(&self, secret: Zeroizing<String>) -> Result<(), Refusal>;
+}
+
+/// What confirming a plan asks of the person.
+#[derive(Clone)]
+enum Confirm {
+    /// The OS's own gesture, or its password in the app's field.
+    Os(AuthPurpose),
+    /// The target store's secret in the confirm dialog's field.
+    StoreSecret(Arc<dyn SecretGesture>),
+}
+
 pub struct OperationManager {
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
     /// Notified whenever an operation stops running.
     ended: Condvar,
+    /// The bound of every [`cancel_all_and_wait`](Self::cancel_all_and_wait), in order: how a
+    /// test tells which bound a quit waited with, and that an exit waited for nothing, without
+    /// reading a clock (GOTCHA-332).
+    #[cfg(test)]
+    stop_bounds: Mutex<Vec<Duration>>,
 }
 
 #[derive(Default)]
@@ -184,7 +222,7 @@ struct Pending {
     title: String,
     target: Option<String>,
     /// Set when the owner must confirm before it runs.
-    gesture: Option<AuthPurpose>,
+    gesture: Option<Confirm>,
     /// When it was registered; one [`PLAN_TTL_MS`] after it, `execute` refuses the plan.
     registered: Stamp,
     exec: Executor,
@@ -208,17 +246,29 @@ impl Pending {
 struct Prompt {
     /// Tripping it closes the OS dialog.
     cancel: CancellationToken,
-    /// Set under the manager's lock by a lock, a cancel or a quit: the plan is refused,
-    /// whatever the OS answers. The token trips later, on a thread of its own, so this flag —
-    /// not the token — decides; a `Verified` that arrives before the dialog closed is
-    /// refused too.
+    /// Set under the manager's lock by a cancel, a quit, or a lock — a lock unless the answer
+    /// is `submitted`: the plan is refused, whatever the OS answers. The token trips later, on
+    /// a thread of its own, so this flag — not the token — decides; a `Verified` that arrives
+    /// before the dialog closed is refused too.
     refused: bool,
+    /// The answer is a secret the person typed into the app and submitted with the confirm —
+    /// the store's secret, or the app's own password field for the OS's gesture — being
+    /// checked (a key derivation, a PAM check): the change was confirmed at the click (D.4a
+    /// F18, the owner's O15). A lock does not refuse it; it is judged on its answer
+    /// (`locked`). An OS prompt still open (polkit, Windows Hello, Touch ID) was not answered
+    /// yet: a lock refuses it.
+    submitted: bool,
+    /// Set under the manager's lock by a lock that passed a `submitted` prompt: the right secret
+    /// runs the plan, a wrong one refuses it as `Locked` — no plan waits across a lock for
+    /// another try ([`judge`]).
+    locked: bool,
     sinks: Vec<Subscriber>,
 }
 
 struct Op {
     title: String,
     target: Option<String>,
+    kind: OpKind,
     started_at_ms: u64,
     status: Status,
     replay: ReplayBuffer,
@@ -234,6 +284,22 @@ impl Op {
             Status::Ended(_) => None,
         }
     }
+}
+
+/// Started by `execute` (a confirmed plan) or by `start` (a read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Plan,
+    Read,
+}
+
+/// What [`OperationManager::launch`] inserts besides the executor.
+struct Launch {
+    title: String,
+    target: Option<String>,
+    kind: OpKind,
+    /// Pages that followed the plan before it ran; none for a read.
+    sinks: Vec<Subscriber>,
 }
 
 enum Status {
@@ -268,7 +334,18 @@ impl OperationManager {
             clock,
             inner: Mutex::default(),
             ended: Condvar::new(),
+            #[cfg(test)]
+            stop_bounds: Mutex::default(),
         })
+    }
+
+    /// The bounds the quits and exits waited with so far (see `stop_bounds`).
+    #[cfg(test)]
+    pub(crate) fn stop_bounds(&self) -> Vec<Duration> {
+        self.stop_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Keep a plan for [`execute`](Self::execute); the view is all the webview gets. Its
@@ -281,13 +358,36 @@ impl OperationManager {
     /// tick, so an abandoned plan does not keep what its executor captured. Until then
     /// `execute` answers `PlanExpired`.
     pub fn register_plan(&self, parts: PlanParts, exec: Executor) -> PlanView {
+        self.register_plan_with(parts, exec, None)
+    }
+
+    /// [`register_plan`](Self::register_plan), its gesture — when it needs one — the target
+    /// store's secret, checked by `secret`, instead of the OS (D.4a T76). A destructive plan's
+    /// only: any other keeps the OS's gesture, whatever `secret` is.
+    pub fn register_plan_with(
+        &self,
+        parts: PlanParts,
+        exec: Executor,
+        secret: Option<Arc<dyn SecretGesture>>,
+    ) -> PlanView {
         let registered = Stamp::now(&*self.clock);
         let expires_at_ms = registered.wall_ms.saturating_add(PLAN_TTL_MS);
         let needs_gesture = parts.requires_gesture || parts.class == PlanClass::Destructive;
-        let gesture = needs_gesture.then(|| AuthPurpose::Confirm {
-            target: parts.target.clone(),
-            verb: parts.verb,
-        });
+        // Only a destructive plan takes the store's secret (critic B finding 24): an approval
+        // that `requires_gesture` keeps the OS's, whatever a slice hands it.
+        let secret = secret.filter(|_| parts.class == PlanClass::Destructive);
+        // What the view tells the page `execute` will ask (D.4a §3.14).
+        let (gesture, view_gesture) = match (needs_gesture, secret) {
+            (false, _) => (None, Gesture::None),
+            (true, Some(secret)) => (Some(Confirm::StoreSecret(secret)), Gesture::StoreSecret),
+            (true, None) => (
+                Some(Confirm::Os(AuthPurpose::Confirm {
+                    target: parts.target.clone(),
+                    verb: parts.verb,
+                })),
+                Gesture::Os,
+            ),
+        };
         let mut inner = self.lock();
         let swept = inner.sweep(&*self.clock);
         inner.next_id += 1;
@@ -312,6 +412,7 @@ impl OperationManager {
             changes: parts.changes,
             target: parts.target,
             expires_at_ms,
+            gesture: view_gesture,
         }
     }
 
@@ -330,6 +431,12 @@ impl OperationManager {
     /// when the OS still answered yes — and so does a prompt that stayed open past the
     /// plan's expiry; the executor then never runs. Otherwise it starts on a thread of its
     /// own, named `op-<id>`, with an 8 MiB stack.
+    ///
+    /// A secret typed into the app (`password`) was submitted with the confirm, so the change
+    /// was confirmed at the click (D.4a F18, the owner's O15): a lock while it is checked does
+    /// not refuse it. It is judged on its answer — the right one runs the plan after the lock
+    /// (its pages, dropped by the lock, hear nothing; the operation's replay keeps its end), a
+    /// wrong one refuses it as `Locked`. A cancel and a quit still refuse it.
     ///
     /// Why a failed gesture keeps the plan, where a cancelled or unavailable one spends it: a
     /// typo would otherwise send the owner back to plan the change again, and keeping it gives
@@ -368,7 +475,9 @@ impl OperationManager {
     /// the OS cannot prompt — instead of opening the OS's prompt
     /// ([`Authenticator::verify_password`]), by the same rules. A refused gesture carries what
     /// the OS said (PAM's messages), to the caller and to the pages that followed the plan. A
-    /// plan that needs no gesture runs as it would, the password wiped unread.
+    /// plan that needs no gesture runs as it would, the password wiped unread. A plan whose
+    /// gesture is the store's secret checks `password` against the vault ([`SecretGesture`]);
+    /// without it, the answer is `AuthUnavailable` with `UsePasswordField` and the plan waits.
     pub fn execute_with(
         self: &Arc<Self>,
         id: OpId,
@@ -387,20 +496,34 @@ impl OperationManager {
             return spend(inner, plan, DesktopError::PlanExpired { op_id: id });
         }
         let mut plan = plan;
-        if let Some(purpose) = plan.gesture.clone() {
+        if let Some(confirm) = plan.gesture.clone() {
             let cancel = CancellationToken::new();
             inner.prompts.insert(
                 id,
                 Prompt {
                     cancel: cancel.clone(),
                     refused: false,
+                    // Typed into the app and sent with the confirm: the store's secret, or the
+                    // app's own field for the OS's gesture. Without it the OS prompts.
+                    submitted: password.is_some(),
+                    locked: false,
                     sinks: mem::take(&mut plan.sinks),
                 },
             );
             drop(inner);
-            let answer = panic::catch_unwind(AssertUnwindSafe(|| match password {
-                Some(password) => auth.verify_password(&purpose, password, &cancel),
-                None => auth.verify(&purpose, &cancel).into(),
+            let answer = panic::catch_unwind(AssertUnwindSafe(|| match (&confirm, password) {
+                (Confirm::Os(purpose), Some(password)) => auth
+                    .verify_password(purpose, password, &cancel)
+                    .into_result(),
+                (Confirm::Os(purpose), None) => {
+                    PasswordAnswer::from(auth.verify(purpose, &cancel)).into_result()
+                }
+                (Confirm::StoreSecret(secret), Some(typed)) => secret.check(typed),
+                // The store's secret is typed, never asked of the OS: the field is the way.
+                (Confirm::StoreSecret(_), None) => Err(DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField,
+                }
+                .into()),
             }));
             let expired = plan.expired(&*self.clock);
             inner = self.lock();
@@ -429,11 +552,74 @@ impl OperationManager {
                 }
             }
         }
-        // The same lock hold as the insert below: a quit that began while the prompt was
+        // The same lock hold as the insert in `launch`: a quit that began while the prompt was
         // open is seen here, and one that begins after it finds the operation running.
         if inner.closing {
             return spend(inner, plan, DesktopError::Closing);
         }
+        let launch = Launch {
+            title: plan.title,
+            target: plan.target,
+            kind: OpKind::Plan,
+            sinks: plan.sinks,
+        };
+        self.launch(inner, id, launch, plan.exec)
+            .map_err(Refusal::from)
+    }
+
+    /// Start a read now: no plan, no gesture. It runs on its own 8 MiB thread like an executed
+    /// plan, streams to subscribers (`subscribe`'s replay covers what came before), is listed by
+    /// `list`, and stops on `cancel(id)` or [`cancel_reads`](Self::cancel_reads). Once the
+    /// manager is closed it is refused with `Closing` — decided under the lock hold that would
+    /// start it — and the executor, with what it captured, is dropped at once, outside the lock.
+    pub fn start(
+        self: &Arc<Self>,
+        title: impl Into<String>,
+        target: Option<String>,
+        exec: Executor,
+    ) -> Result<OpId, DesktopError> {
+        let mut inner = self.lock();
+        if inner.closing {
+            drop(inner);
+            drop(exec);
+            return Err(DesktopError::Closing);
+        }
+        inner.next_id += 1;
+        let id = OpId(inner.next_id);
+        let launch = Launch {
+            title: title.into(),
+            target,
+            kind: OpKind::Read,
+            sinks: Vec::new(),
+        };
+        self.launch(inner, id, launch, exec)
+    }
+
+    /// The app locked or unlocked: every running read stops (its token trips on a thread of its
+    /// own, after the lock is released). Plans that already run were confirmed and go on.
+    pub fn cancel_reads(&self) {
+        let tokens: Vec<CancellationToken> = self
+            .lock()
+            .ops
+            .values()
+            .filter(|op| op.kind == OpKind::Read)
+            .filter_map(|op| op.run().map(|run| run.cancel.clone()))
+            .collect();
+        for token in tokens {
+            trip(token, CANCEL_THREAD);
+        }
+    }
+
+    /// Insert the running operation under `inner` — the caller checked `closing` in this same
+    /// hold — then start its thread. The shared tail of `execute_with` and `start`. A thread
+    /// that cannot start ends the operation failed, its pages told, and is `Internal`.
+    fn launch(
+        self: &Arc<Self>,
+        mut inner: MutexGuard<'_, Inner>,
+        id: OpId,
+        launch: Launch,
+        exec: Executor,
+    ) -> Result<OpId, DesktopError> {
         let cancel = CancellationToken::new();
         let reporter = {
             let manager = Arc::downgrade(self);
@@ -449,26 +635,26 @@ impl OperationManager {
         inner.ops.insert(
             id,
             Op {
-                title: plan.title,
-                target: plan.target,
+                title: launch.title,
+                target: launch.target,
+                kind: launch.kind,
                 started_at_ms: self.clock.now_ms(),
                 status: Status::Running(Run {
                     cancel: cancel.clone(),
                     reporter: reporter.clone(),
                 }),
                 replay: ReplayBuffer::new(REPLAY_CAP),
-                sinks: plan.sinks,
+                sinks: launch.sinks,
             },
         );
         drop(inner);
-        let exec = plan.exec;
         let manager = Arc::clone(self);
         if let Err(e) = spawn_op(id, move || manager.run_op(id, exec, &reporter, &cancel)) {
             // The pages that followed the plan wait for a final event: they get one.
             let message = format!("could not start the operation's thread: {e}");
             let error = DesktopError::Internal(message.clone()).to_ui();
             self.end(id, || (OpEvent::Failed { error }, OpState::Failed));
-            return Err(DesktopError::Internal(message).into());
+            return Err(DesktopError::Internal(message));
         }
         Ok(id)
     }
@@ -649,7 +835,10 @@ impl OperationManager {
     /// that followed it told `Locked` (`Closing` once the manager is closed: a quit drops the
     /// plans too), and every open prompt is refused before this returns (its dialog closes,
     /// and its `execute` refuses whatever the OS answers and tells its pages
-    /// `AuthCancelled`). Running operations go on: they were confirmed before the lock.
+    /// `AuthCancelled`). Running operations go on: they were confirmed before the lock. So does
+    /// a secret typed into the app and still being checked: it was confirmed at the click (D.4a
+    /// F18), and its `execute` judges it on its answer (`refuse_prompts`). A quit refuses that
+    /// too.
     pub fn drop_all_plans(&self) {
         let mut inner = self.lock();
         let why = if inner.closing {
@@ -661,7 +850,9 @@ impl OperationManager {
         for plan in &mut plans {
             refuse(&mut plan.sinks, &why);
         }
-        let prompts = refuse_prompts(&mut inner.prompts);
+        // A quit refuses every prompt; a lock passes a submitted secret to its judgement.
+        let lock = !inner.closing;
+        let prompts = refuse_prompts(&mut inner.prompts, lock);
         drop(inner);
         drop(plans);
         for token in prompts {
@@ -735,10 +926,15 @@ impl OperationManager {
     /// token, then wait until no executor runs or `bound` has passed. `true` when all ended
     /// in time.
     pub fn cancel_all_and_wait(&self, bound: Duration) -> bool {
+        #[cfg(test)]
+        self.stop_bounds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(bound);
         let deadline = Instant::now() + bound;
         let tokens: Vec<CancellationToken> = {
             let mut inner = self.lock();
-            let mut tokens = refuse_prompts(&mut inner.prompts);
+            let mut tokens = refuse_prompts(&mut inner.prompts, false);
             tokens.extend(
                 inner
                     .ops
@@ -804,51 +1000,64 @@ fn spend(
     Err(why.into())
 }
 
-/// Refuse every open prompt not refused yet; their tokens, to close their dialogs.
-fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>) -> Vec<CancellationToken> {
+/// Refuse every open prompt not refused yet; their tokens, to close their dialogs. A lock
+/// (`lock`) refuses no submitted secret (D.4a F18): it marks it `locked`, leaves its check to
+/// finish, and [`judge`] decides on its answer. A quit refuses every prompt.
+fn refuse_prompts(prompts: &mut HashMap<OpId, Prompt>, lock: bool) -> Vec<CancellationToken> {
     prompts
         .values_mut()
         .filter(|prompt| !prompt.refused)
-        .map(|prompt| {
+        .filter_map(|prompt| {
+            if lock && prompt.submitted {
+                prompt.locked = true;
+                return None;
+            }
             prompt.refused = true;
-            prompt.cancel.clone()
+            Some(prompt.cancel.clone())
         })
         .collect()
 }
 
-/// Whether the plan waits for the owner's next try after `outcome`, rather than ending
+/// Whether the plan waits for the owner's next try after `error`, rather than ending
 /// ([`OperationManager::execute`] says why): another prompt was open, the owner was not
-/// verified, the gesture could not be asked this way and the other way is there (on Linux,
-/// polkit without an agent or refusing outside an active local session hands over to the app's
-/// field, and the field where the OS prompts itself hands back to the OS's prompt), or the
-/// password was right but expired, and the owner tries again once it is changed.
-fn waits(outcome: AuthOutcome) -> bool {
+/// verified (a wrong password, a wrong store secret, a mistyped recovery key, the back-off),
+/// the gesture could not be asked this way and the other way is there (on Linux, polkit
+/// without an agent or refusing outside an active local session hands over to the app's
+/// field, and the field where the OS prompts itself hands back to the OS's prompt; a store's
+/// secret is typed into the field), or the password was right but expired, and the owner
+/// tries again once it is changed.
+fn waits(error: &DesktopError) -> bool {
     matches!(
-        outcome,
-        AuthOutcome::Busy
-            | AuthOutcome::Failed { .. }
-            | AuthOutcome::Unavailable {
+        error,
+        DesktopError::AuthBusy
+            | DesktopError::AuthFailed { .. }
+            | DesktopError::AuthUnavailable {
                 reason: UnavailableReason::NoAgent
                     | UnavailableReason::UsePasswordField
                     | UnavailableReason::UseSystemPrompt
                     | UnavailableReason::PasswordExpired,
             }
+            | DesktopError::Core(CoreError::RecoveryKeyInvalid { .. })
     )
 }
 
-/// What a prompt's answer means for plan `id`. `prompt` is its entry, gone when it was
+/// What a gesture's answer means for plan `id`. `prompt` is its entry, gone when it was
 /// closed some other way; `expired` says the plan's time to live passed while it was open.
 /// What the OS said comes with a refusal the OS gave, never with a yes refused afterwards.
-/// A failed gesture keeps the plan, as does one asked the wrong way or with an expired password
-/// ([`waits`]).
+/// A failed gesture keeps the plan, as does one asked the wrong way or with an expired
+/// password ([`waits`]) — unless a lock passed the typed secret (`Prompt::locked`, D.4a F18):
+/// then the plan runs on the right secret and is refused as `Locked` on a wrong one, since no
+/// plan waits across a lock.
 fn judge(
     id: OpId,
-    answer: thread::Result<PasswordAnswer>,
+    answer: thread::Result<Result<(), Refusal>>,
     prompt: Option<Prompt>,
     expired: bool,
 ) -> Answer {
-    let (refused, sinks) = prompt.map_or((true, Vec::new()), |p| (p.refused, p.sinks));
-    let PasswordAnswer { outcome, messages } = match answer {
+    let (refused, locked, sinks) = prompt.map_or((true, false, Vec::new()), |p| {
+        (p.refused, p.locked, p.sinks)
+    });
+    let answer = match answer {
         Ok(answer) => answer,
         Err(panic) => {
             let err = DesktopError::Internal(format!(
@@ -858,35 +1067,33 @@ fn judge(
             return Answer::Refuse(err.into(), sinks);
         }
     };
-    let said = |error: DesktopError| match outcome {
-        AuthOutcome::Verified => Refusal::from(error),
-        _ => Refusal::new(error, messages.clone()),
-    };
-    // A lock, a cancel or a quit closed it: whatever the OS answered, the plan was dropped.
+    let messages = answer
+        .as_ref()
+        .err()
+        .map(|refusal| refusal.messages.clone())
+        .unwrap_or_default();
+    let said = |error: DesktopError| Refusal::new(error, messages.clone());
+    // A lock, a cancel or a quit closed it: whatever was answered, the plan was dropped.
     if refused {
         return Answer::Refuse(said(DesktopError::AuthCancelled), sinks);
     }
-    let err = match outcome {
+    match answer {
         // Run, or wait for another try: neither once the plan has expired.
-        _ if expired && (outcome == AuthOutcome::Verified || waits(outcome)) => {
-            return Answer::Refuse(said(DesktopError::PlanExpired { op_id: id }), sinks);
+        Ok(()) if expired => Answer::Refuse(said(DesktopError::PlanExpired { op_id: id }), sinks),
+        Ok(()) => Answer::Run(sinks),
+        // The lock dropped every plan: one that would wait for another try goes too.
+        Err(refusal) if locked && waits(&refusal.error) => {
+            Answer::Refuse(said(DesktopError::Locked), sinks)
         }
-        AuthOutcome::Verified => return Answer::Run(sinks),
-        AuthOutcome::Busy => DesktopError::AuthBusy,
-        AuthOutcome::Failed {
-            exhausted,
-            retry_in_ms,
-        } => DesktopError::AuthFailed {
-            exhausted,
-            retry_in_ms,
-        },
-        AuthOutcome::Cancelled { .. } => DesktopError::AuthCancelled,
-        AuthOutcome::Unavailable { reason } => DesktopError::AuthUnavailable { reason },
-    };
-    if waits(outcome) {
-        return Answer::Again(said(err), sinks);
+        Err(refusal) if waits(&refusal.error) => {
+            if expired {
+                Answer::Refuse(said(DesktopError::PlanExpired { op_id: id }), sinks)
+            } else {
+                Answer::Again(refusal, sinks)
+            }
+        }
+        Err(refusal) => Answer::Refuse(refusal, sinks),
     }
-    Answer::Refuse(said(err), sinks)
 }
 
 /// The final event and state for how the executor returned.
@@ -976,10 +1183,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use apprafter_core::{
-        CancellationToken, CoreError, CoreResult, Event, Outcome, PlanClass, PlannedChange, Stream,
+        CancellationToken, ChangeAction, CoreError, CoreResult, Event, Outcome, PlanClass,
+        PlannedChange, Stream,
     };
     use apprafter_desktop_ipc::{
-        errors, AuthInfo, AuthOutcome, CancelledBy, OpEvent, OpId, OpState, OutputStream,
+        errors, AuthInfo, AuthOutcome, CancelledBy, Gesture, OpEvent, OpId, OpState, OutputStream,
         SubscriptionId, UnavailableReason,
     };
     use serde_json::json;
@@ -987,11 +1195,12 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        test_spawn, EventSink, Executor, OperationManager, PlanParts, ENDED_KEPT, PLAN_TTL_MS,
+        test_spawn, EventSink, Executor, OperationManager, PlanParts, SecretGesture, ENDED_KEPT,
+        PLAN_TTL_MS,
     };
     use crate::auth::test_os::{self, Call, ScriptedOs};
     use crate::auth::{AuthPurpose, Authenticator, FakeAuthenticator, NoAuthenticator};
-    use crate::errors::DesktopError;
+    use crate::errors::{DesktopError, Refusal};
     use crate::ops::replay::MESSAGE_CAP;
     use crate::ops::reporter::FLUSH_AGE_MS;
     use crate::ops::test_clock::ManualClock;
@@ -1014,7 +1223,8 @@ mod tests {
             changes: vec![PlannedChange {
                 kind: "Target".into(),
                 object: "prod".into(),
-                change: "delete".into(),
+                action: ChangeAction::Delete,
+                detail: None,
             }],
             ..PlanParts::new(class, "Remove target prod", "delete")
         }
@@ -2373,17 +2583,16 @@ mod tests {
         );
         mgr.execute(stubborn.op_id, &auth).unwrap();
         let bound = Duration::from_millis(200);
-        let started = Instant::now();
         let all_ended = {
             let mgr = mgr.clone();
             within("cancel_all_and_wait", move || {
                 mgr.cancel_all_and_wait(bound)
             })
         };
-        let waited = started.elapsed();
+        // It gave up, at its bound: the stubborn op ends only once let go, below, so a wait
+        // for it would never have returned (`within`), whatever the clock says (GOTCHA-332).
         assert!(!all_ended);
-        assert!(waited >= bound, "returned after {waited:?}");
-        assert!(waited < Duration::from_secs(5), "returned after {waited:?}");
+        assert_eq!(mgr.stop_bounds(), [bound]);
         // The bound says nothing about the polite one: it ends once its thread gets to it.
         assert_eq!(wait_ended(&mgr, polite.op_id), OpState::Cancelled);
         assert_eq!(mgr.running(), 1);
@@ -3082,6 +3291,14 @@ mod tests {
         fn monotonic_ms(&self) -> u64 {
             self.clock.monotonic_ms()
         }
+
+        fn with_sleep_ms(&self) -> u64 {
+            self.clock.with_sleep_ms()
+        }
+
+        fn awake_ms(&self) -> u64 {
+            self.clock.awake_ms()
+        }
     }
 
     #[test]
@@ -3438,5 +3655,538 @@ mod tests {
                 error: DesktopError::AuthCancelled.to_ui()
             }]
         );
+    }
+
+    // 18. Reads: run at once, followed, cancelled one by one or all at once on a lock, refused
+    // once the manager is closed.
+
+    /// Sets its flag when dropped: an executor that went without running.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    /// A read that waits for its token, then ends cancelled — or, when the token never trips,
+    /// ends completed once `LONG` has passed, so a cancel that never came fails as the wrong end
+    /// rather than passing at the deadline.
+    fn until_cancelled(started: &Arc<AtomicBool>) -> Executor {
+        let started = started.clone();
+        Box::new(move |_, cancel| {
+            started.store(true, SeqCst);
+            let deadline = Instant::now() + LONG;
+            while !cancel.is_cancelled() {
+                if Instant::now() >= deadline {
+                    return complete(json!("never cancelled"));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(CoreError::Cancelled)
+        })
+    }
+
+    #[test]
+    fn a_read_runs_at_once_and_a_late_subscriber_gets_its_whole_replay() {
+        let (_, mgr) = manager();
+        let exec: Executor = Box::new(|r, _| {
+            r.report(stage(1));
+            complete(json!({ "groups": [] }))
+        });
+        let id = mgr
+            .start("Doctor · prod", Some("prod".into()), exec)
+            .unwrap();
+        assert_eq!(wait_ended(&mgr, id), OpState::Finished);
+        let summary = mgr.list().into_iter().find(|s| s.op_id == id).unwrap();
+        assert_eq!(
+            (summary.title.as_str(), summary.target.as_deref()),
+            ("Doctor · prod", Some("prod"))
+        );
+        let page = VecSink::new("main");
+        let replay = mgr.subscribe(id, page.clone()).unwrap().replay;
+        assert_eq!(replay, vec![staged(1), completed(json!({ "groups": [] }))]);
+        assert!(page.events().is_empty(), "an ended read keeps no sink");
+    }
+
+    #[test]
+    fn cancel_stops_one_read_and_cancel_reads_every_read_but_no_confirmed_plan() {
+        let (_, mgr) = manager();
+        let (a, b) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let first = mgr.start("Catalogue", None, until_cancelled(&a)).unwrap();
+        let second = mgr.start("Latency", None, until_cancelled(&b)).unwrap();
+        let (open, gate) = gate();
+        let plan = mgr.register_plan(
+            parts(PlanClass::Bounded),
+            Box::new(move |_, _| {
+                gate.wait();
+                complete(json!(1))
+            }),
+        );
+        let op = mgr.execute(plan.op_id, &FakeAuthenticator::new()).unwrap();
+        mgr.cancel(first).unwrap();
+        assert_eq!(wait_ended(&mgr, first), OpState::Cancelled);
+        // Only the running read's token trips, never the confirmed plan's.
+        let ((), held) = test_trips::held(|| mgr.cancel_reads());
+        assert_eq!(held.len(), 1, "the one running read, and no plan");
+        for token in held {
+            token.cancel();
+        }
+        assert_eq!(wait_ended(&mgr, second), OpState::Cancelled);
+        assert_eq!(
+            state_of(&mgr, op),
+            Some(OpState::Running),
+            "a confirmed plan runs on"
+        );
+        open.send(()).unwrap();
+        assert_eq!(wait_ended(&mgr, op), OpState::Finished);
+        assert!(a.load(SeqCst) && b.load(SeqCst));
+    }
+
+    #[test]
+    fn dropping_the_plans_on_a_lock_leaves_the_reads_to_cancel_reads() {
+        let (_, mgr) = manager();
+        let started = Arc::new(AtomicBool::new(false));
+        let id = mgr
+            .start("Doctor", None, until_cancelled(&started))
+            .unwrap();
+        mgr.drop_all_plans();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(state_of(&mgr, id), Some(OpState::Running));
+        mgr.cancel_reads();
+        assert_eq!(wait_ended(&mgr, id), OpState::Cancelled);
+    }
+
+    #[test]
+    fn once_closed_a_read_is_refused_and_its_executor_dropped_unrun() {
+        let (_, mgr) = manager();
+        mgr.close();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let exec: Executor = {
+            let ran = ran.clone();
+            Box::new(move |_, _| {
+                let _held = &flag;
+                ran.fetch_add(1, SeqCst);
+                complete(json!(0))
+            })
+        };
+        assert!(matches!(
+            mgr.start("Doctor", None, exec),
+            Err(DesktopError::Closing)
+        ));
+        assert_eq!(ran.load(SeqCst), 0);
+        assert!(
+            dropped.load(SeqCst),
+            "what it captured (a token) goes at once"
+        );
+        assert!(mgr.list().is_empty());
+    }
+
+    #[test]
+    fn a_read_that_panics_fails_as_internal_and_the_manager_goes_on() {
+        let (_, mgr) = manager();
+        let id = mgr
+            .start("Doctor", None, Box::new(|_, _| panic!("the core broke")))
+            .unwrap();
+        assert_eq!(wait_ended(&mgr, id), OpState::Failed);
+        let ok = mgr.start("Doctor", None, returns(json!(1))).unwrap();
+        assert_eq!(wait_ended(&mgr, ok), OpState::Finished);
+    }
+
+    #[test]
+    fn a_read_whose_thread_cannot_start_ends_failed_and_says_so() {
+        let (_, mgr) = manager();
+        test_spawn::fail_next();
+        let err = mgr.start("Doctor", None, returns(json!(1))).unwrap_err();
+        assert_eq!(
+            err.to_ui().code.as_deref(),
+            Some(errors::INTERNAL),
+            "{err:?}"
+        );
+        let [summary] = mgr.list().try_into().expect("one op listed");
+        assert_eq!(summary.state, OpState::Failed);
+        assert_eq!(mgr.running(), 0);
+    }
+
+    /// D.4a §3.14: the view says what `execute` will ask — the OS prompt for a destructive plan
+    /// and an approval, nothing otherwise.
+    #[test]
+    fn the_view_says_which_gesture_execute_asks() {
+        let (_, mgr) = manager();
+        for (class, gesture) in [
+            (PlanClass::Reversible, Gesture::None),
+            (PlanClass::Bounded, Gesture::None),
+            (PlanClass::Destructive, Gesture::Os),
+        ] {
+            let view = mgr.register_plan(parts(class), returns(json!(1)));
+            assert_eq!(view.gesture, gesture, "{class:?}");
+        }
+        let approval = PlanParts {
+            requires_gesture: true,
+            ..PlanParts::new(PlanClass::Bounded, "Approve migration", "approve")
+        };
+        let view = mgr.register_plan(approval, returns(json!(1)));
+        assert_eq!(view.gesture, Gesture::Os);
+    }
+
+    /// The store's secret as a gesture (D.4a T76): `right` confirms; anything else is a wrong
+    /// secret the plan waits after. Counts its checks.
+    struct StoreSecret {
+        right: &'static str,
+        checks: AtomicUsize,
+    }
+
+    impl SecretGesture for StoreSecret {
+        fn check(&self, secret: Zeroizing<String>) -> Result<(), Refusal> {
+            self.checks.fetch_add(1, SeqCst);
+            if secret.as_str() == self.right {
+                Ok(())
+            } else {
+                Err(Refusal::new(
+                    DesktopError::AuthFailed {
+                        exhausted: false,
+                        retry_in_ms: None,
+                    },
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn store_secret() -> Arc<StoreSecret> {
+        Arc::new(StoreSecret {
+            right: "lock password",
+            checks: AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn a_plan_whose_gesture_is_the_store_s_secret_says_so_and_never_asks_the_os() {
+        let auth = FakeAuthenticator::new().with_password("os password".to_owned());
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let secret = store_secret();
+        let view = mgr.register_plan_with(
+            parts(PlanClass::Destructive),
+            counting(&runs),
+            Some(secret.clone()),
+        );
+        assert_eq!(view.gesture, Gesture::StoreSecret);
+        // No field: the OS is not asked, and the plan waits for the field.
+        let r = mgr.execute_with(view.op_id, &auth, None).unwrap_err();
+        assert!(
+            matches!(
+                *r.error,
+                DesktopError::AuthUnavailable {
+                    reason: UnavailableReason::UsePasswordField
+                }
+            ),
+            "{r:?}"
+        );
+        // A wrong secret — the OS's password among them: refused, and the plan waits.
+        let r = mgr
+            .execute_with(view.op_id, &auth, typed("os password"))
+            .unwrap_err();
+        assert!(matches!(*r.error, DesktopError::AuthFailed { .. }), "{r:?}");
+        // The right one runs it, once.
+        mgr.execute_with(view.op_id, &auth, typed("lock password"))
+            .unwrap();
+        wait_ended(&mgr, view.op_id);
+        assert_eq!(runs.load(SeqCst), 1);
+        assert_eq!(secret.checks.load(SeqCst), 2);
+        assert!(auth.asked().is_empty(), "the OS was asked");
+    }
+
+    #[test]
+    fn a_plan_that_needs_no_gesture_ignores_a_store_secret() {
+        let auth = FakeAuthenticator::new();
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let secret = store_secret();
+        let view = mgr.register_plan_with(
+            parts(PlanClass::Bounded),
+            counting(&runs),
+            Some(secret.clone()),
+        );
+        assert_eq!(view.gesture, Gesture::None);
+        mgr.execute_with(view.op_id, &auth, None).unwrap();
+        wait_ended(&mgr, view.op_id);
+        assert_eq!((runs.load(SeqCst), secret.checks.load(SeqCst)), (1, 0));
+    }
+
+    /// A secret typed into the app whose check the test holds at a gate: the store's secret (a
+    /// [`SecretGesture`]) or the app's own password field for the OS's gesture
+    /// ([`Authenticator::verify_password`]). It says when its check began, waits at the gate,
+    /// then answers whether what was typed is `right`. It never opens an OS prompt.
+    struct HeldCheck {
+        right: &'static str,
+        began: Mutex<mpsc::Sender<()>>,
+        gate: Arc<Gate>,
+    }
+
+    /// The check, where it says it began, and the sender that lets it answer.
+    fn held_check() -> (Arc<HeldCheck>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (open, gate) = gate();
+        let (began_tx, began) = mpsc::channel();
+        let check = Arc::new(HeldCheck {
+            right: "lock password",
+            began: Mutex::new(began_tx),
+            gate,
+        });
+        (check, began, open)
+    }
+
+    impl HeldCheck {
+        fn answer(&self, typed: &str) -> bool {
+            let _ = self.began.lock().unwrap().send(());
+            self.gate.wait();
+            typed == self.right
+        }
+    }
+
+    impl SecretGesture for HeldCheck {
+        fn check(&self, secret: Zeroizing<String>) -> Result<(), Refusal> {
+            if self.answer(&secret) {
+                Ok(())
+            } else {
+                Err(DesktopError::AuthFailed {
+                    exhausted: false,
+                    retry_in_ms: None,
+                }
+                .into())
+            }
+        }
+    }
+
+    impl Authenticator for HeldCheck {
+        fn info(&self) -> AuthInfo {
+            FakeAuthenticator::new().info()
+        }
+
+        fn verify(&self, _purpose: &AuthPurpose, _cancel: &CancellationToken) -> AuthOutcome {
+            panic!("a typed password opens no OS prompt")
+        }
+
+        fn verify_password(
+            &self,
+            _purpose: &AuthPurpose,
+            password: Zeroizing<String>,
+            _cancel: &CancellationToken,
+        ) -> crate::auth::PasswordAnswer {
+            if self.answer(&password) {
+                AuthOutcome::Verified.into()
+            } else {
+                crate::auth::PasswordAnswer {
+                    outcome: AuthOutcome::Failed {
+                        exhausted: false,
+                        retry_in_ms: None,
+                    },
+                    messages: vec!["Authentication failure".into()],
+                }
+            }
+        }
+    }
+
+    /// The two ways a secret is typed into the confirm dialog.
+    #[derive(Debug, Clone, Copy)]
+    enum Typed {
+        /// The store's secret (`Gesture::StoreSecret`): Stop protecting, and a destructive plan
+        /// on a protected store with no OS authenticator.
+        StoreSecret,
+        /// The app's own password field for the OS's gesture (Linux's PAM path).
+        PasswordField,
+    }
+
+    /// A destructive plan whose gesture is `how`, checked by `check`; `execute_with` with
+    /// `typed` on a thread of its own, its result on the receiver. The page followed the plan
+    /// before the confirm: its sink is returned.
+    fn confirm_typed(
+        mgr: &Arc<OperationManager>,
+        how: Typed,
+        check: &Arc<HeldCheck>,
+        typed_secret: &'static str,
+        exec: Executor,
+    ) -> (OpId, Arc<VecSink>, mpsc::Receiver<Result<OpId, Refusal>>) {
+        let view = match how {
+            Typed::StoreSecret => {
+                mgr.register_plan_with(parts(PlanClass::Destructive), exec, Some(check.clone()))
+            }
+            Typed::PasswordField => mgr.register_plan(parts(PlanClass::Destructive), exec),
+        };
+        let sink = VecSink::new("main");
+        mgr.subscribe(view.op_id, sink.clone()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (mgr, check) = (mgr.clone(), check.clone());
+        thread::spawn(move || {
+            let auth: Arc<dyn Authenticator> = match how {
+                Typed::StoreSecret => Arc::new(FakeAuthenticator::new()),
+                Typed::PasswordField => check,
+            };
+            let _ = tx.send(mgr.execute_with(view.op_id, &*auth, typed(typed_secret)));
+        });
+        (view.op_id, sink, rx)
+    }
+
+    /// D.4a F18 (owner O15, A1; the owner walk's D-7 runs 1 and 4): a secret typed into the app
+    /// and submitted before the lock is confirmed at the click. A lock that lands while it is
+    /// checked — a key derivation of about 0.6 s, a PAM check — does not refuse it: it is judged
+    /// on its answer. The right one runs the plan (its page, dropped by the lock as every page
+    /// is, hears nothing); a wrong one refuses it as `Locked`, and no plan waits across the lock
+    /// for another try. The lock is forced inside the check (the gate), never sampled.
+    #[test]
+    fn a_typed_secret_a_lock_passed_is_judged_on_its_answer() {
+        for how in [Typed::StoreSecret, Typed::PasswordField] {
+            for (secret, right) in [("lock password", true), ("not it", false)] {
+                let what = format!("{how:?}, {}", if right { "right" } else { "wrong" });
+                let (_, mgr) = manager();
+                let (check, began, open) = held_check();
+                let runs = Arc::new(AtomicUsize::new(0));
+                let (id, sink, result) = confirm_typed(&mgr, how, &check, secret, counting(&runs));
+                began.recv_timeout(LONG).expect("the check began");
+                // The lock hook's order: the plans, then every page's subscription.
+                mgr.drop_all_plans();
+                mgr.drop_all_subscribers();
+                open.send(()).unwrap();
+                let result = result.recv_timeout(LONG).expect("execute returned");
+                if right {
+                    assert_eq!(result.unwrap(), id, "{what}");
+                    assert_eq!(wait_ended(&mgr, id), OpState::Finished, "{what}");
+                    assert_eq!(runs.load(SeqCst), 1, "{what}");
+                } else {
+                    let refused = result.unwrap_err();
+                    assert!(
+                        matches!(*refused.error, DesktopError::Locked),
+                        "{what}: {refused:?}"
+                    );
+                    assert_eq!(runs.load(SeqCst), 0, "{what}");
+                    assert!(mgr.list().is_empty(), "{what}");
+                    let again = mgr
+                        .execute_with(id, &FakeAuthenticator::new(), typed("lock password"))
+                        .unwrap_err();
+                    assert!(
+                        matches!(*again.error, DesktopError::PlanNotFound { .. }),
+                        "{what}: a plan waits across the lock: {again:?}"
+                    );
+                }
+                assert!(
+                    sink.events().is_empty(),
+                    "{what}: a locked page heard {:?}",
+                    sink.events()
+                );
+            }
+        }
+    }
+
+    /// F18's A1 changes what a lock does to a typed secret, and nothing else: a quit (the
+    /// manager closed, then every plan dropped, as `begin_quit` does, or the exit's
+    /// `cancel_all_and_wait`) and the person's own cancel still refuse it while it is checked,
+    /// right or not, and the plan never runs.
+    #[test]
+    fn a_quit_or_a_cancel_still_refuses_a_typed_secret_being_checked() {
+        type Closer = fn(&OperationManager, OpId);
+        let closers: [(&str, Closer); 3] = [
+            ("quit", |mgr, _| {
+                mgr.close();
+                mgr.drop_all_plans();
+            }),
+            ("exit", |mgr, _| assert!(mgr.cancel_all_and_wait(LONG))),
+            ("cancel", |mgr, id| mgr.cancel(id).unwrap()),
+        ];
+        for how in [Typed::StoreSecret, Typed::PasswordField] {
+            for (name, close) in closers {
+                let what = format!("{how:?}, {name}");
+                let (_, mgr) = manager();
+                let (check, began, open) = held_check();
+                let runs = Arc::new(AtomicUsize::new(0));
+                let (id, _sink, result) =
+                    confirm_typed(&mgr, how, &check, "lock password", counting(&runs));
+                began.recv_timeout(LONG).expect("the check began");
+                close(&mgr, id);
+                open.send(()).unwrap();
+                let refused = result
+                    .recv_timeout(LONG)
+                    .expect("execute returned")
+                    .unwrap_err();
+                assert!(
+                    matches!(*refused.error, DesktopError::AuthCancelled),
+                    "{what}: {refused:?}"
+                );
+                assert_eq!(runs.load(SeqCst), 0, "{what}");
+                assert!(mgr.list().is_empty(), "{what}");
+            }
+        }
+    }
+
+    /// A mistyped recovery key (the gate's `recovery_key_invalid`, whose fields say where) is
+    /// a try the person makes again: the plan waits, as after a wrong password.
+    #[test]
+    fn a_mistyped_recovery_key_keeps_the_plan_waiting() {
+        struct Mistyped;
+        impl SecretGesture for Mistyped {
+            fn check(&self, _secret: Zeroizing<String>) -> Result<(), Refusal> {
+                Err(
+                    DesktopError::Core(apprafter_core::CoreError::RecoveryKeyInvalid {
+                        reason: apprafter_core::lock::RecoveryKeyProblem::Checksum {
+                            group: Some(7),
+                        },
+                    })
+                    .into(),
+                )
+            }
+        }
+        let auth = FakeAuthenticator::new();
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let view = mgr.register_plan_with(
+            parts(PlanClass::Destructive),
+            counting(&runs),
+            Some(Arc::new(Mistyped)),
+        );
+        let r = mgr
+            .execute_with(view.op_id, &auth, typed("QQQSY"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &*r.error,
+                DesktopError::Core(apprafter_core::CoreError::RecoveryKeyInvalid { .. })
+            ),
+            "{r:?}"
+        );
+        // Still there: another try reaches the gesture again.
+        let again = mgr
+            .execute_with(view.op_id, &auth, typed("QQQSY"))
+            .unwrap_err();
+        assert!(
+            !matches!(*again.error, DesktopError::PlanNotFound { .. }),
+            "the plan was spent: {again:?}"
+        );
+        assert_eq!(runs.load(SeqCst), 0);
+    }
+
+    /// Only a destructive plan takes the store's secret (D.4a T76, critic B finding 24), made
+    /// the manager's own rule: an approval that `requires_gesture` keeps the OS's gesture even
+    /// when a slice hands it a secret, until its own slice decides.
+    #[test]
+    fn an_approval_given_a_store_secret_keeps_the_os_gesture() {
+        let auth = FakeAuthenticator::new();
+        let (_, mgr) = manager();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let secret = store_secret();
+        let approval = PlanParts {
+            requires_gesture: true,
+            ..parts(PlanClass::Bounded)
+        };
+        let view = mgr.register_plan_with(approval, counting(&runs), Some(secret.clone()));
+        assert_eq!(view.gesture, Gesture::Os);
+        // The OS is asked, never the store's secret.
+        mgr.execute_with(view.op_id, &auth, None).unwrap();
+        wait_ended(&mgr, view.op_id);
+        assert_eq!((runs.load(SeqCst), secret.checks.load(SeqCst)), (1, 0));
+        assert_eq!(auth.asked().len(), 1);
     }
 }

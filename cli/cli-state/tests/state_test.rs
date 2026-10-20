@@ -63,6 +63,8 @@ fn hetzner_cloud_state_round_trips_through_save_load() {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -91,6 +93,8 @@ fn hetzner_cloud_state_carries_ssh_key_ids() {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -119,6 +123,8 @@ fn hetzner_cloud_state_carries_network_and_firewall_ids() {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -147,6 +153,8 @@ fn hetzner_cloud_state_carries_floating_ip_ids() {
             kubeconfig_yaml: None,
             kubeconfig_age: None,
             argocd_admin_password_age: None,
+            kubeconfig_sealed_to: None,
+            argocd_admin_password_sealed_to: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -169,6 +177,8 @@ fn hetzner_cloud_state_round_trips_cached_kubeconfig_yaml() {
         kubeconfig_yaml: Some("apiVersion: v1\n".into()),
         kubeconfig_age: None,
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -204,6 +214,8 @@ fn hetzner_cloud_state_round_trips_cached_kubeconfig_age() {
             "-----BEGIN AGE ENCRYPTED FILE-----\nfake\n-----END AGE ENCRYPTED FILE-----\n".into(),
         ),
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -244,6 +256,8 @@ fn hetzner_cloud_state_round_trips_argocd_admin_password_age() {
         argocd_admin_password_age: Some(
             "-----BEGIN AGE ENCRYPTED FILE-----\nfake\n-----END AGE ENCRYPTED FILE-----\n".into(),
         ),
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -284,6 +298,8 @@ fn hetzner_cloud_state_round_trips_server_type() {
         kubeconfig_yaml: None,
         kubeconfig_age: None,
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -306,6 +322,8 @@ fn hetzner_cloud_state_server_type_without_it_is_none() {
         kubeconfig_yaml: None,
         kubeconfig_age: None,
         argocd_admin_password_age: None,
+        kubeconfig_sealed_to: None,
+        argocd_admin_password_sealed_to: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -329,4 +347,57 @@ fn hetzner_cloud_state_server_type_defaults_to_none_on_old_json() {
     );
     assert_eq!(s.server_id, 99);
     assert_eq!(s.ssh_key_ids, vec![5]);
+}
+
+/// F13: what sealed each cache, when not the shared age key, round-trips through `save`/`load`
+/// as `{"kind": "store_vault", "store_id": …}`; unset it is not written at all, so an older
+/// reader sees the file it knows.
+#[test]
+fn what_sealed_a_cache_round_trips_and_is_absent_when_unset() {
+    use cli_core::secrets::CachedSecret;
+    use cli_state::SealedTo;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StatePaths::for_root(dir.path());
+    let vault = SealedTo::StoreVault {
+        store_id: "3f9c0a1b7d2e4c56".into(),
+    };
+    let mut h: HetznerCloudState =
+        serde_json::from_str(r#"{"server_id": 1, "server_name": "n"}"#).unwrap();
+    *h.cache_mut(CachedSecret::Kubeconfig).0 = Some("K".into());
+    *h.cache_mut(CachedSecret::Kubeconfig).1 = Some(vault.clone());
+    let state = State {
+        hetzner_cloud: Some(h),
+        ..Default::default()
+    };
+    state.save(&paths).unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.state_file()).unwrap()).unwrap();
+    assert_eq!(
+        raw["hetzner_cloud"]["kubeconfig_sealed_to"],
+        serde_json::json!({"kind": "store_vault", "store_id": "3f9c0a1b7d2e4c56"})
+    );
+    assert!(
+        raw["hetzner_cloud"]
+            .get("argocd_admin_password_sealed_to")
+            .is_none(),
+        "{raw}"
+    );
+    let back = State::load_or_default(&paths).unwrap();
+    assert_eq!(back, state);
+    let h = back.hetzner_cloud.unwrap();
+    assert_eq!(h.sealed_to(CachedSecret::Kubeconfig), Some(&vault));
+    assert_eq!(h.sealed_to(CachedSecret::ArgocdPassword), None);
+}
+
+/// F13: a state.json written before the record (or by an older AppRafter) still parses, with
+/// nothing recorded.
+#[test]
+fn a_state_without_the_seal_record_still_parses() {
+    let old: HetznerCloudState =
+        serde_json::from_str(r#"{"server_id": 1, "server_name": "n", "kubeconfig_age": "K"}"#)
+            .unwrap();
+    assert_eq!(old.kubeconfig_sealed_to, None);
+    assert_eq!(old.argocd_admin_password_sealed_to, None);
+    let empty: State = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty, State::default());
 }

@@ -11,6 +11,7 @@ pub mod k8s;
 pub mod machine;
 pub mod machine_filter;
 pub mod provider;
+mod transport;
 pub mod validators;
 
 pub use cert::{

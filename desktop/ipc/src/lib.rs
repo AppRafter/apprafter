@@ -11,20 +11,22 @@ mod lock;
 mod ops;
 mod quit;
 mod settings;
+mod targets;
 
 /// The command names. Plain Rust with no imports: `src-tauri/build.rs` `include!`s it.
 pub mod commands;
 pub mod errors;
 
-pub use app_info::{AppInfo, Os, SecretBackend, SessionEvents};
+pub use app_info::{AppInfo, Os, SecretsInfo, SessionEvents, STORE_CHANGED};
 pub use auth::{AuthInfo, AuthMethod, AuthOutcome, CancelledBy, UnavailableReason};
 pub use commands::{ALLOWED_WHILE_LOCKED, COMMANDS};
-pub use lock::{LockReason, LockState, LOCK_CHANGED};
+pub use lock::{LockOffPlan, LockOnPlan, LockReason, LockSectionInfo, LockState, LOCK_CHANGED};
 pub use ops::{
-    OpEvent, OpId, OpState, OpSummary, OutputStream, PlanView, Subscribed, SubscriptionId,
+    Gesture, OpEvent, OpId, OpState, OpSummary, OutputStream, PlanView, Subscribed, SubscriptionId,
 };
 pub use quit::{Quitting, QUITTING};
 pub use settings::{AutoLock, Refresh, Settings, Theme};
+pub use targets::{CatalogueSourceArg, DraftId, TargetAddArgs, TokenVerified};
 
 /// What every failed command returns: the core's serialisable error projection.
 pub use apprafter_core::UiError;
