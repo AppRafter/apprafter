@@ -8,6 +8,7 @@
 pub mod seam;
 pub mod state;
 
+pub use state::DurableWrite;
 pub use state::{
     migrate_legacy_state_if_present, HetznerCloudState, SealedTo, State, StatePaths, Write,
 };
