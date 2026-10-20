@@ -26,8 +26,12 @@ pub mod slots;
 mod slots_tests;
 mod status;
 pub mod text;
+pub mod ways;
+#[cfg(test)]
+mod ways_tests;
 pub use status::status;
 
+pub use facts::{BackoffFact, CheckBackend, PasswordFact, WayFacts};
 pub use facts::{HostOs, MachineFact, SlotFacts, UnknownFacts};
 pub use faults::FaultPoint;
 pub use off::{execute_off, plan_off, LockOffPayload, LockOffStart, LockedOff};
@@ -43,6 +47,7 @@ pub use slots::{
     plan_slot_add, plan_slot_remove, SlotAddKind, SlotAddPayload, SlotAdded, SlotRemovePayload,
     SlotRemoved,
 };
+pub use ways::{LockOnWay, WayAsked, WayFallback};
 
 use std::path::{Path, PathBuf};
 

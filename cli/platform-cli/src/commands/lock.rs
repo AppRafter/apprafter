@@ -107,7 +107,8 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
     let ctx = crate::context::cli_context()?;
     let root = ctx.config_root().to_path_buf();
     let (shown, targets) = named(&ctx);
-    let plan = lock::plan_on(&ctx, timeout).map_err(report)?;
+    // D.4a's flow — a separate lock password — until d4b-e1a gives `lock on` its default (B58).
+    let plan = lock::plan_on(&ctx, timeout, lock::WayAsked::LockPassword).map_err(report)?;
     if let LockOnStart::AlreadyLocked = plan.payload.start() {
         match timeout {
             None => println!("The target store at {shown} is already locked."),

@@ -42,6 +42,8 @@ use zeroize::Zeroizing;
 
 use super::faults::{self, FaultPoint};
 use super::open::{check_password, SlotOpened};
+use super::ways::{self, LockOnWay, Way, WayAsked, WayFallback};
+use super::SlotNote;
 use crate::context::{Context, SecretString};
 use crate::error::{CoreError, CoreResult};
 use crate::op::{ChangeAction, Outcome, Plan, PlanClass, PlannedChange};
@@ -94,13 +96,24 @@ pub struct CacheDrop {
     pub secret: CachedSecret,
 }
 
-/// What [`execute_on`] carries out. It never crosses IPC (`Plan::payload`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`execute_on`] carries out. It never crosses IPC (`Plan::payload`). Not
+/// `PartialEq`: a plan for the account password holds this computer's machine id, compared
+/// only as bytes where it binds a slot.
+#[derive(Debug, Clone)]
 pub struct LockOnPayload {
     start: LockOnStart,
     timeout_min: u32,
     keys: Vec<PathBuf>,
     drops: Vec<CacheDrop>,
+    /// A new run's way in; `None` for a resume or a store locked already.
+    new_run: Option<NewRun>,
+}
+
+/// What a new run's plan settles before anything is asked (D.4b B55, B56).
+#[derive(Debug, Clone)]
+struct NewRun {
+    /// The way its first slot takes, from the client's facts in B88's order.
+    way: Way,
 }
 
 impl LockOnPayload {
@@ -118,6 +131,36 @@ impl LockOnPayload {
     /// target has a cache sealed to a key (D.4a f Task 3), or no home.
     pub fn keys(&self) -> &[PathBuf] {
         &self.keys
+    }
+
+    /// The way a new run's first slot takes (D.4b B55): this computer's everyday way, or a
+    /// separate lock password; `None` for a resume or a store locked already.
+    pub fn way(&self) -> Option<LockOnWay> {
+        self.new_run.as_ref().map(|run| run.way.way)
+    }
+
+    /// Why the plan takes a separate lock password instead of this computer's everyday way,
+    /// when it does (B55, B88): the client says it in the plan's first lines.
+    pub fn fallback(&self) -> Option<WayFallback> {
+        self.new_run.as_ref().and_then(|run| run.way.fallback)
+    }
+
+    /// B75 (2): this account's password status could not be read, so the account-password
+    /// prompt says that Enter on an empty line means "no password" — and the run then takes
+    /// a separate lock password.
+    pub fn empty_entry_falls_back(&self) -> bool {
+        self.new_run
+            .as_ref()
+            .is_some_and(|run| run.way.empty_entry_falls_back)
+    }
+
+    /// What the everyday slot costs and adds, each said before its secret is asked (B61,
+    /// B70, B76): the CLI's words are `text::plan_note_line`.
+    pub fn notes(&self) -> &[SlotNote] {
+        match &self.new_run {
+            Some(run) => &run.way.notes,
+            None => &[],
+        }
     }
 }
 
@@ -236,6 +279,7 @@ fn plan(
     timeout_min: u32,
     keys: Vec<PathBuf>,
     drops: Vec<CacheDrop>,
+    new_run: Option<NewRun>,
 ) -> Plan<LockOnPayload> {
     Plan {
         class: PlanClass::Bounded,
@@ -246,6 +290,7 @@ fn plan(
             timeout_min,
             keys,
             drops,
+            new_run,
         },
     }
 }
@@ -323,7 +368,16 @@ pub(super) fn refresh(secret: CachedSecret, target: &str) -> String {
 /// credentials and state, the shared keys when a target has a sealed cache (never created) —
 /// refusing a record it cannot read, which may hold the only copy of a secret. Under a weak KDF
 /// policy outside its roots it is `insecure_kdf_refused` before anything is asked (T23).
-pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockOnPayload>> {
+///
+/// A new run takes its way in here (D.4b B55, B88): `asked` is a separate lock password
+/// (`--lock-password`) or this computer's everyday way with what the client found out about
+/// it; a back-off in force refuses the plan (B74). A resume, or a store locked already, asks
+/// the client nothing.
+pub fn plan_on(
+    ctx: &Context,
+    timeout_min: Option<u32>,
+    asked: WayAsked<'_>,
+) -> CoreResult<Plan<LockOnPayload>> {
     super::permit(ctx)?;
     let timeout = timeout_min.unwrap_or(DEFAULT_UNLOCK_TIMEOUT_MIN);
     super::check_timeout(timeout)?;
@@ -343,6 +397,7 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
             timeout,
             Vec::new(),
             Vec::new(),
+            None,
         )),
         Some((SecretsMode::Unlocking, _)) => Err(CoreError::Cli(CliError::LockIncomplete {
             store: root.to_path_buf(),
@@ -382,12 +437,16 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
                 timeout,
                 keys,
                 Vec::new(),
+                None,
             ))
         }
         mode => {
             let restart = matches!(mode, Some((SecretsMode::Locking, _)));
+            // D.4b B55, B74, B88: the way in first, from the client's facts; a back-off in
+            // force refuses here, before a cache is read or anything is asked.
+            let way = ways::decide(asked)?;
             let keys = keys_for_caches(ctx, &store, &targets)?;
-            let (changes, drops) = survey(&store, root, &targets, &keys)?;
+            let (changes, drops) = survey(&store, root, &targets, &keys, way.way)?;
             Ok(plan(
                 LockOnStart::New { restart },
                 title("Lock the secrets of", root, &targets),
@@ -395,6 +454,7 @@ pub fn plan_on(ctx: &Context, timeout_min: Option<u32>) -> CoreResult<Plan<LockO
                 timeout,
                 keys,
                 drops,
+                Some(NewRun { way }),
             ))
         }
     }
@@ -406,6 +466,7 @@ fn survey(
     root: &Path,
     targets: &[String],
     keys: &[PathBuf],
+    way: LockOnWay,
 ) -> CoreResult<(Vec<PlannedChange>, Vec<CacheDrop>)> {
     let identities = transfer::shared_identities(keys)?;
     let mut changes = Vec::new();
@@ -506,9 +567,20 @@ fn survey(
         "Vault",
         &vault_path(root).display().to_string(),
         ChangeAction::Create,
-        "opened by a lock password or a recovery key",
+        vault_opened_by(way),
     ));
     Ok((changes, drops))
+}
+
+/// What a new vault opens with, as its plan line says it (D.4a C6; D.4b B55).
+pub(super) fn vault_opened_by(way: LockOnWay) -> &'static str {
+    match way {
+        LockOnWay::AccountPassword => {
+            "opened by your account password on this computer or a recovery key"
+        }
+        LockOnWay::WindowsHello => "opened by Windows Hello on this computer or a recovery key",
+        LockOnWay::LockPassword => "opened by a lock password or a recovery key",
+    }
 }
 
 /// Carries out `plan` with `input` (module docs). `Completed { already_locked }` when another
@@ -564,6 +636,14 @@ fn on_new(
             cleaned: Vec::new(),
             left: Vec::new(),
         });
+    }
+    // D.4b B56: a plan for another way in writes no vault a lock password opens.
+    if payload.way() != Some(LockOnWay::LockPassword) {
+        return Err(CoreError::Cli(CliError::Other(
+            "a `lock on` plan for another way in was given a lock password; nothing was \
+             written"
+                .to_string(),
+        )));
     }
     check_password(&password)?;
     super::permit(ctx)?;

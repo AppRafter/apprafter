@@ -218,7 +218,7 @@ pub(crate) mod testing {
     use std::sync::{Mutex, PoisonError};
     use std::thread::JoinHandle;
 
-    use apprafter_core::lock::{execute_on, plan_on, LockOnInput, LockedOn};
+    use apprafter_core::lock::{execute_on, plan_on, LockOnInput, LockedOn, WayAsked};
     use apprafter_core::vault::{OsRandom, RecoveryKey};
     use apprafter_core::{CancellationToken, Context, Event, Outcome, Reporter, SecretString};
     use cli_core::secrets::CachedSecret;
@@ -355,7 +355,7 @@ pub(crate) mod testing {
     /// runs it; `signal` hears it wait for the store lock.
     pub(crate) fn lock_on(ctx: &Context, signal: &WaitSignal) -> LockedOn {
         let _one = ONE_LOCK_ON.lock().unwrap_or_else(PoisonError::into_inner);
-        let plan = plan_on(ctx, None).expect("the lock on plan");
+        let plan = plan_on(ctx, None, WayAsked::LockPassword).expect("the lock on plan");
         let key = RecoveryKey::generate(&mut OsRandom).unwrap();
         let shown = key.to_display();
         let recovery = key.confirm(shown.expose()).unwrap();

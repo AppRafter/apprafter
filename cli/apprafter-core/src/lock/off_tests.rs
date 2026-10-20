@@ -255,7 +255,7 @@ fn lock_off_backs_out_of_an_interrupted_lock_on() {
         FaultPoint::AfterMarkerTarget(1),
     ] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -700,7 +700,7 @@ fn a_back_out_with_a_marker_and_no_vault_stops() {
     let (input, _) = new_input();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterMarkerTarget(0)),
-        plan_on(&f.ctx, None).unwrap(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap(),
         input,
         &NullReporter,
         &CancellationToken::new(),
@@ -724,7 +724,7 @@ fn a_back_out_with_a_marker_and_no_vault_stops() {
     let f = files_store();
     execute_on(
         &f.ctx.clone().with_fault(FaultPoint::AfterStoreFileLocking),
-        plan_on(&f.ctx, None).unwrap(),
+        plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap(),
         new_input().0,
         &NullReporter,
         &CancellationToken::new(),
@@ -785,7 +785,7 @@ fn plant_unreadable_key(ctx: &Context) {
 fn a_store_with_no_cache_never_reads_or_creates_the_shared_key() {
     let f = bare_store();
     assert!(!f.ctx.age_key_path().exists());
-    let plan = plan_on(&f.ctx, None).unwrap();
+    let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
     assert!(plan.payload.keys().is_empty(), "{:?}", plan.payload.keys());
     assert!(
         plan.changes
@@ -841,7 +841,7 @@ fn no_interrupted_run_of_a_store_with_no_cache_touches_the_shared_key() {
     ] {
         let f = bare_store();
         plant_unreadable_key(&f.ctx);
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -910,7 +910,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         (FaultPoint::AfterMarkerTarget(0), false),
     ] {
         let f = files_store();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let (input, shown) = new_input();
         execute_on(
             &f.ctx.clone().with_fault(at),
@@ -921,7 +921,7 @@ fn a_resume_reads_the_shared_key_only_for_a_cache_still_sealed_to_it() {
         )
         .unwrap_err();
         std::fs::write(f.ctx.age_key_path(), NOT_A_KEY).unwrap();
-        let plan = plan_on(&f.ctx, None).unwrap();
+        let plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
         let LockOnStart::Resume { id } = plan.payload.start().clone() else {
             panic!("{at:?}: {:?}", plan.payload.start())
         };

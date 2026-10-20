@@ -209,7 +209,12 @@ pub fn plan_lock_on(
     // verifier's finding 11).
     shell.recheck();
     lock::check_password(&password)?;
-    let plan = lock::plan_on(&shell.context, timeout_minutes)?;
+    // D.4a's Protect — a separate lock password — until d4b-g2b offers the ways (B58).
+    let plan = lock::plan_on(
+        &shell.context,
+        timeout_minutes,
+        lock::WayAsked::LockPassword,
+    )?;
     match plan.payload.start() {
         LockOnStart::New { .. } => {}
         LockOnStart::Resume { .. } => {
@@ -386,7 +391,8 @@ pub fn plan_lock_finish(
     password: SecretString,
     recovery: SecretString,
 ) -> Result<PlanView, Refusal> {
-    let plan = lock::plan_on(&shell.context, None).map_err(DesktopError::from)?;
+    let plan = lock::plan_on(&shell.context, None, lock::WayAsked::LockPassword)
+        .map_err(DesktopError::from)?;
     let LockOnStart::Resume { id } = plan.payload.start().clone() else {
         return Err(refused(
             "there is no interrupted Protect to finish in this target store",

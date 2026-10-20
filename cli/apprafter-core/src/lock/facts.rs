@@ -86,6 +86,64 @@ pub struct UnknownFacts;
 
 impl SlotFacts for UnknownFacts {}
 
+/// Whether the system can check the account password here (D.4b B10, B88 (3)): libpam and
+/// one of its services on Linux, the one PAM service that checks the typed text on macOS,
+/// and an account for the user running AppRafter. Read without asking the system to check
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckBackend {
+    Ready,
+    /// libpam does not load.
+    NoLibpam,
+    /// Linux: none of `common-auth`, `system-auth`, `login` is set up.
+    NoService,
+    /// macOS: no PAM service that checks the typed text (`chkpasswd`).
+    NoCheckRoute,
+    /// The user running AppRafter has no account entry.
+    NoAccount,
+}
+
+/// The back-off across runs as it stands (D.4b B12, B74, B88 (6)), read without changing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffFact {
+    Clear,
+    /// A check failed recently: the next is allowed in `wait_secs` seconds; `None` while
+    /// another AppRafter process is checking.
+    Wait {
+        wait_secs: Option<u64>,
+    },
+    /// Its record has no place that is this account's alone (`/run/user/<uid>` missing).
+    NoRecord,
+}
+
+/// What this account's password status reads without privileges (D.4b B75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordFact {
+    /// A password is set and not locked.
+    Usable,
+    /// None, an empty one, or a locked one: no password the system checks opens the account.
+    NoPassword,
+    /// Not readable here (macOS tells an empty password from a set one only at a check).
+    Unknown,
+}
+
+/// What only the client can find out about this computer's everyday way (D.4b B55, B88):
+/// asked by `lock::plan_on` one fact at a time, in B88's order, stopping at the first that
+/// holds — so under `APPRAFTER_SANDBOX`'s fence nothing past [`WayFacts::fenced`] is asked
+/// (B82). The CLI's and the desktop's os-slots glue implement it (d4b-e1a, d4b-g2b). No
+/// method has a default: an implementor answers every one, and none answers "unknown" for a
+/// check it could not make — under the fence it says `fenced`.
+pub trait WayFacts: SlotFacts {
+    /// `APPRAFTER_SANDBOX`'s fence refuses this account a real backend (B16, B82).
+    fn fenced(&self) -> bool;
+    /// Whether the system can check the account password here.
+    fn account_check(&self) -> CheckBackend;
+    /// The back-off as it stands.
+    fn backoff(&self) -> BackoffFact;
+    /// This account's password status.
+    fn password_status(&self) -> PasswordFact;
+}
+
 /// Tests: the facts a test sets (d4b-c1), on any OS.
 #[cfg(test)]
 #[derive(Debug, Clone)]
