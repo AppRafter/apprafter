@@ -358,7 +358,7 @@ pub fn account_password_label(account: &str, host: &str) -> String {
 /// (B30). A store in files has no ways in to change (`lock on` protects it); an interrupted
 /// `lock on` or `lock off` is finished first (`lock_incomplete`); a store another account
 /// can change is refused before its secret is asked (WI-475, d4a-h F1).
-fn locked_vault(ctx: &Context) -> CoreResult<(StoreId, VaultFile)> {
+pub(super) fn locked_vault(ctx: &Context) -> CoreResult<(StoreId, VaultFile)> {
     let root = ctx.config_root();
     let Some(file) = read_store_file(root)? else {
         return Err(not_locked(root));
@@ -385,7 +385,11 @@ fn locked_vault(ctx: &Context) -> CoreResult<(StoreId, VaultFile)> {
 /// B19, M3: under the held lock, the store still locked under `id`, and its vault as it is
 /// now, opened with `opened`'s data key — a vault replaced since (a key change, or `lock
 /// off` and `lock on`) is `store_changed`, never damage.
-fn reread(ctx: &Context, id: &StoreId, opened: &OpenedVault) -> CoreResult<UnlockedVault> {
+pub(super) fn reread(
+    ctx: &Context,
+    id: &StoreId,
+    opened: &OpenedVault,
+) -> CoreResult<UnlockedVault> {
     let root = ctx.config_root();
     let now = read_store_file(root)?;
     let same =
@@ -484,7 +488,7 @@ fn unusable(problem: PasswordProblem) -> AccountPasswordRefusal {
 }
 
 /// The store's write lock, held (T28).
-fn held_lock(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
+pub(super) fn held_lock(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
     let held = crate::target::lock_store(ctx, reporter)?;
     if held.is_held() {
         Ok(held)
@@ -495,7 +499,7 @@ fn held_lock(ctx: &Context, reporter: &dyn Reporter) -> CoreResult<StoreLock> {
     }
 }
 
-fn cancelled<T>() -> Outcome<T> {
+pub(super) fn cancelled<T>() -> Outcome<T> {
     Outcome::Cancelled {
         cleaned: Vec::new(),
         left: Vec::new(),
@@ -509,14 +513,14 @@ fn slot_refused(root: &Path, reason: SlotRefusal) -> CoreError {
     })
 }
 
-fn account_refused(reason: AccountPasswordRefusal) -> CoreError {
+pub(super) fn account_refused(reason: AccountPasswordRefusal) -> CoreError {
     CoreError::Cli(CliError::AccountPasswordRefused {
         reason,
         messages: Vec::new(),
     })
 }
 
-fn incomplete(root: &Path, phase: LockPhase) -> CoreError {
+pub(super) fn incomplete(root: &Path, phase: LockPhase) -> CoreError {
     CoreError::Cli(CliError::LockIncomplete {
         store: root.to_path_buf(),
         phase,

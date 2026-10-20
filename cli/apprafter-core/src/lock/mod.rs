@@ -24,6 +24,7 @@ pub mod open;
 mod reseal;
 #[cfg(test)]
 mod reseal_tests;
+pub mod rotate;
 #[cfg(test)]
 mod rotate_tests;
 pub mod slots;
@@ -48,6 +49,9 @@ pub use on::{
 };
 pub use open::{
     check_password, open_at, open_slot_at, set_unlock_timeout, OpenedVault, SlotOpened,
+};
+pub use rotate::{
+    plan_rotate, DropWhy, RotateKind, RotatePayload, RotateRow, SlotFate, StoreKeyLine,
 };
 pub use slots::{
     account_password_label, check_account_password, execute_slot_add, execute_slot_remove,

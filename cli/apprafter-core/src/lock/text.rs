@@ -4,6 +4,7 @@
 //! doctor's rows and `apprafter status`'s line, so that each limit reads the same wherever it is
 //! shown. The desktop words its own Settings section; its doctor overlay shows doctor's rows.
 
+use crate::lock::{DropWhy, SlotFate, StoreKeyLine};
 use crate::lock::{
     HolderHardening, HolderUnavailableReason, MachineLimit, SlotNote, SlotRefusalView, SlotView,
     UnlockWindow,
@@ -278,6 +279,85 @@ pub fn plan_note_line(note: &SlotNote, kind: crate::secrets::LockSlotKind) -> &'
         (SlotNote::AccountPasswordOffline, _) => ACCOUNT_PASSWORD_OFFLINE,
         (SlotNote::MachineIdMayChange, _) => MACHINE_ID_MAY_CHANGE,
         (other, _) => note_line(other),
+    }
+}
+
+/// D.4b B65: what a key change leaves exposed, in its plan and after it.
+pub const KEY_CHANGE_LEAVES: &str = "Copies of the vault made before this — a backup, a \
+     snapshot — still open with the old secrets and give the old store key: it decrypts the \
+     caches in copies of the targets' state files made before this, and the Hetzner tokens as \
+     they are now. Caches written or re-encrypted from now on open only with the new store \
+     key. To end the rest: renew the tokens (`apprafter target add <t> --renew`) and the \
+     cluster credentials at their source, and delete earlier copies you can.";
+
+/// D.4b B51: a key change's outcome ends with it.
+pub const KEEP_PREVIOUS_RECOVERY_KEY: &str =
+    "Keep the previous recovery key until this store has opened once with the new one.";
+
+/// D.4b B80: said before a key change shows a new recovery key.
+pub const NEW_KEY_VALID_WHEN_DONE: &str = "This recovery key opens the store only when \
+     AppRafter says Done; keep your current recovery key until then.";
+
+/// D.4b B87: a typed way in's question at a key change.
+pub const KEEP_OR_DROP: &str = "Type it to keep it, or type `drop` to drop it.";
+
+/// D.4b B68: said before a question whose drop would leave only the recovery key.
+pub const ONLY_RECOVERY_AFTER_DROP: &str =
+    "If you drop it, the store opens only with the recovery key.";
+
+/// The store key's line in a key change's plan (B65): what its re-encryption covers.
+pub fn store_key_line(line: StoreKeyLine) -> String {
+    let count = |n: u32, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    if line.caches == 0 {
+        return "replaced; no cached secret to re-encrypt".to_string();
+    }
+    let mut of = Vec::new();
+    if line.targets > 0 {
+        of.push(count(line.targets, "target", "targets"));
+    }
+    if line.orphans > 0 {
+        of.push(count(
+            line.orphans,
+            "state folder no target uses",
+            "state folders no target uses",
+        ));
+    }
+    format!(
+        "replaced; {} re-encrypted, of {}",
+        count(line.caches, "cached secret", "cached secrets"),
+        of.join(" and of ")
+    )
+}
+
+/// A slot's fate in a key change's plan (B68, B87).
+pub fn fate_line(fate: SlotFate, kind: LockSlotKind) -> String {
+    match fate {
+        SlotFate::Replaced if kind == LockSlotKind::RecoveryKey => {
+            "replaced: a new recovery key, shown once and typed back".into()
+        }
+        SlotFate::Replaced => "replaced: you set a new lock password".into(),
+        SlotFate::KeptIfGiven => "kept if you open the store with it now, or type it when \
+                                  asked; Enter asks again, and only typing `drop` drops it"
+            .into(),
+        SlotFate::KeptOrNew => "kept if you open the store with it now, or type it when \
+                                asked; Enter makes a new one, shown once and typed back"
+            .into(),
+        SlotFate::Dropped { why } => format!("dropped: {}", drop_line(why)),
+    }
+}
+
+/// Why a key change drops a slot (B68).
+pub fn drop_line(why: DropWhy) -> &'static str {
+    match why {
+        DropWhy::Declined => "you typed `drop`",
+        DropWhy::OtherComputer => {
+            "made on another computer, whose machine id this one does not have"
+        }
+        DropWhy::NoMachineId => "this computer has no machine id to open it with",
+        DropWhy::GestureNotHere => "this AppRafter cannot confirm Windows Hello",
+        DropWhy::NewerKind => "made by a newer AppRafter",
+        DropWhy::KdfRefused => "this AppRafter refuses its key settings",
+        DropWhy::SecondOfKind => "a second one of its kind, which no prompt tries",
     }
 }
 
