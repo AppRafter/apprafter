@@ -12,9 +12,11 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use apprafter::holder::client::{HolderClient, HolderError, HolderToEnd, IO_TIMEOUT};
@@ -29,7 +31,7 @@ use apprafter_core::secrets::{
 use apprafter_core::vault::{
     KdfPolicy, OsRandom, RecoveryKey, SlotSecret, VaultFile, VaultId, VAULT_FILE,
 };
-use common::spawn::{Bin, Spawn};
+use common::spawn::{holder_holds, probe_holder_lock, Bin, HolderLock, Spawn};
 
 /// 64 ASCII alphanumerics, the shape cli_core accepts.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -199,28 +201,15 @@ fn lock_of(sp: &Spawn, b: &StoreBinding, sid: i32) -> PathBuf {
     }
 }
 
-/// A holder holds its lock file for its whole life: free means gone (a zombie holds no lock).
-fn holder_alive(lock: &Path) -> bool {
-    let Ok(f) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock)
-    else {
-        return false;
-    };
-    // SAFETY: flock on a file this function opened; released when it closes.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
-}
-
 fn gone_within(lock: &Path, limit: Duration) -> bool {
     let until = Instant::now() + limit;
     while Instant::now() < until {
-        if !holder_alive(lock) {
+        if !holder_holds(lock) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    !holder_alive(lock)
+    !holder_holds(lock)
 }
 
 /// `root`'s `store.yaml` as `change` leaves it (team decision 2026-10-13): `files` is `lock
@@ -334,7 +323,7 @@ fn the_holder_ends_with_its_session() {
         let s = Live::start(&sp, "t inner_start; read _");
         started_pid(&s.next());
         let lock = lock_of(&sp, &st.binding, s.sid());
-        assert!(holder_alive(&lock));
+        assert!(holder_holds(&lock));
         s.finish();
         assert!(gone_within(&lock, Duration::from_secs(2)), "poll={poll}");
     }
@@ -350,7 +339,7 @@ fn an_expired_window_ends_the_holder() {
     let mut s = Live::start(&sp, "t inner_start; read _; ask item:prod");
     started_pid(&s.next());
     let lock = lock_of(&sp, &st.binding, s.sid());
-    assert!(holder_alive(&lock));
+    assert!(holder_holds(&lock));
     assert!(
         gone_within(&lock, Duration::from_secs(4)),
         "the window was 2 s"
@@ -371,7 +360,7 @@ fn a_holder_ends_within_its_look_once_its_store_is_not_locked_with_its_id() {
         let s = Live::start(&st.sp, "t inner_start; read _");
         started_pid(&s.next());
         let lock = lock_of(&st.sp, &st.binding, s.sid());
-        assert!(holder_alive(&lock), "{change}: the holder serves");
+        assert!(holder_holds(&lock), "{change}: the holder serves");
         change_store(&st.binding.root, change);
         assert!(
             gone_within(&lock, STORE_LOOK + Duration::from_secs(3)),
@@ -470,7 +459,7 @@ fn the_holder_keeps_no_descriptor_its_starter_had() {
         rx.recv_timeout(Duration::from_secs(2)).is_ok(),
         "the pipe's write end is still open: the holder kept a descriptor it inherited"
     );
-    assert!(holder_alive(&lock));
+    assert!(holder_holds(&lock));
     s.go();
     assert_eq!(s.next(), "ended");
     s.finish();
@@ -648,7 +637,7 @@ fn a_hung_holder_is_ended_and_a_live_one_never() {
         "error NotFound",
         "a holder that answered and closed is never killed"
     );
-    assert!(holder_alive(&lock));
+    assert!(holder_holds(&lock));
     // SAFETY: SIGSTOP to the holder this test started: it accepts, and answers nothing.
     unsafe { libc::kill(pid, libc::SIGSTOP) };
     s.go();
@@ -673,6 +662,21 @@ fn the_holder_refuses_a_terminal() {
     );
 }
 
+/// The conversation harness itself (GOTCHA-379): a child reaped is not a child read — its last
+/// output can still be in the terminal, or in the reader's hands — so a step decides "not shown"
+/// only once the terminal has closed. Forced: what the terminal shows reaches the steps only
+/// after the harness has seen the child exit (`__holder` at a terminal says it is no command,
+/// and exits 2 at once).
+#[test]
+fn converse_reads_the_terminal_to_its_end_before_it_says_a_text_was_not_shown() {
+    let ended = common::terminal::converse_holding_output(
+        &Spawn::new(),
+        &["__holder"],
+        &[common::terminal::Step::Expect("is not a command")],
+    );
+    assert_eq!(ended.status.code(), Some(2), "{}", ended.terminal);
+}
+
 /// T47: a holder whose init pipe carries no init frame writes nothing and exits.
 #[test]
 fn a_holder_without_an_init_frame_writes_nothing() {
@@ -688,19 +692,102 @@ fn a_holder_without_an_init_frame_writes_nothing() {
 }
 
 /// G8: a holder a test leaves behind fails that test when its `Spawn` drops — here the session
-/// (and so its holder) is still open as the `Spawn` goes.
+/// (and so its holder) is still open as the `Spawn` goes. A holder at its endpoint serves: it is
+/// never taken for one that is ending (and waited for).
 #[test]
 fn a_leaked_holder_fails_its_test() {
+    let waited = Arc::new(AtomicBool::new(false));
+    let waiting = Arc::clone(&waited);
     let leaked = std::panic::catch_unwind(|| {
         let st = store(Spawn::new());
         let s = Live::start(&st.sp, "t inner_start; read _");
         started_pid(&s.next());
-        drop(st);
+        let Store { sp, _locked, .. } = st;
+        drop(sp.when_a_holder_is_ending(move || waiting.store(true, Ordering::SeqCst)));
         s
     });
     assert!(
         leaked.is_err(),
         "Spawn's Drop must fail a test that leaks a holder"
+    );
+    assert!(
+        !waited.load(Ordering::SeqCst),
+        "a holder that serves was taken for one that is ending"
+    );
+}
+
+/// G8, GOTCHA-337: a holder that is ending — off its endpoint, its lock not let go yet, as End
+/// leaves it between its reply and its exit — is no leak: the `Spawn`'s reaper waits for it to
+/// let go. Nothing orders that exit before the test's end: the reply, the command's exit and
+/// the session's all come first. Forced: the holder is stopped in that very state (its socket
+/// removed, End's first step) and goes on, through its own way out (SIGTERM), only once the
+/// reaper has met it there.
+#[test]
+fn a_holder_that_is_ending_is_waited_for_never_reaped() {
+    let st = store(Spawn::new());
+    let s = Live::start(&st.sp, "t inner_start; read _");
+    let pid = started_pid(&s.next());
+    let lock = lock_of(&st.sp, &st.binding, s.sid());
+    // SAFETY: SIGSTOP to the holder this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    std::fs::remove_file(lock.with_extension("sock")).unwrap();
+    s.finish();
+    assert!(
+        holder_holds(&lock),
+        "the stopped holder still holds its lock"
+    );
+    let met = Arc::new(AtomicBool::new(false));
+    let meeting = Arc::clone(&met);
+    let Store { sp, _locked, .. } = st;
+    let sp = sp.when_a_holder_is_ending(move || {
+        meeting.store(true, Ordering::SeqCst);
+        // SAFETY: SIGTERM, then SIGCONT, to the holder this test stopped: it ends its own way.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGCONT);
+        }
+    });
+    let dropped = catch_unwind(AssertUnwindSafe(|| drop(sp)));
+    assert!(
+        met.load(Ordering::SeqCst),
+        "the reaper never met the holder that was ending"
+    );
+    assert!(
+        dropped.is_ok(),
+        "a holder that was ending was reaped as a leak"
+    );
+    assert!(!holder_holds(&lock));
+}
+
+/// GOTCHA-337, GOTCHA-240: a probe's lock that a sibling test's fork kept — from its fork until
+/// its exec — reads as no holder, to the next probe and to the reaper: every probe is a shared
+/// lock, which only a holder's exclusive one refuses. Forced: once the holder has ended, a
+/// probe's own lock is kept (its file left open), as such a fork keeps it.
+#[test]
+fn a_probes_lock_a_fork_kept_reads_as_no_holder() {
+    let st = store(Spawn::new());
+    let mut s = Live::start(&st.sp, "t inner_start; read _; ask end");
+    started_pid(&s.next());
+    let lock = lock_of(&st.sp, &st.binding, s.sid());
+    s.go();
+    assert_eq!(s.next(), "ended");
+    s.finish();
+    assert!(
+        gone_within(&lock, LINE_TIMEOUT),
+        "the holder that ended let go"
+    );
+    let HolderLock::Free(kept) = probe_holder_lock(&lock) else {
+        panic!("the lock of a holder that ended reads free");
+    };
+    assert!(
+        !holder_holds(&lock),
+        "a probe's lock a fork kept reads as a holder"
+    );
+    let reaped = catch_unwind(AssertUnwindSafe(|| drop(st)));
+    drop(kept);
+    assert!(
+        reaped.is_ok(),
+        "the reaper took a probe's lock a fork kept for a holder"
     );
 }
 

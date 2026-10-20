@@ -10,7 +10,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ use apprafter::holder::endpoint::{socket_endpoint, Endpoint, EndpointId};
 use apprafter::holder::protocol::StoreBinding;
 use apprafter_core::secrets::testing::locked_store;
 use common::golden::{json_route, LOCATIONS_OK, PROVISIONED_STATE, SERVER_42_BODY};
-use common::spawn::{open_pty, Spawn};
+use common::spawn::{holder_holds, open_pty, Spawn};
 
 /// 64 ASCII alphanumerics: the store's token, the one the mock accepts.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
@@ -204,20 +204,6 @@ fn holder_lock(sp: &Spawn, b: &StoreBinding, sid: i32) -> PathBuf {
         Ok(Endpoint::Socket { lock, .. }) => lock,
         other => panic!("{other:?}"),
     }
-}
-
-/// A holder holds its lock file for its whole life: free means gone.
-fn holder_alive(lock: &Path) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(f) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock)
-    else {
-        return false;
-    };
-    // SAFETY: flock on a file this function opened; released when it closes.
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
 }
 
 /// The harness itself (GOTCHA-259): the screen `finish` returns holds what the session wrote
@@ -465,11 +451,11 @@ fn a_cli_that_leads_its_session_takes_its_window_with_it() {
     );
     assert!(!screen.contains("in this terminal for"), "{screen}");
     let until = Instant::now() + Duration::from_secs(2);
-    while holder_alive(&lock) && Instant::now() < until {
+    while holder_holds(&lock) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        !holder_alive(&lock),
+        !holder_holds(&lock),
         "the holder outlived the session its CLI led"
     );
 }
@@ -489,17 +475,17 @@ fn lock_off_ends_this_terminals_window() {
     t.shows(PROMPT, 1);
     t.type_line(&key);
     assert_eq!(t.step(), "unlock 0", "{}", t.screen());
-    assert!(holder_alive(&lock), "unlock opened no window");
+    assert!(holder_holds(&lock), "unlock opened no window");
     t.shows(PROMPT, 2);
     t.type_line(&key);
     assert_eq!(t.step(), "off 0", "{}", t.screen());
     t.shows("The unlock window in this terminal is closed.", 1);
     let until = Instant::now() + Duration::from_secs(2);
-    while holder_alive(&lock) && Instant::now() < until {
+    while holder_holds(&lock) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        !holder_alive(&lock),
+        !holder_holds(&lock),
         "a holder of this terminal outlived lock off"
     );
     t.finish();

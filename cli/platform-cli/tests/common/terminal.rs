@@ -59,23 +59,33 @@ pub fn converse_with(
     steps: &[Step],
     wire: impl FnOnce(&mut Command),
 ) -> Ended {
-    converse_on(sp, args, steps, false, wire)
+    converse_on(sp, args, steps, false, false, wire)
 }
 
 /// [`converse`] with stdout at the terminal too, as a shell runs a command: what asks only
 /// where stdin and stdout are both terminals — the `target add` and `repo creds add` wizards —
 /// asks here (WI-478). `Ended::stdout` is then empty: everything shows in `terminal`.
 pub fn converse_at_terminal(sp: &Spawn, args: &[&str], steps: &[Step]) -> Ended {
-    converse_on(sp, args, steps, true, |_| {})
+    converse_on(sp, args, steps, true, false, |_| {})
+}
+
+/// [`converse`] with everything the terminal shows held back from the steps until the
+/// conversation has seen the child exit — the reader still reads the terminal as it goes, so a
+/// child is never held by a terminal nobody reads (macOS). The harness's own test (GOTCHA-379):
+/// the order the race leaves, the child reaped before its last output reached the steps, made
+/// certain.
+pub fn converse_holding_output(sp: &Spawn, args: &[&str], steps: &[Step]) -> Ended {
+    converse_on(sp, args, steps, false, true, |_| {})
 }
 
 /// The conversation: stdin and stderr at the pty, and stdout too when `stdout_at_terminal`,
-/// else a pipe read on its own thread.
+/// else a pipe read on its own thread. `hold_until_exit`: [`converse_holding_output`].
 fn converse_on(
     sp: &Spawn,
     args: &[&str],
     steps: &[Step],
     stdout_at_terminal: bool,
+    hold_until_exit: bool,
     wire: impl FnOnce(&mut Command),
 ) -> Ended {
     let (master, slave) = open_pty();
@@ -101,36 +111,68 @@ fn converse_on(
     let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&seen);
     let (closed, drained) = std::sync::mpsc::channel::<()>();
+    let (exit_seen, exit_known) = std::sync::mpsc::channel::<()>();
     // Until the child's side closes (EIO on Linux, EOF elsewhere).
     std::thread::spawn(move || {
+        let mut held = Vec::new();
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            if hold_until_exit {
+                held.extend_from_slice(&buf[..n]);
+            } else {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        }
+        if hold_until_exit {
+            let _ = exit_known.recv();
+            sink.lock().unwrap().extend_from_slice(&held);
         }
         let _ = closed.send(());
     });
+    // The child's exit, once reaped; the held-back reader is told.
+    let exited = |child: &mut std::process::Child| {
+        let status = child.try_wait().expect("try_wait")?;
+        let _ = exit_seen.send(());
+        Some(status)
+    };
     let text =
         |seen: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    // Where `want` shows after the first `matched` bytes, from that offset.
+    let shown_at = |matched: usize, want: &str| {
+        let shown = seen.lock().unwrap();
+        shown
+            .get(matched..)
+            .and_then(|rest| find(rest, want.as_bytes()))
+    };
+    // `drained` delivers once: whether a step has had it, so the end waits only when none did.
+    let mut terminal_closed = false;
     let mut matched = 0usize;
     for step in steps {
         match step {
             Step::Expect(want) => {
                 let deadline = Instant::now() + STEP_TIMEOUT;
                 loop {
-                    let at = {
-                        let shown = seen.lock().unwrap();
-                        shown
-                            .get(matched..)
-                            .and_then(|rest| find(rest, want.as_bytes()))
-                    };
-                    if let Some(at) = at {
+                    if let Some(at) = shown_at(matched, want) {
                         matched += at + want.len();
                         break;
                     }
-                    if let Some(status) = child.try_wait().expect("try_wait") {
+                    if let Some(status) = exited(&mut child) {
+                        // Reaped is not read: the child's last output can still be in the
+                        // terminal, or in the reader's hands. Read the terminal to its close,
+                        // then look once more (GOTCHA-379).
+                        if !terminal_closed {
+                            drained
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("the terminal closes once the child has exited");
+                            terminal_closed = true;
+                        }
+                        if let Some(at) = shown_at(matched, want) {
+                            matched += at + want.len();
+                            break;
+                        }
                         panic!("exited {status} before showing {want:?}:\n{}", text(&seen));
                     }
                     assert!(
@@ -152,7 +194,7 @@ fn converse_on(
     }
     let deadline = Instant::now() + STEP_TIMEOUT;
     let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
+        if let Some(status) = exited(&mut child) {
             break status;
         }
         if Instant::now() >= deadline {
@@ -178,9 +220,11 @@ fn converse_on(
     let stdout = out_reader
         .map(|r| r.join().expect("stdout reader"))
         .unwrap_or_default();
-    drained
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the terminal closes once the child has exited");
+    if !terminal_closed {
+        drained
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the terminal closes once the child has exited");
+    }
     Ended {
         status,
         stdout,
