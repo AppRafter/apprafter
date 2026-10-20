@@ -632,18 +632,8 @@ impl State {
     ) -> std::result::Result<DurableWrite, E> {
         let _ = held;
         let path = paths.state_file();
-        let raw = match cli_core::owner_only::read_secret(&path) {
-            Ok(raw) => raw,
-            // As `load_or_default` (`Path::exists`) and the store's own readers see it.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(DurableWrite::NoFile);
-            }
-            Err(source) => return Err(CliError::StorePathIo { path, source }.into()),
+        let Some(raw) = Self::read_raw(&path)? else {
+            return Ok(DurableWrite::NoFile);
         };
         let mut state: State = match serde_json::from_slice(&raw) {
             Ok(state) => state,
@@ -663,6 +653,46 @@ impl State {
         cli_core::fsutil::replace_durable(&path, &bytes, ".state.json.", None)
             .map_err(|e| write_failed(&path, e))?;
         Ok(wrote)
+    }
+
+    /// `state.json` at `paths`, read strictly, as a key change's plan reads every state file
+    /// before it asks anything (D.4b B79): `None` when there is no file — nor for a path
+    /// through a file, which every reader calls no file —; any other read error names the
+    /// file (`StorePathIo`), and content that does not parse is `state::corrupt` naming it,
+    /// with `apprafter import --force` as its remedy. Nothing is renamed or written.
+    pub fn read_existing(paths: &StatePaths) -> Result<Option<Self>> {
+        let path = paths.state_file();
+        let Some(raw) = Self::read_raw(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|err| CliError::InvalidState {
+                path,
+                message: err.to_string(),
+            })
+    }
+
+    /// `path`'s bytes through the owner-only reader (WI-473), for a durable or a strict read
+    /// (D.4b B78, B79): `None` when there is no file, nor for a path through a file — as
+    /// `load_or_default` and the store's own readers see both —; any other failure names the
+    /// file.
+    fn read_raw(path: &Path) -> Result<Option<Vec<u8>>> {
+        match cli_core::owner_only::read_secret(path) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(source) => Err(CliError::StorePathIo {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
     }
 
     /// `change` on `state`, just read under the lock, then the save it asks for.
@@ -743,6 +773,39 @@ fn write_failed_on(path: &Path, e: std::io::Error, windows: bool) -> CliError {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// D.4b B79: a key change's plan reads each state file strictly — no file, or a path
+    /// through a file, is none; one that parses is its state; one that does not is
+    /// `state::corrupt` naming it — and moves or writes nothing.
+    #[test]
+    fn a_strict_read_names_a_state_that_does_not_parse_and_moves_nothing() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        assert!(State::read_existing(&paths).unwrap().is_none());
+        std::fs::write(dir.path().join("a-file"), b"x").unwrap();
+        let through = StatePaths::for_root(&dir.path().join("a-file"));
+        assert!(State::read_existing(&through).unwrap().is_none());
+        State {
+            provider: Some("hetzner-cloud".into()),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let read = State::read_existing(&paths).unwrap().unwrap();
+        assert_eq!(read.provider.as_deref(), Some("hetzner-cloud"));
+        std::fs::write(paths.state_file(), b"{ not json").unwrap();
+        match State::read_existing(&paths) {
+            Err(CliError::InvalidState { path, .. }) => assert_eq!(path, paths.state_file()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), b"{ not json");
+        let folder = paths.state_file().parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::read_dir(folder).unwrap().count(),
+            1,
+            "nothing set aside"
+        );
+    }
 
     #[test]
     fn save_replaces_the_file_atomically_and_leaves_no_temp_file() {
