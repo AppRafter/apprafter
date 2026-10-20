@@ -268,6 +268,8 @@ pub mod codes {
     /// account password not taken for a slot (both cli-core's, passing through).
     pub const SLOT_NOT_FOUND: &str = "apprafter::secrets::slot_not_found";
     pub const ACCOUNT_PASSWORD_REFUSED: &str = "apprafter::secrets::account_password_refused";
+    /// D.4b B84 (b): a key change that stopped on an error, and where it left the store.
+    pub const KEY_CHANGE_STOPPED: &str = "apprafter::secrets::key_change_stopped";
     /// The lock's three refusals the core raises itself (`CoreError`).
     pub const PASSWORD_REFUSED: &str = "apprafter::secrets::password_refused";
     pub const RECOVERY_KEY_INVALID: &str = "apprafter::secrets::recovery_key_invalid";
@@ -325,6 +327,7 @@ pub mod codes {
         STORE_NOT_PRIVATE,
         SLOT_NOT_FOUND,
         ACCOUNT_PASSWORD_REFUSED,
+        KEY_CHANGE_STOPPED,
         PASSWORD_REFUSED,
         RECOVERY_KEY_INVALID,
         INSECURE_KDF_REFUSED,
@@ -736,6 +739,26 @@ fn neutral_help(e: &cli_core::CliError) -> Option<String> {
                  interrupted. Finish it, or stop protecting the secrets, on the Security page."
                 .into(),
         },
+        C::KeyChangeStopped { left, .. } => match left {
+            cli_core::KeyChangeLeft::NotWritten => "Nothing changed: the store opens as \
+                 before, and a recovery key shown then is not valid. Keep your current \
+                 recovery key."
+                .into(),
+            cli_core::KeyChangeLeft::Unfinished => "The new keys are written, and the key \
+                 change did not finish: a recovery key shown then opens the store now, and the \
+                 one it replaced no longer does. Finish it on the Security page, or stop \
+                 protecting the secrets there."
+                .into(),
+            cli_core::KeyChangeLeft::BackOutFailed => "The key change was not written, and the \
+                 store may read as an interrupted key change: finish it on the Security page \
+                 with one of its earlier secrets, or stop protecting the secrets there."
+                .into(),
+            cli_core::KeyChangeLeft::Unknown => "Whether the new keys were written could not \
+                 be told: keep both your current recovery key and any recovery key shown then. \
+                 Finish it on the Security page with any of the store's secrets, or stop \
+                 protecting the secrets there."
+                .into(),
+        },
         C::SlotRefused { reason, .. } => match reason {
             cli_core::SlotRefusal::KdfTooWeak | cli_core::SlotRefusal::KdfOutOfRange => {
                 "This build will not use that lock password's key settings. Unlock with the \
@@ -958,6 +981,10 @@ fn project_cli(e: &cli_core::CliError, put: &mut impl FnMut(&str, serde_json::Va
         C::LockIncomplete { store, phase } => {
             put("store", json!(store.display().to_string()));
             put("phase", json!(phase.as_str()));
+        }
+        C::KeyChangeStopped { store, left, .. } => {
+            put("store", json!(store.display().to_string()));
+            put("left", json!(left.as_str()));
         }
         C::SlotRefused { store, reason } => {
             put("store", json!(store.display().to_string()));
@@ -1487,6 +1514,26 @@ pub mod samples {
             C::LockIncomplete {
                 store: store(),
                 phase: LockPhase::Rotating,
+            },
+            C::KeyChangeStopped {
+                store: store(),
+                left: cli_core::KeyChangeLeft::NotWritten,
+                cause: s("disk full"),
+            },
+            C::KeyChangeStopped {
+                store: store(),
+                left: cli_core::KeyChangeLeft::Unfinished,
+                cause: s("disk full"),
+            },
+            C::KeyChangeStopped {
+                store: store(),
+                left: cli_core::KeyChangeLeft::BackOutFailed,
+                cause: s("disk full"),
+            },
+            C::KeyChangeStopped {
+                store: store(),
+                left: cli_core::KeyChangeLeft::Unknown,
+                cause: s("disk full"),
             },
             C::CacheNotSealed {
                 secret: CachedSecret::Kubeconfig,
@@ -2076,6 +2123,7 @@ mod tests {
             codes::STORE_NOT_PRIVATE,
             codes::SLOT_NOT_FOUND,
             codes::ACCOUNT_PASSWORD_REFUSED,
+            codes::KEY_CHANGE_STOPPED,
         ] {
             assert!(
                 seen.contains(code),
@@ -2643,6 +2691,7 @@ mod tests {
             codes::STORE_NOT_PRIVATE,
             codes::SLOT_NOT_FOUND,
             codes::ACCOUNT_PASSWORD_REFUSED,
+            codes::KEY_CHANGE_STOPPED,
         ] {
             assert!(helped.contains(code), "{code} has no neutral help");
         }

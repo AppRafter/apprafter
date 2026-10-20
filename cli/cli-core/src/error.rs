@@ -541,6 +541,35 @@ impl LockPhase {
     }
 }
 
+/// Where a key change that stopped on an error left its store (D.4b B84 b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyChangeLeft {
+    /// Nothing that stays was written: the store opens as before, and a recovery key shown
+    /// in the run is not valid.
+    NotWritten,
+    /// The new keys are written: the store reads as an unfinished key change, which `lock
+    /// rekey` or `lock recovery` finishes; a recovery key shown in the run opens it now.
+    Unfinished,
+    /// Not written, and `store.yaml` could not be put back: the store may read as an
+    /// unfinished key change, which the same commands finish with its earlier secrets.
+    BackOutFailed,
+    /// Whether the new vault was written could not be told, and the old one could not be
+    /// put back (critic round, finding 3): keep every secret of the store, earlier and new.
+    Unknown,
+}
+
+impl KeyChangeLeft {
+    /// Its name on the wire (`fields.left`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyChangeLeft::NotWritten => "not_written",
+            KeyChangeLeft::Unfinished => "unfinished",
+            KeyChangeLeft::BackOutFailed => "back_out_failed",
+            KeyChangeLeft::Unknown => "unknown",
+        }
+    }
+}
+
 /// What is wrong with a vault that cannot be read (D.4a §3.12). Damage is found only by a key
 /// that opened it or by its structure; a missing or foreign vault is said so before any key
 /// is asked for. Never "no such secret" (ADR 0068 Risks "Failures in the vault code").
@@ -1062,6 +1091,54 @@ fn lock_incomplete_help(phase: LockPhase) -> String {
              `apprafter lock off` returns the secrets to files instead. Until then commands that \
              need the store's secrets refuse, because some may be sealed to the new store key and \
              some to the old one."
+            .to_string(),
+    }
+}
+
+fn key_change_stopped_message(store: &Path, left: KeyChangeLeft, cause: &str) -> String {
+    let s = store.display();
+    match left {
+        KeyChangeLeft::NotWritten => format!(
+            "{cause}: the key change of the target store at {s} was not written — it opens as \
+             before, with its earlier secrets, and a recovery key shown in this run is not valid"
+        ),
+        KeyChangeLeft::Unfinished => format!(
+            "{cause}: the key change of the target store at {s} did not finish — its new keys \
+             are written: a recovery key shown in this run opens it now, and the one it \
+             replaced no longer does"
+        ),
+        KeyChangeLeft::BackOutFailed => format!(
+            "{cause}: the key change of the target store at {s} was not written, and its lock \
+             state could not be put back — it may read as an interrupted key change"
+        ),
+        KeyChangeLeft::Unknown => format!(
+            "{cause}: the key change of the target store at {s} stopped, and whether its new \
+             vault was written could not be told — it reads as an interrupted key change"
+        ),
+    }
+}
+
+fn key_change_stopped_help(left: KeyChangeLeft) -> String {
+    match left {
+        KeyChangeLeft::NotWritten => "Keep your current recovery key. Fix what failed, then run \
+             the command again."
+            .to_string(),
+        KeyChangeLeft::Unfinished => "Keep the recovery key shown in this run: the store opens \
+             with it now, or with a way in the key change kept. Run `apprafter lock rekey` or \
+             `apprafter lock recovery` again with one of those secrets to finish it, or \
+             `apprafter lock off` to return the secrets to files. Until then commands that need \
+             the store's secrets refuse."
+            .to_string(),
+        KeyChangeLeft::BackOutFailed => "Run `apprafter lock rekey` or `apprafter lock recovery` \
+             again with one of the store's earlier secrets: it finds the key change not written \
+             and puts the store back as it was. `apprafter lock off` returns the secrets to \
+             files instead. Until then commands that need the store's secrets refuse."
+            .to_string(),
+        KeyChangeLeft::Unknown => "Keep both your current recovery key and any recovery key shown \
+             in this run, and every other secret of the store. Run `apprafter lock rekey` or \
+             `apprafter lock recovery` again with one of them, earlier or new: it opens the vault \
+             on disk and finishes the key change or puts it back. `apprafter lock off` returns the \
+             secrets to files instead. Until then commands that need the store's secrets refuse."
             .to_string(),
     }
 }
@@ -2025,6 +2102,20 @@ pub enum CliError {
         help("{}", lock_incomplete_help(*phase))
     )]
     LockIncomplete { store: PathBuf, phase: LockPhase },
+
+    /// A key change that stopped on an error (D.4b B84 b): what failed, and where it left
+    /// the store — put back as it was while its new vault was not yet durable, else an
+    /// unfinished key change for `lock rekey` / `lock recovery` to finish.
+    #[error("{}", key_change_stopped_message(store, *left, cause))]
+    #[diagnostic(
+        code(apprafter::secrets::key_change_stopped),
+        help("{}", key_change_stopped_help(*left))
+    )]
+    KeyChangeStopped {
+        store: PathBuf,
+        left: KeyChangeLeft,
+        cause: String,
+    },
 
     /// A slot refused before any key was derived (D.4a T22, T63).
     #[error("{}", slot_refused_message(store, *reason))]
@@ -3495,6 +3586,22 @@ mod tests {
              "apprafter::secrets::lock_incomplete",
              "an earlier `lock rekey` or `lock recovery` on the target store at /s did not finish",
              "`apprafter lock off` returns the secrets to files"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::NotWritten, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s was not written — it opens as before, with its earlier secrets, and a recovery key shown in this run is not valid",
+             "Keep your current recovery key"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::Unfinished, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s did not finish — its new keys are written: a recovery key shown in this run opens it now, and the one it replaced no longer does",
+             "or `apprafter lock off` to return the secrets to files"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::BackOutFailed, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s was not written, and its lock state could not be put back — it may read as an interrupted key change",
+             "with one of the store's earlier secrets"),
+            (CliError::KeyChangeStopped { store: s(), left: KeyChangeLeft::Unknown, cause: "x".into() },
+             "apprafter::secrets::key_change_stopped",
+             "x: the key change of the target store at /s stopped, and whether its new vault was written could not be told — it reads as an interrupted key change",
+             "Keep both your current recovery key and any recovery key shown in this run"),
             (CliError::SlotRefused { store: s(), reason: SlotRefusal::KdfTooWeak },
              "apprafter::secrets::slot_refused",
              "the lock password of the target store at /s is kept with key-derivation settings weaker than this AppRafter accepts",

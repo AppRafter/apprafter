@@ -86,6 +86,9 @@ use crate::vault::{
     MachineId, OsRandom, RotationIds, SlotBody, SlotId, SlotKind, SlotRecord, VaultId,
 };
 use crate::CancellationToken;
+use cli_core::KeyChangeLeft;
+
+use crate::secrets::vault_id_on_disk;
 
 /// Which key change (B68; ADR 0069 §2 reading 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -987,6 +990,11 @@ struct Run<'a> {
     old: &'a VaultHeader,
     new_vault: VaultId,
     policy: &'static KdfPolicy,
+    /// The old vault as the lock found it, opened: put back when the vault on disk is not
+    /// one this run proved, before any cache moved.
+    current: &'a UnlockedVault,
+    /// What every vault this run writes says wrote it.
+    writer: &'a str,
 }
 
 /// Tests: what [`AFTER_ROTATED_WRITE`] runs on the store root.
@@ -1071,6 +1079,8 @@ pub fn execute_rotate(
         old: current.header(),
         new_vault: parts.ids.vault_id,
         policy,
+        current: &current,
+        writer: &writer,
     };
     // R1
     stage(reporter, 1, "Marking the key change");
@@ -1082,20 +1092,29 @@ pub fn execute_rotate(
         }),
         ..run.before.clone()
     };
-    mark(&run, &rotating)?;
+    injected(FailAt::StoreFile)
+        .and_then(|()| mark(&run, &rotating))
+        .map_err(|cause| stopped_before_durable(&run, &cause))?;
     faults::hit(ctx, FaultPoint::AfterStoreFileRotating)?;
     // R2
     stage(reporter, 2, "Writing the new vault");
-    write_rotated(&run, &rotated.bytes)?;
+    // §5.3: Cancel is honoured until here: the store goes back to `locked` (B84 b).
+    if cancel.is_cancelled() {
+        return back_out_cancelled(&run);
+    }
+    write_rotated(&run, &rotated.bytes).map_err(|cause| stopped_before_durable(&run, &cause))?;
     faults::hit(ctx, FaultPoint::AfterVaultRotated)?;
-    let disk = read_back(&run, &rotated.vault, &parts.reopen)?;
+    let disk =
+        read_back(&run, &rotated.vault, &parts.reopen).map_err(|cause| put_back(&run, &cause))?;
     faults::hit(ctx, FaultPoint::AfterRotatedVerified)?;
     // R3
     stage(reporter, 3, "Re-encrypting cached secrets");
-    let resealed = reseal_all(&run, &rotated.vault, disk)?;
+    let resealed =
+        reseal_all(&run, &rotated.vault, disk).map_err(|cause| unfinished(&run, cause))?;
     // R4
     stage(reporter, 4, "Retiring the old store key");
-    let retired = retire(&run, &rotated.vault, &writer)?;
+    let retired = retire(&run, &rotated.vault, &writer)
+        .map_err(|cause| retire_failed(&run, &rotated.vault, cause))?;
     faults::hit(ctx, FaultPoint::AfterRetiringDropped)?;
     // R4b
     stage(
@@ -1113,7 +1132,7 @@ pub fn execute_rotate(
         slots: slot_infos(retired.header()),
         ..run.before.clone()
     };
-    mark(&run, &locked)?;
+    mark(&run, &locked).map_err(|cause| unfinished(&run, cause))?;
     faults::hit(ctx, FaultPoint::AfterRotated)?;
     // R6
     Ok(Outcome::Completed {
@@ -1139,6 +1158,7 @@ fn mark(run: &Run<'_>, file: &StoreFile) -> CoreResult<()> {
 /// R2's write: the rotated vault by the durable replace (B78), then the root synced (B51).
 /// Tests: [`AFTER_ROTATED_WRITE`] runs between the two (critic round, findings 1, 3, 7).
 fn write_rotated(run: &Run<'_>, bytes: &[u8]) -> CoreResult<()> {
+    injected(FailAt::VaultReplace)?;
     vault::file::replace(&vault_path(run.root), bytes, run.held)
         .map_err(|e| vault_err(run.root, e))?;
     #[cfg(test)]
@@ -1147,6 +1167,7 @@ fn write_rotated(run: &Run<'_>, bytes: &[u8]) -> CoreResult<()> {
             spoil(run.root);
         }
     });
+    injected(FailAt::VaultSync)?;
     sync_root(run.store)?;
     Ok(())
 }
@@ -1196,6 +1217,7 @@ fn reseal_all(run: &Run<'_>, vault: &UnlockedVault, disk: Arc<[u8]>) -> CoreResu
         .map_err(|e| vault_err(run.root, e))?
         .ok_or_else(|| misused("the rotated vault retires no store key"))?;
     let retiring = [retiring];
+    injected(FailAt::Reseal)?;
     let mut done = Resealed::default();
     for (n, folder) in state_folders(run.store)?.iter().enumerate() {
         reseal(
@@ -1221,6 +1243,12 @@ fn retire(run: &Run<'_>, vault: &UnlockedVault, writer: &str) -> CoreResult<Unlo
         .map_err(|e| vault_err(run.root, e))?;
     vault::file::replace(&vault_path(run.root), &bytes, run.held)
         .map_err(|e| vault_err(run.root, e))?;
+    #[cfg(test)]
+    AFTER_RETIRED_WRITE.with(|hook| {
+        if let Some(spoil) = hook.borrow().as_ref() {
+            spoil(run.root);
+        }
+    });
     sync_root(run.store)?;
     let not_kept_here = || {
         CoreError::Cli(not_kept(
@@ -1365,4 +1393,193 @@ fn stage(reporter: &dyn Reporter, index: u32, title: &str) {
         total: 6,
         title: title.to_string(),
     });
+}
+
+/// Where a test makes a step fail as an I/O error would (B84 b) — never a crash: a crash is
+/// a `FaultPoint`, which no back-out follows (F5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailAt {
+    /// R1's write of `store.yaml`.
+    StoreFile,
+    /// R2's replace, before the vault moves.
+    VaultReplace,
+    /// R2's root sync, after the vault moved.
+    VaultSync,
+    /// The back-out's own write of `store.yaml`.
+    BackOut,
+    /// R3, before its first folder.
+    Reseal,
+    /// Putting back the last vault this run proved (critic round, findings 1–3).
+    Restore,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the steps that fail on this thread, each once.
+    pub(super) static FAIL_AT: std::cell::RefCell<Vec<FailAt>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Tests: runs on the store root right after R4's write, standing in for a vault on
+    /// disk that does not hold what was written (R4's read-back must catch it).
+    pub(super) static AFTER_RETIRED_WRITE: std::cell::RefCell<Option<VaultHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// An injected I/O failure at `at`, once, when a test armed it; nothing in any other build.
+fn injected(at: FailAt) -> CoreResult<()> {
+    #[cfg(test)]
+    if FAIL_AT.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let found = armed.iter().position(|point| *point == at);
+        found.map(|i| armed.remove(i)).is_some()
+    }) {
+        return Err(CoreError::Cli(CliError::Io(std::io::Error::other(
+            format!("injected failure at {at:?}"),
+        ))));
+    }
+    #[cfg(not(test))]
+    let _ = at;
+    Ok(())
+}
+
+/// B84 (b): a step before R3 failed with `cause`, `store.yaml` saying `rotating`. The vault
+/// on disk decides — read again, never assumed: the new one, durable, leaves the store
+/// `rotating` for a finish (d4b-c2b); the old one, untouched, puts `store.yaml` back to
+/// `locked`; anything else — no vault, another, or one that cannot be read — has the old
+/// vault put back first, as no cache has moved yet (critic round, finding 3). The error
+/// says which.
+fn stopped_before_durable(run: &Run<'_>, cause: &dyn fmt::Display) -> CoreError {
+    match vault_id_on_disk(run.root) {
+        Ok(Some(now)) if now == run.new_vault => stopped(run, KeyChangeLeft::Unfinished, cause),
+        Ok(Some(now)) if now == run.old.vault_id => back_out_with(run, cause),
+        Ok(_) => put_back(
+            run,
+            &format!("{cause}; the vault on disk is neither the old one nor the new one"),
+        ),
+        Err(also) => put_back(
+            run,
+            &format!("{cause}; the vault on disk could not be read: {also}"),
+        ),
+    }
+}
+
+/// Never losing access (rule 5; critic round, findings 1 and 3): the vault on disk is not
+/// one this run proved, and no cache has moved yet (R3 has not begun). The old vault —
+/// sealed again from the copy read under the lock: its data key, vault id and every slot as
+/// they were, so every earlier secret opens it — is put back and read back, then
+/// `store.yaml` goes back to `locked`: the key change was not written. A restore that fails
+/// leaves `rotating` over a vault nobody can vouch for: `unknown`, keep every secret.
+fn put_back(run: &Run<'_>, cause: &dyn fmt::Display) -> CoreError {
+    if let Err(also) = restore(run, run.current) {
+        return stopped(
+            run,
+            KeyChangeLeft::Unknown,
+            &format!("{cause}; putting the earlier vault back failed too: {also}"),
+        );
+    }
+    back_out_with(run, cause)
+}
+
+/// `store.yaml` back to `locked` over the old vault, and said: not written, or the
+/// back-out's own failure.
+fn back_out_with(run: &Run<'_>, cause: &dyn fmt::Display) -> CoreError {
+    match back_out(run) {
+        Ok(()) => stopped(run, KeyChangeLeft::NotWritten, cause),
+        Err(also) => stopped(
+            run,
+            KeyChangeLeft::BackOutFailed,
+            &format!("{cause}; putting the lock state back failed too: {also}"),
+        ),
+    }
+}
+
+/// R4's write or its read-back failed (critic round, finding 2): the vault on disk may be
+/// one no secret opens. R2's vault — every new and kept secret opens it, and it still holds
+/// the retiring store key — is put back, so the store stays a key change a finish completes
+/// (d4b-c2b redoes R4). A restore that fails is `unknown`.
+fn retire_failed(run: &Run<'_>, rotated: &UnlockedVault, cause: CoreError) -> CoreError {
+    match restore(run, rotated) {
+        Ok(()) => unfinished(run, cause),
+        Err(also) => stopped(
+            run,
+            KeyChangeLeft::Unknown,
+            &format!("{cause}; putting the key change's vault back failed too: {also}"),
+        ),
+    }
+}
+
+/// `vault` — the last one this run proved — sealed again (a fresh payload nonce, its data
+/// key, vault id, slots and payload as they are) and written over what is on disk by the
+/// durable replace, the root synced, then read back with its own data key and compared.
+fn restore(run: &Run<'_>, vault: &UnlockedVault) -> CoreResult<()> {
+    injected(FailAt::Restore)?;
+    let sealed = vault
+        .seal(run.writer, &mut OsRandom)
+        .map_err(|e| vault_err(run.root, e))?;
+    vault::file::replace(&vault_path(run.root), &sealed, run.held)
+        .map_err(|e| vault_err(run.root, e))?;
+    sync_root(run.store)?;
+    let not_kept_here =
+        || CoreError::Cli(not_kept(run.store, "the vault this key change put back"));
+    let disk = read_vault(run.store, run.id)?;
+    let back = VaultFile::parse(&disk)
+        .and_then(|parsed| parsed.open_with_key(vault.data_key(), vault.header().vault_id))
+        .map_err(|_| not_kept_here())?;
+    let want = vault
+        .payload()
+        .encode()
+        .map_err(|e| vault_err(run.root, e))?;
+    let got = back
+        .payload()
+        .encode()
+        .map_err(|e| vault_err(run.root, e))?;
+    if back.header().slots != vault.header().slots || !bool::from(got[..].ct_eq(&want[..])) {
+        return Err(not_kept_here());
+    }
+    Ok(())
+}
+
+/// A step after the new vault is durable failed with `cause`: the store stays `rotating`,
+/// and the retiring store key in the new vault lets a finish (d4b-c2b) re-seal what is
+/// left.
+fn unfinished(run: &Run<'_>, cause: CoreError) -> CoreError {
+    stopped(run, KeyChangeLeft::Unfinished, &cause)
+}
+
+fn stopped(run: &Run<'_>, left: KeyChangeLeft, cause: &dyn fmt::Display) -> CoreError {
+    CoreError::Cli(CliError::KeyChangeStopped {
+        store: run.root.to_path_buf(),
+        left,
+        cause: cause.to_string(),
+    })
+}
+
+/// B84 (b): `store.yaml` back to `locked`, its slot list from the old vault, synced.
+fn back_out(run: &Run<'_>) -> CoreResult<()> {
+    injected(FailAt::BackOut)?;
+    let locked = StoreFile {
+        secrets: SecretsMode::Locked,
+        rotation: None,
+        slots: slot_infos(run.old),
+        ..run.before.clone()
+    };
+    mark(run, &locked)
+}
+
+/// §5.3: a cancel after R1 and before R2 — the vault on disk still the old one — puts the
+/// store back; a back-out that fails leaves `rotating`, said.
+fn back_out_cancelled(run: &Run<'_>) -> CoreResult<Outcome<KeysRotated>> {
+    match back_out(run) {
+        Ok(()) => Ok(Outcome::Cancelled {
+            cleaned: vec![format!(
+                "{STORE_FILE}: back to `locked`; the key change was not written, and a \
+                 recovery key shown in this run is not valid"
+            )],
+            left: Vec::new(),
+        }),
+        Err(also) => Err(stopped(
+            run,
+            KeyChangeLeft::BackOutFailed,
+            &format!("cancelled; putting the lock state back failed: {also}"),
+        )),
+    }
 }

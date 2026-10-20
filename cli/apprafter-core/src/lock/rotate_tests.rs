@@ -42,6 +42,10 @@ use super::off::HelloKeyGone;
 use crate::secrets::{StoreFile, StoreId};
 use crate::vault::{KeptMaterial, RecoveryKey, RotationIds, SlotSecret};
 use crate::{CancellationToken, NullReporter, Outcome};
+use cli_core::KeyChangeLeft;
+
+use super::rotate::{FailAt, FAIL_AT};
+use crate::{Event, Reporter};
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -1960,4 +1964,368 @@ fn a_cancel_before_the_lock_writes_nothing() {
         Outcome::Cancelled { .. }
     ));
     assert_eq!(kit.store_file().secrets, SecretsMode::Locked);
+}
+
+/// Tests: the steps that fail on this thread, each once (`rotate::injected`).
+fn fail_at(points: &[FailAt]) {
+    FAIL_AT.with(|armed| armed.borrow_mut().extend_from_slice(points));
+}
+
+fn stopped(err: &CoreError, left: KeyChangeLeft) -> bool {
+    matches!(err, CoreError::Cli(CliError::KeyChangeStopped { left: l, .. }) if *l == left)
+}
+
+/// A reporter that trips `cancel` when the run reaches stage `at`: the run's own event,
+/// never a clock.
+struct CancelAt {
+    at: u32,
+    cancel: CancellationToken,
+}
+
+impl Reporter for CancelAt {
+    fn report(&self, event: Event) {
+        if let Event::Stage { index, .. } = event {
+            if index == self.at {
+                self.cancel.cancel();
+            }
+        }
+    }
+}
+
+/// `lock recovery` of a default store, every question answered, nothing written yet; the
+/// new recovery key shown.
+fn recovery_asked(kit: &Kit) -> (Plan<RotatePayload>, RotateMaterial, String) {
+    let (plan, material, shown) = asked(
+        kit,
+        RotateKind::Recovery,
+        &FixedFacts::on(b'a'),
+        ACCOUNT_A,
+        |q| panic!("{q:?}"),
+    );
+    (plan, material, shown.expect("a new recovery key"))
+}
+
+fn execute(kit: &Kit, plan: Plan<RotatePayload>, material: RotateMaterial) -> CoreError {
+    execute_rotate(
+        &kit.ctx,
+        plan,
+        material,
+        &NullReporter,
+        &CancellationToken::new(),
+    )
+    .unwrap_err()
+}
+
+/// B84 (b) (acceptance 3): R1's write failing — before the new vault exists — changes
+/// nothing: the store opens as before with its secrets, and the error says so.
+#[test]
+fn a_failed_first_write_changes_nothing() {
+    let kit = Kit::new(Shape::Default);
+    let file = kit.store_file();
+    let vault_bytes = vault::file::read(&vault_path(kit.root())).unwrap();
+    let (plan, material, _) = recovery_asked(&kit);
+    fail_at(&[FailAt::StoreFile]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::NotWritten), "{err:?}");
+    assert_eq!(kit.store_file(), file);
+    assert_eq!(
+        vault::file::read(&vault_path(kit.root())).unwrap(),
+        vault_bytes
+    );
+    assert!(kit.open(recovery_secret(&kit.recovery())).is_ok());
+}
+
+/// B84 (b) (acceptance 3): R2's replace failing before the vault moves backs out —
+/// `store.yaml` is `locked` again as it was — and the error says the change was not written
+/// and the recovery key shown is not valid; that key opens nothing.
+#[test]
+fn a_replace_that_fails_before_the_vault_moves_backs_out() {
+    let kit = Kit::new(Shape::Default);
+    let file = kit.store_file();
+    let vault_bytes = vault::file::read(&vault_path(kit.root())).unwrap();
+    let (plan, material, shown) = recovery_asked(&kit);
+    fail_at(&[FailAt::VaultReplace]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::NotWritten), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("injected failure at VaultReplace"), "{text}");
+    assert!(
+        text.contains("a recovery key shown in this run is not valid"),
+        "{text}"
+    );
+    assert_eq!(
+        kit.store_file(),
+        file,
+        "store.yaml is locked again, as it was"
+    );
+    assert_eq!(
+        vault::file::read(&vault_path(kit.root())).unwrap(),
+        vault_bytes
+    );
+    assert!(kit.open(recovery_secret(&shown)).is_err());
+}
+
+/// B84 (b) (acceptance 3): R2's sync failing once the new vault moved — the vault on disk
+/// is the new one — leaves the store `rotating` to that vault, for a finish; the new
+/// secrets open it, so nothing is lost.
+#[test]
+fn a_vault_that_moved_before_the_failure_stays_for_a_finish() {
+    let kit = Kit::new(Shape::Default);
+    let (plan, material, shown) = recovery_asked(&kit);
+    let new_id = plan.payload.new_vault_id();
+    fail_at(&[FailAt::VaultSync]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::Unfinished), "{err:?}");
+    let file = kit.store_file();
+    assert_eq!(file.secrets, SecretsMode::Rotating);
+    assert_eq!(
+        file.rotation.map(|r| r.to.to_string()),
+        Some(new_id.clone())
+    );
+    assert_eq!(kit.header().vault_id.to_string(), new_id);
+    assert!(kit.open(recovery_secret(&shown)).is_ok());
+}
+
+/// B84 (b) (acceptance 3): a back-out whose own write fails leaves `rotating` — over the old
+/// vault, whose secrets still open it — and says both failures.
+#[test]
+fn a_back_out_that_fails_itself_leaves_rotating_and_says_so() {
+    let kit = Kit::new(Shape::Default);
+    let vault_bytes = vault::file::read(&vault_path(kit.root())).unwrap();
+    let (plan, material, _) = recovery_asked(&kit);
+    fail_at(&[FailAt::VaultReplace, FailAt::BackOut]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::BackOutFailed), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("injected failure at VaultReplace")
+            && text.contains("injected failure at BackOut"),
+        "{text}"
+    );
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+    assert_eq!(
+        vault::file::read(&vault_path(kit.root())).unwrap(),
+        vault_bytes
+    );
+    assert!(kit.open(recovery_secret(&kit.recovery())).is_ok());
+}
+
+/// §5.3: Cancel is honoured until R2 — a cancel after R1 puts `store.yaml` back to `locked`
+/// as it was, and the outcome says what it cleaned.
+#[test]
+fn a_cancel_after_the_store_file_and_before_the_vault_puts_the_store_back() {
+    let kit = Kit::new(Shape::Default);
+    let file = kit.store_file();
+    let (plan, material, _) = recovery_asked(&kit);
+    let cancel = CancellationToken::new();
+    let at_r2 = CancelAt {
+        at: 2,
+        cancel: cancel.clone(),
+    };
+    match execute_rotate(&kit.ctx, plan, material, &at_r2, &cancel).unwrap() {
+        Outcome::Cancelled { cleaned, .. } => assert_eq!(cleaned.len(), 1, "{cleaned:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(kit.store_file(), file);
+}
+
+/// B84 (b), §4.5: an error after the new vault is durable leaves the store `rotating`, the
+/// old store key still inside the new vault for the finish to re-seal what is left.
+#[test]
+fn an_error_after_the_new_vault_is_durable_leaves_a_finishable_change() {
+    let kit = Kit::new(Shape::Default);
+    let (plan, material, shown) = recovery_asked(&kit);
+    fail_at(&[FailAt::Reseal]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::Unfinished), "{err:?}");
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+    let opened = kit.open(recovery_secret(&shown)).unwrap();
+    assert!(opened.payload().retiring_identity().unwrap().is_some());
+}
+
+/// F5: a fault point is a crash — no back-out follows it — so d4b-c2b's crash matrix meets
+/// `rotating` over the old vault exactly as a dead process leaves it.
+#[test]
+fn a_crash_after_the_store_file_is_never_backed_out() {
+    let kit = Kit::new(Shape::Default);
+    let (plan, material, _) = recovery_asked(&kit);
+    let crashing = kit
+        .ctx
+        .clone()
+        .with_fault(FaultPoint::AfterStoreFileRotating);
+    let err = execute_rotate(
+        &crashing,
+        plan,
+        material,
+        &NullReporter,
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+    assert!(
+        !matches!(err, CoreError::Cli(CliError::KeyChangeStopped { .. })),
+        "{err:?}"
+    );
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+}
+
+/// B84 (b): where a stopped key change left the store, as the desktop reads it — the code,
+/// the `left` field, and a help that names the Security page, never a command.
+#[test]
+fn a_stopped_key_change_says_where_it_left_the_store() {
+    let ui = UiError::from(&CoreError::Cli(CliError::KeyChangeStopped {
+        store: "/s".into(),
+        left: KeyChangeLeft::Unfinished,
+        cause: "disk full".into(),
+    }));
+    assert_eq!(
+        ui.code.as_deref(),
+        Some("apprafter::secrets::key_change_stopped")
+    );
+    assert_eq!(
+        serde_json::to_value(&ui.fields).unwrap(),
+        json!({"store": "/s", "left": "unfinished"})
+    );
+    let help = ui.help.unwrap();
+    assert!(
+        help.contains("Security page") && !help.contains("apprafter "),
+        "{help}"
+    );
+    assert!(ui.message.starts_with("disk full: "), "{}", ui.message);
+}
+
+/// Critic round, finding 1 (rule 5, never losing access): R2's read-back finds the old
+/// vault on disk — the write did not hold — and no cache has moved, so the store is put
+/// back: `locked` over the old vault (sealed again from the copy read under the lock), every
+/// earlier secret opening it, the key shown opening nothing, the cache as it was; the change
+/// was not written, and the error says so with what failed.
+#[test]
+fn a_vault_on_disk_that_is_not_what_r2_wrote_puts_the_old_vault_back() {
+    let kit = Kit::new(Shape::Default);
+    let to = kit.made.recipient();
+    kit.seed(
+        "prod",
+        json!({"server_id": 1, "server_name": "p", "kubeconfig_age": sealed(to, YAML)}),
+    );
+    let state = StatePaths::for_active_target(&kit.ctx.store(), "prod").state_file();
+    let cached = std::fs::read(&state).unwrap();
+    let file = kit.store_file();
+    let path = vault_path(kit.root());
+    let old = vault::file::read(&path).unwrap();
+    let (plan, material, shown) = recovery_asked(&kit);
+    super::rotate::AFTER_ROTATED_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_: &Path| {
+            std::fs::write(&path, &old).unwrap();
+        }));
+    });
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::NotWritten), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("does not hold the vault this key change wrote"),
+        "{err}"
+    );
+    assert_eq!(
+        kit.store_file(),
+        file,
+        "store.yaml is locked again, as it was"
+    );
+    assert!(kit.open(recovery_secret(&kit.recovery())).is_ok());
+    assert!(kit
+        .open(SlotSecret::AccountPassword(
+            SecretString::new(ACCOUNT_A),
+            machine(b'a')
+        ))
+        .is_ok());
+    assert!(kit.open(recovery_secret(&shown)).is_err());
+    assert_eq!(std::fs::read(&state).unwrap(), cached, "no cache moved");
+}
+
+/// Critic round, finding 1: a vault on disk after R2 that is no vault at all — a damaged
+/// write — is replaced by the old vault before anything else moves, and the store goes back
+/// to `locked`: every earlier secret opens it.
+#[test]
+fn a_garbled_vault_after_r2_puts_the_old_vault_back() {
+    let kit = Kit::new(Shape::Default);
+    let file = kit.store_file();
+    let (plan, material, _) = recovery_asked(&kit);
+    super::rotate::AFTER_ROTATED_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|root: &Path| {
+            std::fs::write(vault_path(root), b"not a vault").unwrap();
+        }));
+    });
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::NotWritten), "{err:?}");
+    assert_eq!(kit.store_file(), file);
+    assert!(kit.open(recovery_secret(&kit.recovery())).is_ok());
+}
+
+/// Critic round, finding 2: a vault on disk after R4 that is no vault at all is replaced by
+/// R2's — the key shown opens it, and it still holds the retiring store key — so the store
+/// stays a key change a finish completes.
+#[test]
+fn a_garbled_vault_after_r4_puts_r2_s_vault_back() {
+    let kit = Kit::new(Shape::Default);
+    let (plan, material, shown) = recovery_asked(&kit);
+    let new_id = plan.payload.new_vault_id();
+    super::rotate::AFTER_RETIRED_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|root: &Path| {
+            std::fs::write(vault_path(root), b"not a vault").unwrap();
+        }));
+    });
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::Unfinished), "{err:?}");
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+    assert_eq!(kit.header().vault_id.to_string(), new_id);
+    let opened = kit.open(recovery_secret(&shown)).unwrap();
+    assert!(opened.payload().retiring_identity().unwrap().is_some());
+}
+
+/// Critic round, finding 3 (never masked): a vault on disk that is neither the old nor the
+/// new one, which cannot be put back either, leaves `rotating` and says `unknown` — keep
+/// every secret — never "not written".
+#[test]
+fn a_vault_that_cannot_be_put_back_says_keep_every_key() {
+    let kit = Kit::new(Shape::Default);
+    let (plan, material, _) = recovery_asked(&kit);
+    super::rotate::AFTER_ROTATED_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|root: &Path| {
+            std::fs::write(vault_path(root), b"not a vault").unwrap();
+        }));
+    });
+    fail_at(&[FailAt::VaultSync, FailAt::Restore]);
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::Unknown), "{err:?}");
+    assert!(
+        err.to_string().contains("injected failure at Restore"),
+        "{err}"
+    );
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+}
+
+/// Critic round, finding 7 (overview §9, c2a; B63, B78): a target's state folder whose sync
+/// fails ends the run in R3, before the retiring store key leaves the vault — armed after
+/// R2's own durable replace, on this thread — so the store stays a finishable key change.
+#[cfg(unix)]
+#[test]
+fn a_state_folder_s_failed_sync_ends_the_run_before_r4() {
+    let kit = Kit::new(Shape::Default);
+    let to = kit.made.recipient();
+    kit.seed(
+        "prod",
+        json!({"server_id": 1, "server_name": "p", "kubeconfig_age": sealed(to, YAML)}),
+    );
+    let (plan, material, shown) = recovery_asked(&kit);
+    super::rotate::AFTER_ROTATED_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|_: &Path| {
+            cli_core::fsutil::testing::fail_next_dir_sync();
+        }));
+    });
+    let err = execute(&kit, plan, material);
+    assert!(stopped(&err, KeyChangeLeft::Unfinished), "{err:?}");
+    assert_eq!(kit.store_file().secrets, SecretsMode::Rotating);
+    let opened = kit.open(recovery_secret(&shown)).unwrap();
+    assert!(
+        opened.payload().retiring_identity().unwrap().is_some(),
+        "R4 never ran"
+    );
 }
