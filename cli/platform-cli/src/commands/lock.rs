@@ -85,6 +85,8 @@ const ADD_ANYWAY: &str = "Add it anyway? [y/N] ";
 /// B2: a short account password declined, after the check and before any recovery key.
 const NOT_ADDED: &str = "Nothing was written. `apprafter lock on --lock-password` protects the \
                          store with a separate lock password instead.\n";
+/// D.4b B80: before a new recovery key is shown, when it starts to open the store.
+const KEY_VALID_WHEN: &str = "This recovery key opens the store only when AppRafter says Locked.\n";
 /// C14 for a lock password: where the recovery key opens the store.
 const OPENS_WITHOUT_LOCK_PASSWORD: &str = "It opens this store if the lock password is lost. \
                                            AppRafter cannot open a locked store without its \
@@ -226,12 +228,16 @@ fn on(asker: &dyn Asker, timeout: Option<u32>, lock_password: bool) -> miette::R
     };
     // After the first slot's step: an empty entry may have moved a new run to a lock password.
     let everyday = everyday_of(&plan);
+    let shown_slot = recovery_slot(&plan);
     eprintln!("Locking...");
     let done = completed(
         lock::execute_on(&ctx, plan, input, &Progress, &CancellationToken::new())
             .map_err(report)?,
     )?;
-    print!("{}", on_result(&done, &shown, everyday));
+    print!(
+        "{}",
+        on_result(&done, &shown, everyday, shown_slot.as_deref())
+    );
     Ok(())
 }
 
@@ -356,15 +362,20 @@ fn new_password(asker: &dyn Asker, shown: &str) -> Result<SecretString, PromptEr
     }
 }
 
-/// C14 with O8's sentences: the key, shown once, and what it opens — where the everyday slot
-/// does not (D.4b B70).
+/// C14 with O8's sentences: the key, shown once with its slot's id after B80's words, and
+/// what it opens — where the everyday slot does not (D.4b B70, B80).
 fn recovery_text(
     shown: &str,
     vault_shown: &str,
     key: &SecretString,
     everyday: LockSlotKind,
+    slot: &str,
 ) -> Zeroizing<String> {
-    let mut text = Zeroizing::new(format!("Recovery key for {shown} — shown only now:\n\n"));
+    let mut text = Zeroizing::new(String::from(KEY_VALID_WHEN));
+    text.push_str(&format!(
+        "Recovery key for {shown} · slot {slot} — shown only now; write the id on the paper \
+         too:\n\n"
+    ));
     for line in key.expose().lines() {
         text.push_str("    ");
         text.push_str(line);
@@ -391,8 +402,9 @@ fn show_and_confirm(
     shown: &str,
     vault_shown: &str,
     everyday: LockSlotKind,
+    slot: &str,
 ) -> Result<ConfirmedRecoveryKey, PromptError> {
-    let text = recovery_text(shown, vault_shown, &key.to_display(), everyday);
+    let text = recovery_text(shown, vault_shown, &key.to_display(), everyday, slot);
     asker.tell(&text)?;
     let mut key = key;
     loop {
@@ -474,7 +486,12 @@ fn new_input(
         }
     }
     let everyday = everyday_of(plan);
-    let recovery = show_and_confirm(asker, key, shown, vault_shown, everyday).map_err(&refused)?;
+    // D.4b B80: the key is shown with its slot's id, minted when the run was planned.
+    let slot = recovery_slot(plan).ok_or_else(|| {
+        CliError::Other("a new `lock on` run's plan holds no recovery slot id".to_string())
+    })?;
+    let recovery =
+        show_and_confirm(asker, key, shown, vault_shown, everyday, &slot).map_err(&refused)?;
     Ok(LockOnInput::New { first, recovery })
 }
 
@@ -662,6 +679,13 @@ fn everyday_of(plan: &Plan<LockOnPayload>) -> LockSlotKind {
     }
 }
 
+/// The recovery key's slot id as surfaces show it — its first 8 hex characters (D.4b B80) —
+/// minted when a new run was planned; `None` for a resume or a store locked already.
+fn recovery_slot(plan: &Plan<LockOnPayload>) -> Option<String> {
+    let id = plan.payload.recovery_slot_id()?;
+    Some(text::short_id(&id.to_string()).to_owned())
+}
+
 /// What a command of a locked store asks for, by its everyday slot (C7, C16; D.4b B55).
 fn secret_words(everyday: LockSlotKind) -> &'static str {
     match everyday {
@@ -826,7 +850,12 @@ fn noun(secret: &str) -> &str {
 }
 
 /// C16, C17 (no window yet), G2's and G13's lines, naming the everyday slot (D.4b B55).
-fn on_result(done: &LockedOn, shown: &str, everyday: LockSlotKind) -> String {
+fn on_result(
+    done: &LockedOn,
+    shown: &str,
+    everyday: LockSlotKind,
+    recovery_slot: Option<&str>,
+) -> String {
     if done.already_locked {
         return format!(
             "The target store at {shown} was locked by another `apprafter lock on` meanwhile; \
@@ -842,6 +871,12 @@ fn on_result(done: &LockedOn, shown: &str, everyday: LockSlotKind) -> String {
         done.tokens_moved.len(),
         done.caches_resealed
     );
+    // D.4b B80: the key shown at the start opens the store from now on.
+    if let Some(slot) = recovery_slot {
+        out.push_str(&format!(
+            "  ✓ the recovery key of slot {slot} opens it from now on\n"
+        ));
+    }
     for d in &done.caches_dropped {
         out.push_str(&format!(
             "  dropped the cached {} of `{}`: {}\n",
@@ -1455,8 +1490,15 @@ mod tests {
             .expose()
             .replace('\n', " ");
         let s = Script::new(vec![Ok(other.as_str()), Ok(typed.as_str())]);
-        let confirmed =
-            show_and_confirm(&s, key, "~/store", "~/store/vault", LockSlotKind::Password).unwrap();
+        let confirmed = show_and_confirm(
+            &s,
+            key,
+            "~/store",
+            "~/store/vault",
+            LockSlotKind::Password,
+            "3a4b5c6d",
+        )
+        .unwrap();
         assert_eq!(confirmed.to_display().expose(), shown);
         let told = s.told();
         let groups = shown.lines().nth(1).unwrap();
@@ -1521,7 +1563,7 @@ mod tests {
             caches_left: Vec::new(),
             unlock_timeout_min: 5,
         };
-        let out = on_result(&done, "/s", LockSlotKind::Password);
+        let out = on_result(&done, "/s", LockSlotKind::Password, None);
         assert!(
             out.contains(
                 "`apprafter target add prod --renew` stores a token in the vault (at a terminal \
@@ -1996,12 +2038,14 @@ mod tests {
             caches_left: Vec::new(),
             unlock_timeout_min: 5,
         };
-        assert!(on_result(&done, "/s", LockSlotKind::Password).starts_with(
-            "Locked: the secrets of /s are in its vault (opened by the lock password or the \
+        assert!(
+            on_result(&done, "/s", LockSlotKind::Password, None).starts_with(
+                "Locked: the secrets of /s are in its vault (opened by the lock password or the \
              recovery key).\nA command that needs them asks for the lock password or the \
              recovery key in its terminal;"
-        ));
-        let account = on_result(&done, "/s", LockSlotKind::OsPassword);
+            )
+        );
+        let account = on_result(&done, "/s", LockSlotKind::OsPassword, None);
         assert!(
             account
                 .contains("(opened by your account password on this computer or the recovery key)")
@@ -2009,14 +2053,22 @@ mod tests {
             "{account}"
         );
         let key = RecoveryKey::generate(&mut OsRandom).unwrap().to_display();
-        assert!(
-            recovery_text("~/store", "~/store/vault", &key, LockSlotKind::OsPassword)
-                .contains("It opens this store where your account password does not")
-        );
-        assert!(
-            recovery_text("~/store", "~/store/vault", &key, LockSlotKind::Password)
-                .contains("It opens this store if the lock password is lost.")
-        );
+        assert!(recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::OsPassword,
+            "3a4b5c6d"
+        )
+        .contains("It opens this store where your account password does not"));
+        assert!(recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::Password,
+            "3a4b5c6d"
+        )
+        .contains("It opens this store if the lock password is lost."));
     }
 
     /// B56: a resume of an account-password run without one of its secrets names its own way
@@ -2048,6 +2100,48 @@ mod tests {
         );
         assert!(way_out(LockSlotKind::Password)
             .contains("finishes only with both the lock password and the recovery key"));
+    }
+
+    /// D.4b B80: a new recovery key is shown after the words that it opens the store only once
+    /// AppRafter says Locked, with its slot's id; the result names the id it now opens with.
+    #[test]
+    fn the_recovery_key_is_shown_with_its_slot_id() {
+        let key = RecoveryKey::generate(&mut OsRandom).unwrap().to_display();
+        let said = recovery_text(
+            "~/store",
+            "~/store/vault",
+            &key,
+            LockSlotKind::Password,
+            "3a4b5c6d",
+        );
+        assert!(
+            said.starts_with(
+                "This recovery key opens the store only when AppRafter says Locked.\nRecovery \
+                 key for ~/store · slot 3a4b5c6d — shown only now; write the id on the paper \
+                 too:\n\n"
+            ),
+            "{}",
+            said.as_str()
+        );
+        let done = LockedOn {
+            store: "/s".into(),
+            store_id: Some("0123456789abcdef".into()),
+            already_locked: false,
+            restarted: false,
+            tokens_moved: Vec::new(),
+            tokens_left: Vec::new(),
+            caches_resealed: 0,
+            caches_dropped: Vec::new(),
+            caches_left: Vec::new(),
+            unlock_timeout_min: 5,
+        };
+        assert!(
+            on_result(&done, "/s", LockSlotKind::Password, Some("3a4b5c6d"))
+                .contains("  ✓ the recovery key of slot 3a4b5c6d opens it from now on\n")
+        );
+        assert!(
+            !on_result(&done, "/s", LockSlotKind::Password, None).contains("opens it from now on")
+        );
     }
 }
 

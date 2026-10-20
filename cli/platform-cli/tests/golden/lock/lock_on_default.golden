@@ -14,7 +14,8 @@ Unlock window: 5 min (`--timeout` changes it). Once locked, a command that needs
 This stops an AI agent that runs AppRafter as you from reading these secrets or using them without you. It does not stop a program that sets out to capture what you type: for that, run agents under a separate OS account or in a sandbox (guide: Protecting secrets from agents).
 Your account password is checked with the system once, now. Type it at the prompt — a fingerprint reader does not count — and know that a wrong one may count as a failed login on systems that lock an account after failed logins.
 Account password of walker: 
-Recovery key for <SANDBOX>/apprafter-config — shown only now:
+This recovery key opens the store only when AppRafter says Locked.
+Recovery key for <SANDBOX>/apprafter-config · slot <SLOT> — shown only now; write the id on the paper too:
 
     APPRAFTER-RECOVERY-KEY-1
     <RECOVERY-KEY>
@@ -31,3 +32,4 @@ Locked: the secrets of <SANDBOX>/apprafter-config are in its vault (opened by yo
 A command that needs them asks for your account password or the recovery key in its terminal; a command with no terminal is refused.
   ✓ 1 token(s) moved into the vault
   ✓ 0 cached secret(s) re-encrypted
+  ✓ the recovery key of slot <SLOT> opens it from now on

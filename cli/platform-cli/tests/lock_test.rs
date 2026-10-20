@@ -222,7 +222,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
 mod at_a_terminal {
     use super::*;
     use common::terminal::{converse, line, shown_recovery_key, Ended, Step};
-    use common::transcript::{check_transcript, normalize, transcript};
+    use common::transcript::{check_transcript, normalize, shown_slot_id, transcript};
 
     const NEW: &str = "New lock password for ";
     const REPEAT: &str = "Repeat the lock password: ";
@@ -605,6 +605,71 @@ mod at_a_terminal {
         assert!(!dest.exists() && !default.exists());
     }
 
+    /// D.4b B80 (d4b-e1a): the recovery key is shown with the id of the slot that holds it —
+    /// the vault's recovery-key slot once `lock on` says Locked — and the result says so.
+    #[test]
+    fn the_key_is_shown_with_the_id_of_the_slot_that_holds_it() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let end = lock_at_terminal(&sp);
+        assert!(end.status.success(), "{}", end.terminal);
+        assert!(
+            end.terminal
+                .contains("This recovery key opens the store only when AppRafter says Locked."),
+            "{}",
+            end.terminal
+        );
+        let id = shown_slot_id(&end.terminal);
+        let bytes = std::fs::read(sp.store().join("vault")).unwrap();
+        let vault = apprafter_core::vault::VaultFile::parse(&bytes).unwrap();
+        let recovery = vault
+            .header()
+            .slots
+            .iter()
+            .find(|slot| slot.kind == apprafter_core::vault::SlotKind::RecoveryKey)
+            .unwrap();
+        assert!(
+            recovery.id.to_string().starts_with(&id),
+            "{id} is not {}",
+            recovery.id
+        );
+        assert!(
+            end.stdout.contains(&format!(
+                "the recovery key of slot {id} opens it from now on"
+            )),
+            "{}",
+            end.stdout
+        );
+    }
+
+    /// B80: a key shown before a cancel names a slot no vault holds — none was written — and
+    /// the next run shows a key of another id.
+    #[test]
+    fn a_key_shown_before_a_cancel_names_a_slot_no_vault_holds() {
+        let _one = one_at_a_time();
+        let sp = Spawn::new();
+        seeded(&sp);
+        let cancelled = converse(
+            &sp,
+            &["lock", "on", "--lock-password"],
+            &[
+                Step::Expect(NEW),
+                line(PASSWORD),
+                Step::Expect(REPEAT),
+                line(PASSWORD),
+                Step::Expect(CONFIRM),
+                Step::Type(vec![0x03]),
+            ],
+        );
+        assert_eq!(cancelled.status.code(), Some(1), "{}", cancelled.terminal);
+        let first = shown_slot_id(&cancelled.terminal);
+        assert!(!sp.store().join("vault").exists());
+        let end = lock_at_terminal(&sp);
+        assert!(end.status.success(), "{}", end.terminal);
+        assert_ne!(shown_slot_id(&end.terminal), first);
+    }
+
     /// D.4b B55, B82, B88 (1) (d4b-e1a): a plain `lock on` where APPRAFTER_SANDBOX fences this
     /// account — every spawned test's — asks this computer nothing, says so first and takes a
     /// lock password: the fence's two lines, then D.4a's dialogue byte for byte
@@ -645,5 +710,14 @@ mod at_a_terminal {
              <RECOVERY-KEY>\n\nIt opens this store.\n"
         );
         assert_eq!(normalize(&sp, "Lock the secrets\n"), "Lock the secrets\n");
+        assert_eq!(
+            normalize(
+                &sp,
+                "for ~/s · slot 3a4b5c6d — shown\n✓ the recovery key of slot 0123abcd opens\n\
+                 slot 0123456789abcdef0 stays\nslot 3A4B5C6D stays\n"
+            ),
+            "for ~/s · slot <SLOT> — shown\n✓ the recovery key of slot <SLOT> opens\n\
+             slot 0123456789abcdef0 stays\nslot 3A4B5C6D stays\n"
+        );
     }
 }
