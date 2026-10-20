@@ -622,7 +622,7 @@ fn survey(
             // d4a-h F13's residue: a cache that records the vault it was sealed to — on a store
             // in files, a vault that is gone — names it: no age key ever opened it.
             let why = match h.sealed_to(secret) {
-                Some(SealedTo::StoreVault { store_id }) => format!(
+                Some(SealedTo::StoreVault { store_id, .. }) => format!(
                     "it was encrypted to the key of a target store vault that is no longer here \
                      (store id {store_id}), which no age key opens; if you still have that vault \
                      and its `store.yaml`, put them back and unlock instead of going on"
@@ -1154,6 +1154,7 @@ fn reseal(
         };
         let vault = || SealedTo::StoreVault {
             store_id: id.as_str().to_string(),
+            vault_id: None,
         };
         let shadowed = h.kubeconfig_age.is_some();
         let mut changed = false;

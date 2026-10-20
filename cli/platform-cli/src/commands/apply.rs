@@ -880,6 +880,7 @@ mod tests {
     fn the_state_refresh_keeps_the_caches_and_what_sealed_them() {
         let vault = || cli_state::SealedTo::StoreVault {
             store_id: "3f9c0a1b7d2e4c56".into(),
+            vault_id: None,
         };
         let before = HetznerCloudState {
             server_type: Some("cx22".into()),

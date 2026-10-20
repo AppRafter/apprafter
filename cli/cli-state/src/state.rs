@@ -432,14 +432,23 @@ pub struct HetznerCloudState {
     pub argocd_admin_password_sealed_to: Option<SealedTo>,
 }
 
-/// The key a cached secret was sealed to, when it was not the shared age key (F13). A store id
-/// only, never a key.
+/// The key a cached secret was sealed to, when it was not the shared age key (F13): a store
+/// id and, since D.4b, the vault's id (B86) — never a key. A vault id names exactly one store
+/// key: both change together, at `lock on` and at every key change. So a cache whose record
+/// names this store's vault under another id than the vault on disk was sealed to a store
+/// key a key change retired. AppRafter 0.2.80 wrote no vault id: its record reads with
+/// `vault_id: None`; it ignores the field and drops it when it rewrites the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SealedTo {
-    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it, or
-    /// it was cached while that store was locked.
-    StoreVault { store_id: String },
+    /// The key of the target store vault with this id: `lock on` re-sealed the cache to it,
+    /// it was cached while that store was locked, or a key change re-sealed it. `vault_id`
+    /// is that vault's id, 32 lower-case hex characters.
+    StoreVault {
+        store_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault_id: Option<String>,
+    },
 }
 
 impl HetznerCloudState {
@@ -882,6 +891,7 @@ mod tests {
             argocd_admin_password_age: None,
             kubeconfig_sealed_to: Some(SealedTo::StoreVault {
                 store_id: "3f9c0a1b7d2e4c56".into(),
+                vault_id: None,
             }),
             argocd_admin_password_sealed_to: None,
         }

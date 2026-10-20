@@ -888,6 +888,7 @@ impl SecretStore {
             let sealed_to = match &new.settled {
                 Settled::Locked(id) => Some(SealedTo::StoreVault {
                     store_id: id.as_str().to_string(),
+                    vault_id: None,
                 }),
                 Settled::Files => None,
             };

@@ -360,6 +360,7 @@ fn what_sealed_a_cache_round_trips_and_is_absent_when_unset() {
     let paths = StatePaths::for_root(dir.path());
     let vault = SealedTo::StoreVault {
         store_id: "3f9c0a1b7d2e4c56".into(),
+        vault_id: None,
     };
     let mut h: HetznerCloudState =
         serde_json::from_str(r#"{"server_id": 1, "server_name": "n"}"#).unwrap();
@@ -387,6 +388,57 @@ fn what_sealed_a_cache_round_trips_and_is_absent_when_unset() {
     let h = back.hetzner_cloud.unwrap();
     assert_eq!(h.sealed_to(CachedSecret::Kubeconfig), Some(&vault));
     assert_eq!(h.sealed_to(CachedSecret::ArgocdPassword), None);
+}
+
+/// D.4b B86: a record may name the vault whose store key sealed the cache — written as
+/// `vault_id` and read back — and AppRafter 0.2.80's record, which names none, still reads.
+#[test]
+fn a_records_vault_id_round_trips_and_an_older_record_reads_without_one() {
+    use cli_core::secrets::CachedSecret;
+    use cli_state::SealedTo;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StatePaths::for_root(dir.path());
+    let vault = SealedTo::StoreVault {
+        store_id: "3f9c0a1b7d2e4c56".into(),
+        vault_id: Some("00112233445566778899aabbccddeeff".into()),
+    };
+    let mut h: HetznerCloudState =
+        serde_json::from_str(r#"{"server_id": 1, "server_name": "n"}"#).unwrap();
+    *h.cache_mut(CachedSecret::Kubeconfig).0 = Some("K".into());
+    *h.cache_mut(CachedSecret::Kubeconfig).1 = Some(vault.clone());
+    State {
+        hetzner_cloud: Some(h),
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.state_file()).unwrap()).unwrap();
+    assert_eq!(
+        raw["hetzner_cloud"]["kubeconfig_sealed_to"],
+        serde_json::json!({
+            "kind": "store_vault",
+            "store_id": "3f9c0a1b7d2e4c56",
+            "vault_id": "00112233445566778899aabbccddeeff",
+        })
+    );
+    let back = State::load_or_default(&paths)
+        .unwrap()
+        .hetzner_cloud
+        .unwrap();
+    assert_eq!(back.sealed_to(CachedSecret::Kubeconfig), Some(&vault));
+    let older: HetznerCloudState = serde_json::from_str(
+        r#"{"server_id": 1, "server_name": "n", "kubeconfig_age": "K",
+            "kubeconfig_sealed_to": {"kind": "store_vault", "store_id": "3f9c0a1b7d2e4c56"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        older.sealed_to(CachedSecret::Kubeconfig),
+        Some(&SealedTo::StoreVault {
+            store_id: "3f9c0a1b7d2e4c56".into(),
+            vault_id: None,
+        })
+    );
 }
 
 /// F13: a state.json written before the record (or by an older AppRafter) still parses, with

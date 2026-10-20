@@ -539,6 +539,7 @@ mod tests {
         let vault = || {
             Some(SealedTo::StoreVault {
                 store_id: "3f9c0a1b7d2e4c56".into(),
+                vault_id: None,
             })
         };
         let lost = LostKey {

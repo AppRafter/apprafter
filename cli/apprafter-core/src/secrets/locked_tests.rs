@@ -56,10 +56,12 @@ fn lock_state(ctx: &Context, secrets: SecretsMode, with_id: Option<&str>) {
     .unwrap();
 }
 
-/// F13: the record of a cache sealed to the vault of the store with `id`.
+/// F13: the record of a cache sealed to the vault of the store with `id`, as AppRafter
+/// 0.2.80 wrote it: no vault id (B86).
 fn vault_record(id: &str) -> cli_state::SealedTo {
     cli_state::SealedTo::StoreVault {
         store_id: id.to_string(),
+        vault_id: None,
     }
 }
 

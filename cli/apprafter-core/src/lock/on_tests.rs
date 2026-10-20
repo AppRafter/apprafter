@@ -243,6 +243,7 @@ pub(super) fn assert_locked_whole(ctx: &Context, secret: &str) {
     // F13: each cache sealed to the store's key says so; the dropped one has no record.
     let vault = Some(cli_state::SealedTo::StoreVault {
         store_id: file.id.as_ref().unwrap().as_str().to_string(),
+        vault_id: None,
     });
     assert_eq!(
         (
