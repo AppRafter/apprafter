@@ -825,4 +825,8 @@ fn lock_on_names_its_lock_password_flag() {
     let help = short_help_for(&["lock", "on"]);
     let flag = |l: &str| l.trim_start().starts_with("--lock-password");
     assert!(help.lines().any(flag), "{help}");
+    // d4b-e1a Task 4: the long help says what `lock on` does without the flag.
+    let long = help_for(&["lock", "on"]);
+    let flat = long.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("opens with your account password"), "{long}");
 }

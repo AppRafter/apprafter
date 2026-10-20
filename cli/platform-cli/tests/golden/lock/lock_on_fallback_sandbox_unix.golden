@@ -1,0 +1,31 @@
+[exit 0]
+[terminal]
+AppRafter does not check your account password while APPRAFTER_SANDBOX is set: the variable fences tests and agents away from it.
+The store gets a separate lock password instead.
+Lock the secrets of the target store at <SANDBOX>/apprafter-config (targets: prod):
+  move    Hetzner token of `prod`            credentials.yaml → vault
+  create  age key of this store              its own, in the vault
+  create  <SANDBOX>/apprafter-config/vault opened by a lock password or a recovery key
+  note    the SSH key <SANDBOX>/home/.ssh/id_ed25519 that fetches kubeconfigs stays outside the vault: a program running as you can use it to reach the nodes
+  note    while a command or the app uses a secret, it is in that process's memory and, for a kubeconfig, in a file programs running as you can read
+Unlock window: 5 min (`--timeout` changes it). Once locked, a command that needs these secrets asks for the lock password or the recovery key in its terminal, and a command with no terminal is refused. HCLOUD_TOKEN and APPRAFTER_AGE_KEY no longer stand in for the store's secrets.
+This stops an AI agent that runs AppRafter as you from reading these secrets or using them without you. It does not stop a program that sets out to capture what you type: for that, run agents under a separate OS account or in a sandbox (guide: Protecting secrets from agents).
+New lock password for <SANDBOX>/apprafter-config: 
+Repeat the lock password: 
+Recovery key for <SANDBOX>/apprafter-config — shown only now:
+
+    APPRAFTER-RECOVERY-KEY-1
+    <RECOVERY-KEY>
+
+It opens this store if the lock password is lost. AppRafter cannot open a locked store without its lock password or its recovery key. Keep the recovery key somewhere other than this computer. The recovery key opens nothing without the vault file: include <SANDBOX>/apprafter-config/vault in your backups; it is encrypted. Clear this screen once it is saved.
+Type the recovery key to confirm you saved it (the `APPRAFTER-RECOVERY-KEY-1` prefix is optional): 
+Locking...
+  Writing the vault
+  Checking the vault
+  Re-encrypting cached secrets
+  Removing the secrets from files
+[stdout]
+Locked: the secrets of <SANDBOX>/apprafter-config are in its vault (opened by the lock password or the recovery key).
+A command that needs them asks for the lock password or the recovery key in its terminal; a command with no terminal is refused.
+  ✓ 1 token(s) moved into the vault
+  ✓ 0 cached secret(s) re-encrypted

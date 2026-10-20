@@ -67,6 +67,14 @@ fn store_yaml(sp: &Spawn) -> Option<String> {
     std::fs::read_to_string(sp.store().join("store.yaml")).ok()
 }
 
+/// D.4b B55, B88 (1): what a plain `lock on` says first where APPRAFTER_SANDBOX fences this
+/// account on Linux and macOS — every spawned test's (`src/commands/lock.rs`'s
+/// `fallback_head`).
+const SANDBOX_HEAD_UNIX: &str = "AppRafter does not check your account password while \
+                                 APPRAFTER_SANDBOX is set: the variable fences tests and \
+                                 agents away from it.\nThe store gets a separate lock \
+                                 password instead.\n";
+
 /// Every file under `dir` holding `needle`.
 #[cfg(unix)]
 fn holding(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
@@ -92,6 +100,35 @@ fn lock_on_without_a_terminal_is_refused() {
     assert!(stderr.contains("apprafter::cli::usage_refused"), "{stderr}");
     assert!(
         stderr.contains("asks for a new lock password and shows a recovery key"),
+        "{stderr}"
+    );
+    assert_eq!(store_yaml(&sp), None);
+}
+
+/// D.4b B55, F4 (d4b-e1a): a plain `lock on` with no terminal, where APPRAFTER_SANDBOX fences
+/// this account, says why it would take a lock password — the fence's two lines, naming
+/// Windows Hello on Windows (`lock_on_fallback_sandbox_windows`) — then refuses as D.4a did;
+/// nothing is written.
+#[test]
+fn a_plain_lock_on_without_a_terminal_says_why_it_takes_a_lock_password() {
+    let sp = Spawn::new();
+    seeded(&sp);
+    let (code, _, stderr) = run(&sp, &["lock", "on"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let head = if cfg!(windows) {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/lock/lock_on_fallback_sandbox_windows.golden"),
+        )
+        .unwrap()
+    } else {
+        SANDBOX_HEAD_UNIX.to_string()
+    };
+    let stderr = stderr.replace("\r\n", "\n");
+    assert!(stderr.contains(&head), "{stderr}");
+    assert!(
+        stderr.contains("apprafter::cli::usage_refused")
+            && stderr.contains("asks for a new lock password"),
         "{stderr}"
     );
     assert_eq!(store_yaml(&sp), None);
@@ -185,7 +222,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
 mod at_a_terminal {
     use super::*;
     use common::terminal::{converse, line, shown_recovery_key, Ended, Step};
-    use common::transcript::{check_transcript, normalize};
+    use common::transcript::{check_transcript, normalize, transcript};
 
     const NEW: &str = "New lock password for ";
     const REPEAT: &str = "Repeat the lock password: ";
@@ -568,16 +605,27 @@ mod at_a_terminal {
         assert!(!dest.exists() && !default.exists());
     }
 
-    /// G-LOCKON-D4A (D.4b B58 (1), B93): until `lock on` gets its default (d4b-e1a Task 4), a
-    /// plain `lock on` is `--lock-password`'s dialogue byte for byte.
+    /// D.4b B55, B82, B88 (1) (d4b-e1a): a plain `lock on` where APPRAFTER_SANDBOX fences this
+    /// account — every spawned test's — asks this computer nothing, says so first and takes a
+    /// lock password: the fence's two lines, then D.4a's dialogue byte for byte
+    /// (`lock_on_lock_password`, G-LOCKON-D4A).
     #[test]
-    fn a_plain_lock_on_is_the_lock_password_dialogue() {
+    fn a_plain_lock_on_under_the_fence_takes_a_lock_password_and_says_why() {
         let _one = one_at_a_time();
         let sp = Spawn::new();
         seeded(&sp);
         let end = converse(&sp, &["lock", "on"], &lock_steps());
         assert!(end.status.success(), "{}", end.terminal);
-        check_transcript("lock/lock_on_lock_password", &sp, &end);
+        check_transcript("lock/lock_on_fallback_sandbox_unix", &sp, &end);
+        let d4a = std::fs::read_to_string(
+            common::golden::golden_root().join("lock/lock_on_lock_password.golden"),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript(&sp, &end).replacen(SANDBOX_HEAD_UNIX, "", 1),
+            d4a,
+            "the fence's two lines, then D.4a's dialogue"
+        );
     }
 
     /// D.4b-e1a: the transcript harness masks what varies per run — the root, the recovery

@@ -294,6 +294,10 @@ const ENDPOINT_LITERALS: &[&str] = &[
     "pipe_name",
     // The Windows OpenSSH agent's pipe (D.4a T72, O1): `platform-cli/src/limits_client.rs`.
     "ssh_agent_path",
+    // `lock on`'s fallback words for a person (D.4b B88 (6), d4b-e1a): they name the back-off
+    // record's folder (`/run/user/<uid>`) and derive no endpoint:
+    // `platform-cli/src/commands/lock.rs`.
+    "fallback_reason",
 ];
 
 /// A string literal G2 keeps in [`ENDPOINT_LITERALS`].

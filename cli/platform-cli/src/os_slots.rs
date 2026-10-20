@@ -115,13 +115,6 @@ impl OsSlots {
     /// The account a check is for, as the account-password prompt names it. Critic round,
     /// finding 3: read outside tests from Task 4 on (`commands::lock::new_input`), which
     /// removes the attribute — left behind, the expectation itself is a warning.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the account-password prompt from d4b-e1a Task 4 on"
-        )
-    )]
     pub(crate) fn account_name(&self) -> Option<String> {
         match &self.backend {
             Backend::Absent => None,

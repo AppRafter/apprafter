@@ -305,8 +305,9 @@ fn harness_refuses_output_that_still_names_the_sandbox_root() {
 
 /// Every recorded file must belong to a case in this file, in
 /// `golden_doctor.rs` or, for `lock on`'s transcripts (D.4b-e1a), in
-/// `lock_test.rs`; otherwise a renamed or deleted case would leave a
-/// golden that nothing checks.
+/// `lock_test.rs` — by its case name, or by its file's path where a test
+/// reads it so (`lock_on_fallback_sandbox_windows`, D.4b-e1a); otherwise a
+/// renamed or deleted case would leave a golden that nothing checks.
 #[test]
 fn every_golden_file_has_a_case() {
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -343,7 +344,10 @@ fn every_golden_file_has_a_case() {
         })
         .filter(|id| {
             let quoted = format!("\"{id}\"");
-            !sources.iter().any(|source| source.contains(&quoted))
+            let path = format!("/{id}.golden\"");
+            !sources
+                .iter()
+                .any(|source| source.contains(&quoted) || source.contains(&path))
         })
         .collect();
     assert!(
