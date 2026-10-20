@@ -11,3 +11,5 @@ pub mod spawn;
 pub mod stand_in;
 #[cfg(unix)]
 pub mod terminal;
+#[cfg(unix)]
+pub mod transcript;

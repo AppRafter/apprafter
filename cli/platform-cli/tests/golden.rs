@@ -303,8 +303,9 @@ fn harness_refuses_output_that_still_names_the_sandbox_root() {
     sb.assert_no_raw_root("harness/split", &format!("× {head}\n  │ {tail}/home\n"));
 }
 
-/// Every recorded file must belong to a case in this file or in
-/// `golden_doctor.rs`; otherwise a renamed or deleted case would leave a
+/// Every recorded file must belong to a case in this file, in
+/// `golden_doctor.rs` or, for `lock on`'s transcripts (D.4b-e1a), in
+/// `lock_test.rs`; otherwise a renamed or deleted case would leave a
 /// golden that nothing checks.
 #[test]
 fn every_golden_file_has_a_case() {
@@ -318,7 +319,11 @@ fn every_golden_file_has_a_case() {
             }
         }
     }
-    let sources = [include_str!("golden.rs"), include_str!("golden_doctor.rs")];
+    let sources = [
+        include_str!("golden.rs"),
+        include_str!("golden_doctor.rs"),
+        include_str!("lock_test.rs"),
+    ];
     let root = golden_root();
     let mut files = Vec::new();
     collect(&root, &mut files);
@@ -343,8 +348,8 @@ fn every_golden_file_has_a_case() {
         .collect();
     assert!(
         orphans.is_empty(),
-        "golden files with no case in golden.rs or golden_doctor.rs (restore the case or \
-         delete the file): {orphans:?}"
+        "golden files with no case in golden.rs, golden_doctor.rs or lock_test.rs (restore the \
+         case or delete the file): {orphans:?}"
     );
 }
 

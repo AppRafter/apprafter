@@ -185,6 +185,7 @@ fn a_test_build_locks_no_store_outside_its_sandbox() {
 mod at_a_terminal {
     use super::*;
     use common::terminal::{converse, line, shown_recovery_key, Ended, Step};
+    use common::transcript::{check_transcript, normalize};
 
     const NEW: &str = "New lock password for ";
     const REPEAT: &str = "Repeat the lock password: ";
@@ -256,6 +257,8 @@ mod at_a_terminal {
             holding(&sp.store(), TOKEN).is_empty(),
             "the token stayed in clear"
         );
+        // G-LOCKON-D4A (D.4b B58, B71, B93): the whole dialogue, byte for byte.
+        check_transcript("lock/lock_on_lock_password", &sp, &end);
     }
 
     /// O2 (overview §5 d): a 14-character password shows C13 and `Use it anyway? [y/N]`;
@@ -493,6 +496,8 @@ mod at_a_terminal {
             holding(&sp.store(), TOKEN).is_empty(),
             "the token stayed in clear"
         );
+        // G-LOCKON-D4A: the resume's dialogue, byte for byte.
+        check_transcript("lock/lock_on_lock_password_resume", &sp, &end);
     }
 
     /// Rule 4 (team decision 2026-10-13): without the recovery key a resume finishes nothing.
@@ -560,5 +565,24 @@ mod at_a_terminal {
         assert!(!end.terminal.contains("shared age key"), "{}", end.terminal);
         assert!(!end.terminal.contains(&shown) && !end.stdout.contains(&shown));
         assert!(!dest.exists() && !default.exists());
+    }
+
+    /// D.4b-e1a: the transcript harness masks what varies per run — the root, the recovery
+    /// key's groups, a carriage return, a test build's line — and nothing else.
+    #[test]
+    fn a_transcript_masks_what_varies_and_nothing_else() {
+        let sp = Spawn::new();
+        let root = sp.root().display().to_string();
+        let raw = format!(
+            "INSECURE-FAST-KDF: this test build derives keys with weak parameters\r\n\
+             Recovery key for {root}/s — shown only now:\r\n\r\n    APPRAFTER-RECOVERY-KEY-1\r\n\
+             \x20   QQQSY-QCYQ5\r\n\r\nIt opens this store.\r\n"
+        );
+        assert_eq!(
+            normalize(&sp, &raw),
+            "Recovery key for <SANDBOX>/s — shown only now:\n\n    APPRAFTER-RECOVERY-KEY-1\n    \
+             <RECOVERY-KEY>\n\nIt opens this store.\n"
+        );
+        assert_eq!(normalize(&sp, "Lock the secrets\n"), "Lock the secrets\n");
     }
 }
