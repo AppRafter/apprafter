@@ -1576,6 +1576,7 @@ pub mod samples {
             unavailable(AccountCheckUnavailable::NoService),
             unavailable(AccountCheckUnavailable::NoCheckRoute),
             unavailable(AccountCheckUnavailable::NoAccount),
+            unavailable(AccountCheckUnavailable::NoNewPrivs),
             unavailable(AccountCheckUnavailable::NoMachineId),
             unavailable(AccountCheckUnavailable::NoBackoffRecord),
             unavailable(AccountCheckUnavailable::SystemError {

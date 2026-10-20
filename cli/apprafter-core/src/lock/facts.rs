@@ -92,8 +92,8 @@ impl SlotFacts for UnknownFacts {}
 
 /// Whether the system can check the account password here (D.4b B10, B88 (3)): libpam and
 /// one of its services on Linux, the one PAM service that checks the typed text on macOS,
-/// and an account for the user running AppRafter. Read without asking the system to check
-/// anything.
+/// and an account for the user running AppRafter — on Linux in a process without no_new_privs
+/// (WI-545). Read without asking the system to check anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckBackend {
     Ready,
@@ -105,6 +105,11 @@ pub enum CheckBackend {
     NoCheckRoute,
     /// The user running AppRafter has no account entry.
     NoAccount,
+    /// Linux: AppRafter runs with no_new_privs (a sandbox such as Flatpak or bubblewrap, a
+    /// service started with `NoNewPrivileges=`): the system's set-uid password helper cannot
+    /// read the password database, so the system would refuse even the right password and may
+    /// count it (WI-545).
+    NoNewPrivs,
 }
 
 /// The back-off across runs as it stands (D.4b B12, B74, B88 (6)), read without changing it.

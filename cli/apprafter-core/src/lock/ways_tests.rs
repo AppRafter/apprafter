@@ -198,6 +198,41 @@ fn each_fallback_reason_is_named_in_b88s_order_and_nothing_after_it_is_asked() {
             3,
         ),
         (
+            "the build, before no_new_privs: Windows is unaffected (WI-545)",
+            Stand {
+                backend: CheckBackend::NoNewPrivs,
+                ..Stand::ready(Windows)
+            },
+            WayFallback::HelloNotBuilt,
+            2,
+        ),
+        (
+            "no_new_privs, before the machine id, the back-off's record and the password \
+             (WI-545)",
+            Stand {
+                backend: CheckBackend::NoNewPrivs,
+                machine: MachineFact::NoId,
+                backoff: BackoffFact::NoRecord,
+                status: PasswordFact::NoPassword,
+                ..Stand::ready(Linux)
+            },
+            WayFallback::NoNewPrivs,
+            3,
+        ),
+        (
+            "no_new_privs, before the back-off's refusal: a run that checks nothing is never \
+             held back (B74; WI-545)",
+            Stand {
+                backend: CheckBackend::NoNewPrivs,
+                backoff: BackoffFact::Wait {
+                    wait_secs: Some(540),
+                },
+                ..Stand::ready(Linux)
+            },
+            WayFallback::NoNewPrivs,
+            3,
+        ),
+        (
             "the machine id, before the back-off's record",
             Stand {
                 machine: MachineFact::NoId,
@@ -253,6 +288,16 @@ fn each_fallback_reason_is_named_in_b88s_order_and_nothing_after_it_is_asked() {
             "{case}"
         );
     }
+}
+
+/// WI-545: the reason's name on the wire, as the desktop reads it (c4's TypeScript, g2b's
+/// Protect): the kernel's own name for the flag.
+#[test]
+fn no_new_privs_has_its_wire_name() {
+    assert_eq!(
+        serde_json::to_value(WayFallback::NoNewPrivs).unwrap(),
+        serde_json::json!("no_new_privs")
+    );
 }
 
 /// B55 with each stand-in (B15; acceptance 1): the account password is this computer's

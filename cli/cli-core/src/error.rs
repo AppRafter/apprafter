@@ -707,6 +707,9 @@ pub enum AccountCheckUnavailable {
     NoService,
     NoCheckRoute,
     NoAccount,
+    /// Linux: AppRafter runs with no_new_privs, under which the system may refuse even the
+    /// right password (WI-545).
+    NoNewPrivs,
     NoMachineId,
     NoBackoffRecord,
     /// The system's check failed with `name` (its PAM constant, `PAM_SYSTEM_ERR`), giving
@@ -726,6 +729,7 @@ impl AccountCheckUnavailable {
             AccountCheckUnavailable::NoService => "no_service",
             AccountCheckUnavailable::NoCheckRoute => "no_check_route",
             AccountCheckUnavailable::NoAccount => "no_account",
+            AccountCheckUnavailable::NoNewPrivs => "no_new_privs",
             AccountCheckUnavailable::NoMachineId => "no_machine_id",
             AccountCheckUnavailable::NoBackoffRecord => "no_backoff_record",
             AccountCheckUnavailable::SystemError { .. } => "system_error",
@@ -1139,6 +1143,11 @@ fn account_password_refused_message(
                 .to_string(),
             AccountCheckUnavailable::NoAccount => "this computer cannot check your account \
                  password: the user running AppRafter has no account entry"
+                .to_string(),
+            AccountCheckUnavailable::NoNewPrivs => "AppRafter cannot check your account \
+                 password safely while it runs with no_new_privs (a sandbox such as Flatpak or \
+                 bubblewrap, or a service started with NoNewPrivileges=): the system may refuse \
+                 even the right password and count it as a failed login"
                 .to_string(),
             AccountCheckUnavailable::NoMachineId => "this computer's machine id cannot be \
                  read, and an account-password slot is bound to it"
@@ -3462,6 +3471,10 @@ mod tests {
              "apprafter::secrets::account_password_refused",
              "this computer cannot check your account password: libpam is not installed",
              "`apprafter lock on --lock-password`"),
+            (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unavailable { what: AccountCheckUnavailable::NoNewPrivs }, messages: Vec::new() },
+             "apprafter::secrets::account_password_refused",
+             "AppRafter cannot check your account password safely while it runs with no_new_privs (a sandbox such as Flatpak or bubblewrap, or a service started with NoNewPrivileges=): the system may refuse even the right password and count it as a failed login",
+             "`apprafter lock on --lock-password`"),
             (CliError::AccountPasswordRefused { reason: AccountPasswordRefusal::Unavailable { what: AccountCheckUnavailable::SystemError { name: "PAM_SYSTEM_ERR".into() } }, messages: Vec::new() },
              "apprafter::secrets::account_password_refused",
              "the system's password check failed (PAM_SYSTEM_ERR) without a verdict",
@@ -3517,6 +3530,32 @@ mod tests {
             let h = help_of(&err);
             assert!(h.contains(help), "{code}: {h}");
             assert!(!h.contains("file an issue"), "{code}: {h}");
+        }
+    }
+
+    /// WI-545: each reason this computer cannot check the account password has its name on the
+    /// wire (`fields.unavailable`), the desktop's to read; `no_new_privs` is the kernel's own.
+    #[test]
+    fn each_unavailable_check_has_its_wire_name() {
+        for (what, name) in [
+            (AccountCheckUnavailable::NoLibpam, "no_libpam"),
+            (AccountCheckUnavailable::NoService, "no_service"),
+            (AccountCheckUnavailable::NoCheckRoute, "no_check_route"),
+            (AccountCheckUnavailable::NoAccount, "no_account"),
+            (AccountCheckUnavailable::NoNewPrivs, "no_new_privs"),
+            (AccountCheckUnavailable::NoMachineId, "no_machine_id"),
+            (
+                AccountCheckUnavailable::NoBackoffRecord,
+                "no_backoff_record",
+            ),
+            (
+                AccountCheckUnavailable::SystemError {
+                    name: "PAM_SYSTEM_ERR".into(),
+                },
+                "system_error",
+            ),
+        ] {
+            assert_eq!(what.as_str(), name, "{what:?}");
         }
     }
 

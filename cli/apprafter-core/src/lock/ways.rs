@@ -55,7 +55,8 @@ pub enum LockOnWay {
 /// Why a plan takes a separate lock password instead of this computer's everyday way: B88's
 /// reasons, declared in the order the plan checks them — (1) the fence, (2) the build, (3)
 /// the system's check, (4) the session, (5) the machine id, (6) the back-off's record, (7)
-/// the password — `no_account` beside the system's check, as d4b-d reads it. Never
+/// the password — `no_account` and `no_new_privs` beside the system's check, as d4b-d and
+/// WI-545 read them. Never
 /// `backoff`: a back-off in force refuses (B74).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +73,10 @@ pub enum WayFallback {
     NoCheckRoute,
     /// (3) The user running AppRafter has no account entry.
     NoAccount,
+    /// (3) Linux: AppRafter runs with no_new_privs, under which the system may refuse even the
+    /// right password and count it (WI-545): read after the account, before libpam is
+    /// loaded and before the back-off's record.
+    NoNewPrivs,
     /// (3) Windows Hello is not supported on this computer (d4b-w2).
     HelloNotSupported,
     /// (3) Windows Hello is not set up for this account (d4b-w2).
@@ -133,6 +138,7 @@ pub(super) fn decide(asked: WayAsked<'_>) -> CoreResult<Way> {
         CheckBackend::NoService => return fall_back(WayFallback::NoService),
         CheckBackend::NoCheckRoute => return fall_back(WayFallback::NoCheckRoute),
         CheckBackend::NoAccount => return fall_back(WayFallback::NoAccount),
+        CheckBackend::NoNewPrivs => return fall_back(WayFallback::NoNewPrivs),
     }
     let MachineFact::Id(machine) = facts.machine_id() else {
         return fall_back(WayFallback::NoMachineId);

@@ -766,6 +766,12 @@ fn fallback_reason(reason: WayFallback, os: HostOs) -> &'static str {
             "This computer cannot check your account password: the user running AppRafter has \
              no account entry."
         }
+        WayFallback::NoNewPrivs => {
+            "AppRafter cannot check your account password safely here: it runs with \
+             no_new_privs (a sandbox such as Flatpak or bubblewrap, or a service started with \
+             NoNewPrivileges=), under which the system may refuse even the right password and \
+             count it as a failed login."
+        }
         WayFallback::HelloNotSupported => "Windows Hello is not available on this computer.",
         WayFallback::HelloNotSetUp => "Windows Hello is not set up for this account.",
         WayFallback::RemoteSession => "Windows Hello cannot be asked in a remote session.",
@@ -1982,6 +1988,7 @@ mod tests {
             F::NoService,
             F::NoCheckRoute,
             F::NoAccount,
+            F::NoNewPrivs,
             F::HelloNotSupported,
             F::HelloNotSetUp,
             F::RemoteSession,
