@@ -107,7 +107,9 @@ pub(super) fn new_input() -> (LockOnInput, String) {
     let (recovery, shown) = confirmed();
     (
         LockOnInput::New {
-            password: SecretString::new(PASSWORD),
+            // D.4b-c3: the first slot `first_slot` makes for a lock-password plan — what
+            // D.4a's suites have always run their plans with (F14).
+            first: super::ways::lock_password_slot(SecretString::new(PASSWORD)).unwrap(),
             recovery,
         },
         shown,

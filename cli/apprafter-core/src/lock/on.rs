@@ -7,7 +7,8 @@
 //! 1. `store.yaml` says `locking`, with a fresh id (after a re-read under the lock: a run that
 //!    won the race finished meanwhile, G13);
 //! 2. the vault is written by no-replace, its directory synced (c1's `write_new`);
-//! 3. it is read back from disk and opened with the password slot AND the recovery slot, and
+//! 3. it is read back from disk and opened with the first slot (the plan's way in, D.4b B56)
+//!    AND the recovery slot, and
 //!    every entry compared;
 //! 4. per target, each cache is re-sealed to the store's key and checked (Cancel is honoured
 //!    until here: before it, what this run wrote is undone);
@@ -41,7 +42,8 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use super::faults::{self, FaultPoint};
-use super::open::{check_password, SlotOpened};
+use super::open::SlotOpened;
+use super::ways::FirstSlot;
 use super::ways::{self, LockOnWay, Way, WayAsked, WayFallback};
 use super::SlotNote;
 use crate::context::{Context, SecretString};
@@ -197,10 +199,11 @@ impl LockOnPayload {
 
 /// The secrets a run is given.
 pub enum LockOnInput {
-    /// A new vault: the lock password (`check_password`'s), and the recovery key the person typed
-    /// back in full (T25, O12).
+    /// A new vault: its first slot, made by `lock::first_slot` for the plan's way once its
+    /// secret was checked (D.4b B56), and the recovery key that step drew, typed back in
+    /// full (T25, O12).
     New {
-        password: SecretString,
+        first: FirstSlot,
         recovery: ConfirmedRecoveryKey,
     },
     /// Finishing an interrupted run: its vault, opened once by the lock password's slot and
@@ -617,6 +620,16 @@ pub(super) fn vault_opened_by(way: LockOnWay) -> &'static str {
     }
 }
 
+/// The slot a new vault's read-back opens first, as `not_kept` names it (D.4a T36; D.4b
+/// B56).
+fn first_noun(way: LockOnWay) -> &'static str {
+    match way {
+        LockOnWay::AccountPassword => "a slot the account password opens",
+        LockOnWay::WindowsHello => "a slot Windows Hello opens",
+        LockOnWay::LockPassword => "a slot the lock password opens",
+    }
+}
+
 /// Carries out `plan` with `input` (module docs). `Completed { already_locked }` when another
 /// run locked the store first; `Cancelled` before step 4, with what this run wrote undone.
 pub fn execute_on(
@@ -634,8 +647,8 @@ pub fn execute_on(
                 ..LockedOn::empty(ctx, payload.timeout_min)
             },
         }),
-        (LockOnStart::New { restart }, LockOnInput::New { password, recovery }) => {
-            on_new(ctx, &payload, restart, password, recovery, reporter, cancel)
+        (LockOnStart::New { restart }, LockOnInput::New { first, recovery }) => {
+            on_new(ctx, &payload, restart, first, recovery, reporter, cancel)
         }
         (LockOnStart::Resume { id }, LockOnInput::Resume { password, recovery }) => {
             on_resume(ctx, &payload, &id, password, recovery, reporter, cancel)
@@ -660,7 +673,7 @@ fn on_new(
     ctx: &Context,
     payload: &LockOnPayload,
     restart: bool,
-    password: SecretString,
+    first: FirstSlot,
     recovery: ConfirmedRecoveryKey,
     reporter: &dyn Reporter,
     cancel: &CancellationToken,
@@ -671,15 +684,25 @@ fn on_new(
             left: Vec::new(),
         });
     }
-    // D.4b B56: a plan for another way in writes no vault a lock password opens.
-    if payload.way() != Some(LockOnWay::LockPassword) {
+    // D.4b B56: the first slot is its plan's way's — `first_slot` made it once its secret
+    // was checked — never a slot of another way; and (B80) never one another plan's step
+    // made, so the recovery key's slot id the client showed is the new vault's.
+    let way = first.way();
+    if Some(way) != payload.way() {
         return Err(CoreError::Cli(CliError::Other(
-            "a `lock on` plan for another way in was given a lock password; nothing was \
-             written"
+            "a `lock on` plan was given a first slot of another way in; nothing was written"
                 .to_string(),
         )));
     }
-    check_password(&password)?;
+    if first
+        .plan_vault()
+        .is_some_and(|made| Some(made) != payload.vault_id())
+    {
+        return Err(CoreError::Cli(CliError::Other(
+            "a `lock on` plan was given the first slot of another plan; nothing was written"
+                .to_string(),
+        )));
+    }
     super::permit(ctx)?;
     // D.4b B57, B80: the ids the plan minted, the recovery key's shown with it — read
     // before anything is written.
@@ -721,10 +744,7 @@ fn on_new(
         secrets: SecretsMode::Locking,
         id: Some(id.clone()),
         slots: vec![
-            SlotInfo {
-                kind: LockSlotKind::Password,
-                label: PASSWORD_LABEL.to_string(),
-            },
+            first.info(),
             SlotInfo {
                 kind: LockSlotKind::RecoveryKey,
                 label: RECOVERY_LABEL.to_string(),
@@ -763,6 +783,7 @@ fn on_new(
     let shown = recovery.to_display();
     let again = RecoveryKey::parse(shown.expose())
         .map_err(|e| CoreError::RecoveryKeyInvalid { reason: e.into() })?;
+    let (slot, secret) = first.into_parts();
     let writer = ctx.vault_access().writer();
     let (bytes, made) = vault::create_with(
         ids,
@@ -770,10 +791,7 @@ fn on_new(
         &writer,
         contents,
         vec![
-            NewSlot::Password {
-                secret: password.clone(),
-                label: PASSWORD_LABEL.to_string(),
-            },
+            slot,
             NewSlot::RecoveryKey {
                 key: recovery.into_key(),
                 label: RECOVERY_LABEL.to_string(),
@@ -803,13 +821,13 @@ fn on_new(
     {
         return Err(CoreError::Cli(not_kept(&store, "the vault this run wrote")));
     }
-    let by_password = parsed
-        .open(&SlotSecret::Password(password), policy)
-        .map_err(|_| CoreError::Cli(not_kept(&store, "a slot the lock password opens")))?;
+    let by_first = parsed
+        .open(&secret, policy)
+        .map_err(|_| CoreError::Cli(not_kept(&store, first_noun(way))))?;
     let by_recovery = parsed
         .open(&SlotSecret::RecoveryKey(again), policy)
         .map_err(|_| CoreError::Cli(not_kept(&store, "a slot the recovery key opens")))?;
-    for opened in [&by_password, &by_recovery] {
+    for opened in [&by_first, &by_recovery] {
         check_entries(&store, opened, &placed, &identity, payload.timeout_min)?;
     }
     faults::hit(ctx, FaultPoint::AfterVaultVerified)?;
@@ -818,8 +836,8 @@ fn on_new(
     }
     // Steps 4–6.
     let session = KeySession::new(
-        by_password.data_key().clone(),
-        by_password.header().vault_id,
+        by_first.data_key().clone(),
+        by_first.header().vault_id,
         root.to_path_buf(),
     );
     let key = transfer::store_key(root, session, disk);
@@ -829,14 +847,7 @@ fn on_new(
         ..LockedOn::empty(ctx, payload.timeout_min)
     };
     finish(
-        &run,
-        file,
-        &key,
-        &by_password,
-        payload,
-        false,
-        reporter,
-        &mut done,
+        &run, file, &key, &by_first, payload, false, reporter, &mut done,
     )?;
     Ok(Outcome::Completed { result: done })
 }

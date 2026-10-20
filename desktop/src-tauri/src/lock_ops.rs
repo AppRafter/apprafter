@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use apprafter_core::lock::open::RecoveryKeyProblem;
 use apprafter_core::lock::{self, HolderHardening, LockOnInput, LockOnStart, LockedOn};
 use apprafter_core::secrets::{LockSlotKind, StoreId};
-use apprafter_core::vault::{ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, SlotInput};
+use apprafter_core::vault::{ConfirmedRecoveryKey, KdfPolicy, RecoveryKey, SlotInput};
 use apprafter_core::{CoreError, PlanClass, SecretString};
 use apprafter_desktop_ipc::{LockOffPlan, LockOnPlan, LockSectionInfo, OpId, PlanView};
 
@@ -210,7 +210,7 @@ pub fn plan_lock_on(
     shell.recheck();
     lock::check_password(&password)?;
     // D.4a's Protect — a separate lock password — until d4b-g2b offers the ways (B58).
-    let plan = lock::plan_on(
+    let mut plan = lock::plan_on(
         &shell.context,
         timeout_minutes,
         lock::WayAsked::LockPassword,
@@ -230,11 +230,20 @@ pub fn plan_lock_on(
             ))
         }
     }
-    let key = RecoveryKey::generate(&mut OsRandom).map_err(|e| {
-        DesktopError::Core(CoreError::Cli(cli_core::CliError::RandomUnavailable {
-            detail: e.to_string(),
-        }))
-    })?;
+    // D.4b B56: the lock password checked as the first slot, and the recovery key drawn
+    // only then — the same two steps Protect has always taken (until d4b-g2b's ways).
+    let step = lock::first_slot(&mut plan, lock::FirstSecret::LockPassword(password))?;
+    let (first, key) = match step {
+        lock::FirstStep::Ready { first, recovery } => (first, recovery),
+        lock::FirstStep::Mistake(e) => return Err(e.into()),
+        // Only an account password's empty entry falls back (d4b-g2b asks it).
+        lock::FirstStep::FellBack => {
+            return Err(refused(
+                "Protect's plan left the lock password while it was checked",
+                "Start Protect again.",
+            ));
+        }
+    };
     let shown = key.to_display();
     let new_key = NewKey::new(key);
     let epoch = shell.vault.epoch();
@@ -255,7 +264,7 @@ pub fn plan_lock_on(
             let outcome = lock::execute_on(
                 &ctx,
                 plan,
-                LockOnInput::New { password, recovery },
+                LockOnInput::New { first, recovery },
                 reporter,
                 cancel,
             )?;
@@ -497,6 +506,7 @@ mod tests {
     use apprafter_core::lock::{MachineLimit, UnlockWindow};
     use apprafter_core::secrets::testing::locked_store;
     use apprafter_core::secrets::{SecretsMode, VaultAccess};
+    use apprafter_core::vault::OsRandom;
     use apprafter_core::{Context, Outcome, PathSource, SecretString};
     use apprafter_desktop_ipc::{errors, Gesture, LockReason, OpEvent, PlanView, Settings};
     use cli_core::{Target, TargetConfig, TargetCredentials};

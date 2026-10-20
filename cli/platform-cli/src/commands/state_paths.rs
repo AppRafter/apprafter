@@ -219,7 +219,7 @@ pub(crate) mod testing {
     use std::thread::JoinHandle;
 
     use apprafter_core::lock::{execute_on, plan_on, LockOnInput, LockedOn, WayAsked};
-    use apprafter_core::vault::{OsRandom, RecoveryKey};
+    use apprafter_core::lock::{first_slot, FirstSecret, FirstStep};
     use apprafter_core::{CancellationToken, Context, Event, Outcome, Reporter, SecretString};
     use cli_core::secrets::CachedSecret;
     use cli_core::target::{
@@ -355,14 +355,18 @@ pub(crate) mod testing {
     /// runs it; `signal` hears it wait for the store lock.
     pub(crate) fn lock_on(ctx: &Context, signal: &WaitSignal) -> LockedOn {
         let _one = ONE_LOCK_ON.lock().unwrap_or_else(PoisonError::into_inner);
-        let plan = plan_on(ctx, None, WayAsked::LockPassword).expect("the lock on plan");
-        let key = RecoveryKey::generate(&mut OsRandom).unwrap();
-        let shown = key.to_display();
-        let recovery = key.confirm(shown.expose()).unwrap();
-        let input = LockOnInput::New {
-            password: SecretString::new(PASSWORD),
-            recovery,
+        let mut plan = plan_on(ctx, None, WayAsked::LockPassword).expect("the lock on plan");
+        // D.4b B56: the lock password's first slot, and the recovery key drawn with it.
+        let FirstStep::Ready { first, recovery } = first_slot(
+            &mut plan,
+            FirstSecret::LockPassword(SecretString::new(PASSWORD)),
+        )
+        .expect("the lock password") else {
+            panic!("a lock password is a first slot at once");
         };
+        let shown = recovery.to_display();
+        let recovery = recovery.confirm(shown.expose()).unwrap();
+        let input = LockOnInput::New { first, recovery };
         match execute_on(
             ctx,
             plan,

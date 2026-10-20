@@ -47,6 +47,7 @@ pub use slots::{
     plan_slot_add, plan_slot_remove, SlotAddKind, SlotAddPayload, SlotAdded, SlotRemovePayload,
     SlotRemoved,
 };
+pub use ways::{first_slot, FirstSecret, FirstSlot, FirstStep};
 pub use ways::{LockOnWay, WayAsked, WayFallback};
 
 use std::path::{Path, PathBuf};

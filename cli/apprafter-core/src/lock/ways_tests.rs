@@ -9,11 +9,13 @@ use std::sync::Mutex;
 
 use cli_core::{AccountPasswordRefusal, CliError};
 
+use super::on_tests::{assert_locked_whole, lock, PASSWORD};
 use super::on_tests::{files_store, new_input};
 use super::*;
 use crate::vault::MachineId;
 use crate::vault::{SlotId, SlotKind, VaultFile, VaultHeader, VAULT_FILE};
 use crate::Context;
+use crate::SecretString;
 use crate::{CancellationToken, CoreError, CoreResult, NullReporter, Outcome, Plan};
 
 /// This computer's facts as a test sets them (B15): each call recorded by name, in order, so
@@ -442,4 +444,115 @@ fn every_new_run_writes_the_ids_its_plan_minted() {
             (None, None)
         );
     }
+}
+
+/// A run's input through the first slot's step, as a client makes it (B56): `secret` for the
+/// plan's way, then the recovery key that step drew, typed back; and the key's text.
+fn input_for(plan: &mut Plan<LockOnPayload>, secret: FirstSecret) -> (LockOnInput, String) {
+    match first_slot(plan, secret).unwrap() {
+        FirstStep::Ready { first, recovery } => {
+            let shown = recovery.to_display().expose().to_string();
+            let recovery = recovery.confirm(&shown).unwrap();
+            (LockOnInput::New { first, recovery }, shown)
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// B56, O2 (acceptance 2, 3): a lock password the vault would refuse is a mistake — said and
+/// asked again, no recovery key drawn, nothing written; one it takes is the first slot, and
+/// only then is the recovery key drawn. The run is D.4a's: the store opens with both.
+#[test]
+fn a_lock_password_is_checked_before_its_recovery_key_exists() {
+    let f = files_store();
+    let mut plan = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let before = crate::target::testkit::snapshot(f.ctx.config_root());
+    let long = "a".repeat(1025);
+    for (typed, reason) in [
+        ("", PasswordProblem::Empty),
+        (long.as_str(), PasswordProblem::TooLong { max: 1024 }),
+    ] {
+        let secret = FirstSecret::LockPassword(SecretString::new(typed));
+        match first_slot(&mut plan, secret).unwrap() {
+            FirstStep::Mistake(CoreError::LockPasswordRefused { reason: said }) => {
+                assert_eq!(said, reason)
+            }
+            other => panic!("{reason:?}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        crate::target::testkit::snapshot(f.ctx.config_root()),
+        before
+    );
+    let secret = FirstSecret::LockPassword(SecretString::new(PASSWORD));
+    let (input, shown) = input_for(&mut plan, secret);
+    done(execute_on(
+        &f.ctx,
+        plan,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    ));
+    let kinds: Vec<SlotKind> = header_of(&f.ctx).slots.iter().map(|s| s.kind).collect();
+    assert_eq!(kinds, [SlotKind::Password, SlotKind::RecoveryKey]);
+    assert_locked_whole(&f.ctx, PASSWORD);
+    assert_locked_whole(&f.ctx, &shown);
+}
+
+/// B55, B56: a secret the plan does not take is refused before anything is asked, drawn or
+/// written — a lock password for a plan of this computer's account password, any secret for
+/// a plan that is no new run's (a store locked already) — and the plan stays as it was.
+#[test]
+fn a_secret_the_plan_does_not_take_is_refused_before_anything_is_drawn() {
+    let f = files_store();
+    let stand = Stand::ready(HostOs::Linux);
+    let mut plan = plan_on(&f.ctx, None, WayAsked::Everyday(&stand)).unwrap();
+    let before = crate::target::testkit::snapshot(f.ctx.config_root());
+    let lock_password = || FirstSecret::LockPassword(SecretString::new(PASSWORD));
+    let step = first_slot(&mut plan, lock_password());
+    assert!(
+        matches!(step, Err(CoreError::Cli(CliError::Other(_)))),
+        "{step:?}"
+    );
+    assert_eq!(plan.payload.way(), Some(LockOnWay::AccountPassword));
+    assert_eq!(
+        crate::target::testkit::snapshot(f.ctx.config_root()),
+        before
+    );
+    lock(&f.ctx);
+    let mut locked = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    assert_eq!(locked.payload.start(), &LockOnStart::AlreadyLocked);
+    let step = first_slot(&mut locked, lock_password());
+    assert!(
+        matches!(step, Err(CoreError::Cli(CliError::Other(_)))),
+        "{step:?}"
+    );
+}
+
+/// B80, F13 (critic round, finding 2): a first slot is written only under the plan whose step
+/// made it — the recovery key's slot id the client showed is that plan's — so the first slot
+/// of one plan given to another writes nothing.
+#[test]
+fn a_first_slot_is_written_only_under_its_own_plan() {
+    let f = files_store();
+    let mut made = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let other = plan_on(&f.ctx, None, WayAsked::LockPassword).unwrap();
+    let secret = FirstSecret::LockPassword(SecretString::new(PASSWORD));
+    let (input, _) = input_for(&mut made, secret);
+    let before = crate::target::testkit::snapshot(f.ctx.config_root());
+    let run = execute_on(
+        &f.ctx,
+        other,
+        input,
+        &NullReporter,
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(run, Err(CoreError::Cli(CliError::Other(_)))),
+        "{run:?}"
+    );
+    assert_eq!(
+        crate::target::testkit::snapshot(f.ctx.config_root()),
+        before
+    );
 }

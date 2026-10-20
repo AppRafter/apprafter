@@ -16,9 +16,10 @@ use apprafter_core::lock::{
     LockOnPayload, LockOnStart, LockReport, LockedOff, LockedOn, MachineLimit, PasswordAdvice,
     PasswordProblem, RecoveryKeyProblem, SlotOpened, SlotView, UnlockWindow,
 };
+use apprafter_core::lock::{FirstSecret, FirstStep};
 use apprafter_core::secrets::{LockSlotKind, SecretsMode, StoreId, STORE_FILE};
 use apprafter_core::vault::{
-    ConfirmedRecoveryKey, KdfPolicy, OsRandom, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
+    ConfirmedRecoveryKey, KdfPolicy, RecoveryKey, DEFAULT_UNLOCK_TIMEOUT_MIN,
 };
 use apprafter_core::{
     CancellationToken, ChangeAction, Context, CoreError, CoreResult, Event, Plan, PlannedChange,
@@ -108,7 +109,7 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
     let root = ctx.config_root().to_path_buf();
     let (shown, targets) = named(&ctx);
     // D.4a's flow — a separate lock password — until d4b-e1a gives `lock on` its default (B58).
-    let plan = lock::plan_on(&ctx, timeout, lock::WayAsked::LockPassword).map_err(report)?;
+    let mut plan = lock::plan_on(&ctx, timeout, lock::WayAsked::LockPassword).map_err(report)?;
     if let LockOnStart::AlreadyLocked = plan.payload.start() {
         match timeout {
             None => println!("The target store at {shown} is already locked."),
@@ -159,7 +160,7 @@ fn on(asker: &dyn Asker, timeout: Option<u32>) -> miette::Result<()> {
                 &root.join(apprafter_core::vault::VAULT_FILE),
                 ctx.home_dir(),
             );
-            new_input(asker, &shown, &vault_shown, &root).map_err(miette::Report::new)?
+            new_input(asker, &mut plan, &shown, &vault_shown, &root).map_err(miette::Report::new)?
         }
         LockOnStart::AlreadyLocked => unreachable!("answered above"),
     };
@@ -337,20 +338,33 @@ fn show_and_confirm(
     }
 }
 
-/// A new run's secrets: the password, then the recovery key (nothing is written before both).
+/// A new run's secrets: the password, then its first slot — checked, and only then is a
+/// recovery key drawn (D.4b B56) — then the recovery key typed back (nothing is written
+/// before both).
 fn new_input(
     asker: &dyn Asker,
+    plan: &mut Plan<LockOnPayload>,
     shown: &str,
     vault_shown: &str,
     root: &Path,
 ) -> Result<LockOnInput, CliError> {
     let refused = prompt_refusal(root);
     let password = new_password(asker, shown).map_err(&refused)?;
-    let key = RecoveryKey::generate(&mut OsRandom).map_err(|e| CliError::RandomUnavailable {
-        detail: e.to_string(),
-    })?;
+    let step = lock::first_slot(plan, FirstSecret::LockPassword(password))
+        .map_err(crate::context::into_cli_error)?;
+    let (first, key) = match step {
+        FirstStep::Ready { first, recovery } => (first, recovery),
+        // `new_password` asked until O2 took the password, and only an account password's
+        // empty entry falls back (d4b-e1a asks it): neither is met here.
+        FirstStep::Mistake(e) => return Err(crate::context::into_cli_error(e)),
+        FirstStep::FellBack => {
+            return Err(CliError::Other(
+                "the `lock on` plan left the lock password while it was checked".to_string(),
+            ));
+        }
+    };
     let recovery = show_and_confirm(asker, key, shown, vault_shown).map_err(&refused)?;
-    Ok(LockOnInput::New { password, recovery })
+    Ok(LockOnInput::New { first, recovery })
 }
 
 /// A resume's question for the secret of a `kind` slot of the store `shown` (rule 4).
