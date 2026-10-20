@@ -91,6 +91,21 @@ That is the condition that makes this ignore wrong, not a version bump.
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6 as zbus::wire); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6 as zbus::names); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (derives moved into zbus 6); zbus_polkit and the Tauri plugins still require zbus 5; WI-544" },
+    # cli and desktop (the desktop through apprafter-core and cli-core), build time only: age
+    # 0.12.1 -> i18n-embed-fl 0.10.1, and i18n-embed 0.16 -> i18n-embed-impl 0.8.4, both
+    # proc-macros -> i18n-config 0.4.8 -> basic-toml 0.1.10. It parses age's own i18n.toml inside
+    # rustc while the `fl!` macros expand, and it is in no shipped binary (`cargo tree -e
+    # no-proc-macro` cannot find it). An UNMAINTAINED notice of 2026-09-26 with an empty patched
+    # list, not a vulnerability; the advisory suggests `toml`. No release moves it yet. age 0.12.1
+    # (2026-07-14) is the newest, and it requires i18n-embed-fl ^0.10 with no feature to turn it
+    # off: ours are already `default-features = false` + `armor`, and str4d/rage#422 (i18n behind
+    # a feature) is still open. Both i18n-embed-fl 0.10 releases require i18n-config ^0.4.7, and
+    # 0.4.7 and 0.4.8 (2025-07-09, the newest) both require basic-toml. cargo-i18n's main branch
+    # took `toml` instead (kellpossible/cargo-i18n#176, merged 2026-09-26), with no release yet.
+    # WI-546: delete this entry in the change that takes a released i18n-config on `toml`. A 0.4.x
+    # patch is a `cargo update`; a new minor needs an age release on it, and age is the vault's
+    # crypto, so that change re-checks the vault and age vectors byte for byte.
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained; build time only, through age's i18n proc-macros (i18n-embed-fl, i18n-embed-impl -> i18n-config 0.4.8); cargo-i18n's move to toml is unreleased; WI-546" },
 ]
 
 [bans]
